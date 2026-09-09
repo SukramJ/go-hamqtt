@@ -24,16 +24,20 @@ func TestBucketSpellings(t *testing.T) {
 		model.BucketMaster:     "master",
 		model.BucketCalculated: "calculated",
 		model.BucketCustom:     "custom",
-		model.Bucket(0):        "unknown",
+		// The zero value renders empty on purpose: a hub datapoint has no
+		// paramset, and topic.Join drops an empty segment, so its topic has
+		// one level fewer rather than a placeholder nobody can read.
+		model.BucketUnset: "",
+		model.Bucket(99):  "unknown",
 	} {
 		if got := b.String(); got != want {
 			t.Errorf("Bucket(%d).String() = %q, want %q", b, got, want)
 		}
 	}
-	if model.Bucket(0).Valid() || model.Bucket(99).Valid() {
+	if model.Bucket(99).Valid() {
 		t.Error("an undeclared bucket reported valid")
 	}
-	if !model.BucketValues.Valid() {
+	if !model.BucketValues.Valid() || !model.BucketUnset.Valid() {
 		t.Error("a declared bucket reported invalid")
 	}
 }

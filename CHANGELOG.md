@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-09-09
+
+### Added
+
+- **`model.BucketUnset`** — the zero value is now a declared bucket:
+  a datapoint that belongs to no paramset at all. A hub-level value —
+  a system variable, a program — is not on a channel and has no
+  configuration/runtime distinction to make.
+
+  It renders as the empty string, and `topic.Join` drops empty
+  segments, so such a datapoint's topic is one level shallower rather
+  than carrying a placeholder nobody can interpret. `Slot.Valid`
+  accepts it; refusing it left half of a consumer's tree
+  unaddressable.
+
+  `Bucket(99)` still reports `"unknown"` and invalid.
+
 ## [0.5.0] - 2026-09-09
 
 ### Added
