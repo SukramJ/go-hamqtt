@@ -3,6 +3,54 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] - 2026-09-09
+
+### Added
+
+- **`discovery.ValidateBody(platform, body)`** checks one
+  already-built discovery body — a plain `map[string]any` — against
+  the platform's Home Assistant schema.
+
+  It exists for the consumers that still publish the per-entity
+  discovery form, one retained config per entity, rather than a device
+  bundle. Those bodies are assembled as maps, never pass through
+  `Component`, and so never reached `Validate` at all. Five of the six
+  consuming projects are in exactly that position.
+
+  The rules are not a second implementation: `Validate` now calls this
+  function per component, so a bundle and a raw body get the same
+  verdict — pinned by a test.
+
+- **`ValidationError.Warnings` and `ValidationError.Blocking()`**,
+  plus **`ErrAdvisory`**, separating what Home Assistant refuses from
+  what it accepts and rewrites. `errors.Is(err, ErrInvalidBundle)`
+  matches only the former, so existing `if invalid { do not publish }`
+  code keeps publishing the payloads Home Assistant is happy with.
+
+### Fixed
+
+- **A dispatching platform's required keys are read from the variant
+  the body names**, not from the union of all variants. `light` has
+  three sub-schemas selected by its own `schema` key, and the union
+  demands the template schema's `command_on_template` of a
+  json-schema light — a false alarm on 62 real entities in one
+  consumer's corpus. Key *legality* still falls back to the union when
+  a body names no variant; required keys are then not checked at all,
+  because nothing can say which set applies.
+
+- **The legacy micro sign is a warning, not an error.** Home
+  Assistant's `_native_unit_of_measurement_compat` is
+  `AMBIGUOUS_UNITS.get(unit, unit)` — it accepts U+00B5 and rewrites
+  it to U+03BC rather than discarding the config, which is what this
+  module previously claimed in a doc comment and enforced as a
+  failure. Publishing the canonical spelling is still right; it is
+  advice, not a gate.
+
+### Dependencies
+
+- **go-ha-catalog v0.2.1**, for the corrected `AmbiguousUnits`
+  documentation.
+
 ## [0.8.0] - 2026-09-09
 
 ### Added
