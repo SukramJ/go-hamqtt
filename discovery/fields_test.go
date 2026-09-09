@@ -196,3 +196,117 @@ func TestPtrKeepsAZeroOnTheWire(t *testing.T) {
 		t.Errorf("tilt_optimistic = %v, want false", got["tilt_optimistic"])
 	}
 }
+
+// TestComponentCarriesThePerEntityFrame covers the discovery form five of the
+// six consuming projects still publish: one retained config per entity, each
+// repeating the device and origin blocks a bundle would carry once.
+//
+// Home Assistant declares `device` on 31 of the 32 platforms and `origin` on
+// 30, so these are ordinary keys there — a consumer on that form could not
+// express its payload as a Component at all without them.
+func TestComponentCarriesThePerEntityFrame(t *testing.T) {
+	t.Parallel()
+
+	comp := discovery.Component{
+		Platform:   hacatalog.PlatformSensor,
+		UniqueID:   "u1",
+		StateTopic: "gh/x",
+		Device:     &discovery.DeviceInfo{Identifiers: []string{"dev-1"}, Name: "Hallway"},
+		Origin:     &discovery.Origin{Name: "openccu-loom"},
+	}
+	raw, err := json.Marshal(comp)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	device, ok := got["device"].(map[string]any)
+	if !ok {
+		t.Fatalf("device = %v, want an object", got["device"])
+	}
+	if device["name"] != "Hallway" {
+		t.Errorf("device.name = %v, want Hallway", device["name"])
+	}
+	if origin, ok := got["origin"].(map[string]any); !ok || origin["name"] != "openccu-loom" {
+		t.Errorf("origin = %v, want an object naming the bridge", got["origin"])
+	}
+
+	// And the validator must accept that body, or the form it exists for is
+	// unusable.
+	if err := discovery.ValidateBody(comp.Platform, got); err != nil {
+		t.Errorf("the per-entity frame was rejected: %v", err)
+	}
+}
+
+// TestBundleComponentOmitsTheFrame is the other half: inside a device bundle
+// the frame lives at the top, and a component repeating it would describe the
+// same device twice. Nil pointers keep the keys out entirely rather than
+// emitting an empty object, which Home Assistant would read as a device with
+// no identifiers.
+func TestBundleComponentOmitsTheFrame(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(discovery.Component{
+		Platform: hacatalog.PlatformSensor,
+		UniqueID: "u1",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, key := range []string{"device", "origin"} {
+		if _, present := got[key]; present {
+			t.Errorf("%q was emitted on a bundle component", key)
+		}
+	}
+}
+
+// TestNameNullIsNotTheSameAsAnAbsentName pins a distinction that decides how
+// every entity of a device is labelled.
+//
+// entity.py's _set_entity_name reads `config.get(CONF_NAME, UNDEFINED)`: an
+// explicit null comes back as None and becomes the entity's name — Home
+// Assistant then shows the device's name alone — while an absent key comes
+// back UNDEFINED and makes Home Assistant derive a default instead. A consumer
+// publishing one composite entity per device needs the null, or the device
+// name appears twice in every label.
+func TestNameNullIsNotTheSameAsAnAbsentName(t *testing.T) {
+	t.Parallel()
+
+	decode := func(comp discovery.Component) map[string]any {
+		t.Helper()
+		raw, err := json.Marshal(comp)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		out := map[string]any{}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return out
+	}
+
+	absent := decode(discovery.Component{Platform: hacatalog.PlatformSensor, UniqueID: "u"})
+	if _, present := absent["name"]; present {
+		t.Error("an unset Name emitted the key")
+	}
+
+	null := decode(discovery.Component{Platform: hacatalog.PlatformSensor, UniqueID: "u", NameNull: true})
+	value, present := null["name"]
+	if !present {
+		t.Fatal("NameNull did not emit the key at all")
+	}
+	if value != nil {
+		t.Errorf("name = %v, want null", value)
+	}
+
+	named := decode(discovery.Component{Platform: hacatalog.PlatformSensor, UniqueID: "u", Name: "Hallway"})
+	if named["name"] != "Hallway" {
+		t.Errorf("name = %v, want Hallway", named["name"])
+	}
+}
