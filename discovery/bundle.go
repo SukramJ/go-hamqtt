@@ -91,6 +91,32 @@ type Component struct {
 	Max              *float64                 `json:"max,omitempty"`
 	Step             *float64                 `json:"step,omitempty"`
 
+	// The keys below are accepted by nearly every platform (28 to 30 of the
+	// 32), so they live here rather than in a per-platform Fields struct.
+	CommandTemplate   string `json:"command_template,omitempty"`
+	Optimistic        *bool  `json:"optimistic,omitempty"`
+	EntityPicture     string `json:"entity_picture,omitempty"`
+	VisibleByDefault  *bool  `json:"visible_by_default,omitempty"`
+	Encoding          string `json:"encoding,omitempty"`
+	QoS               *int   `json:"qos,omitempty"`
+	Retain            *bool  `json:"retain,omitempty"`
+	MessageExpiry     *int   `json:"message_expiry_interval,omitempty"`
+	AvailabilityTopic string `json:"availability_topic,omitempty"`
+	AvailabilityTmpl  string `json:"availability_template,omitempty"`
+	PayloadAvailable  string `json:"payload_available,omitempty"`
+	PayloadNotAvail   string `json:"payload_not_available,omitempty"`
+	// Group is accepted by all 32 platforms. It lists the unique ids of the
+	// entities this one groups — a list, not a name, which is the kind of
+	// thing the catalog's per-key type exists to settle.
+	Group []string `json:"group,omitempty"`
+
+	// JSONAttributesTopic and its template attach a whole JSON document to an
+	// entity as attributes. It is how a consumer publishes a datapoint's
+	// descriptor — ranges, value lists, units — alongside its value without
+	// inventing an entity per field.
+	JSONAttributesTopic    string `json:"json_attributes_topic,omitempty"`
+	JSONAttributesTemplate string `json:"json_attributes_template,omitempty"`
+
 	// Fields carries platform-specific keys as a typed struct — see
 	// [ClimateFields]. Marshalled by flattening, so it must encode to a JSON
 	// object.
@@ -182,32 +208,4 @@ func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string
 	for _, k := range keys {
 		b.Components[k] = Component{Platform: platformOf[k]}
 	}
-}
-
-// ClimateFields are the climate platform's own topic keys.
-//
-// It is hand-written rather than generated because a composite entity's field
-// set is what a consumer types out, and the catalog's schema is what validates
-// it. Adding a platform's fields is additive and needs no codegen run.
-type ClimateFields struct {
-	CurrentTemperatureTopic string   `json:"current_temperature_topic,omitempty"`
-	TemperatureStateTopic   string   `json:"temperature_state_topic,omitempty"`
-	TemperatureCommandTopic string   `json:"temperature_command_topic,omitempty"`
-	ModeStateTopic          string   `json:"mode_state_topic,omitempty"`
-	ModeCommandTopic        string   `json:"mode_command_topic,omitempty"`
-	FanModeStateTopic       string   `json:"fan_mode_state_topic,omitempty"`
-	FanModeCommandTopic     string   `json:"fan_mode_command_topic,omitempty"`
-	SwingModeStateTopic     string   `json:"swing_mode_state_topic,omitempty"`
-	SwingModeCommandTopic   string   `json:"swing_mode_command_topic,omitempty"`
-	PresetModeStateTopic    string   `json:"preset_mode_state_topic,omitempty"`
-	PresetModeCommandTopic  string   `json:"preset_mode_command_topic,omitempty"`
-	ActionTopic             string   `json:"action_topic,omitempty"`
-	Modes                   []string `json:"modes,omitempty"`
-	FanModes                []string `json:"fan_modes,omitempty"`
-	SwingModes              []string `json:"swing_modes,omitempty"`
-	PresetModes             []string `json:"preset_modes,omitempty"`
-	MinTemp                 *float64 `json:"min_temp,omitempty"`
-	MaxTemp                 *float64 `json:"max_temp,omitempty"`
-	TempStep                *float64 `json:"temp_step,omitempty"`
-	TemperatureUnit         string   `json:"temperature_unit,omitempty"`
 }

@@ -35,6 +35,17 @@ test-cover: ## run tests + coverage report
 	CGO_ENABLED=1 $(GO) test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out | tail -20
 
+.PHONY: generate
+generate: ## regenerate discovery/gen_fields.go from the catalog
+	$(GO) run ./script/genfields
+	gofumpt -w discovery/gen_fields.go
+
+.PHONY: generate-check
+generate-check: ## fail when the generated file is stale (CI gate)
+	$(GO) run ./script/genfields
+	gofumpt -w discovery/gen_fields.go
+	git diff --exit-code -- discovery/gen_fields.go
+
 .PHONY: vet
 vet: ## run go vet
 	$(GO) vet ./...
@@ -62,10 +73,11 @@ tidy: ## sync go.mod
 check: vet fmt-check lint test ## the pre-commit / pre-push gate
 
 .PHONY: cover-check
-cover-check: ## fail when a package drops below COVER_MIN
+cover-check: ## fail when a package drops below COVER_MIN (script/ is build tooling, not library code, and is exempt)
 	@CGO_ENABLED=1 $(GO) test -count=1 -covermode=atomic -coverprofile=coverage.out ./... >/dev/null
 	@$(GO) tool cover -func=coverage.out | awk -v min=$(COVER_MIN) '\
 	  /^total:/ { next } \
+	  /\/script\// { next } \
 	  { pkg=$$1; sub(/\/[^\/]*$$/, "", pkg); cov[pkg]+=$$3+0; n[pkg]++ } \
 	  END { bad=0; for (p in cov) { avg=cov[p]/n[p]; \
 	    if (avg < min) { printf "FAIL %s (%.1f%% < %d%%)\n", p, avg, min; bad=1 } \
