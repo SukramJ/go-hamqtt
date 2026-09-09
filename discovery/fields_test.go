@@ -310,3 +310,35 @@ func TestNameNullIsNotTheSameAsAnAbsentName(t *testing.T) {
 		t.Errorf("name = %v, want Hallway", named["name"])
 	}
 }
+
+// TestOriginUsesTheCanonicalSpellings pins the long form. Home Assistant's
+// abbreviation table maps `sw` onto `sw_version` and `url` onto `support_url`
+// and accepts either, but every other key this package emits is the canonical
+// spelling; a payload that mixes the two reads as though one were a different
+// key.
+func TestOriginUsesTheCanonicalSpellings(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(discovery.Origin{Name: "bridge", SW: "1.2.3", URL: "https://example.invalid"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for key, want := range map[string]string{
+		"name":        "bridge",
+		"sw_version":  "1.2.3",
+		"support_url": "https://example.invalid",
+	} {
+		if got[key] != want {
+			t.Errorf("%s = %v, want %q", key, got[key], want)
+		}
+	}
+	for _, abbreviated := range []string{"sw", "url"} {
+		if _, present := got[abbreviated]; present {
+			t.Errorf("%q is the abbreviation, not the canonical key", abbreviated)
+		}
+	}
+}

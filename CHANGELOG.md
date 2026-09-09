@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] - 2026-09-09
+
+### Fixed
+
+- **`Origin` emitted Home Assistant's abbreviations rather than its
+  canonical keys** — `sw` and `url` instead of `sw_version` and
+  `support_url`. Home Assistant's abbreviation table maps one onto the
+  other and it accepts either, so nothing was broken, but every other
+  key this package emits is the long form: a payload mixing the two
+  reads as though one of them were a different key, and a consumer
+  diffing its output against a reference sees a change that is not one.
+
+  This is a wire change for anyone already publishing an `origin`
+  block through this type.
+
 ## [0.11.0] - 2026-09-09
 
 ### Added
