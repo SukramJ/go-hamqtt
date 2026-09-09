@@ -73,6 +73,24 @@ type Extra interface {
 	ExtraPayload(k Kind, opts Options) map[string]any
 }
 
+// Naming is the policy that turns a Go field name into a payload key.
+//
+// It is a choice rather than a constant because two published surfaces
+// disagree, and both are already on the wire: a key renamed is a break for
+// whoever reads it. Pick one per surface and stay on it.
+type Naming uint8
+
+const (
+	// NamingSnake gives sw_version and interface_id. The default, and what a
+	// new consumer should use — it is what Home Assistant's own payloads look
+	// like.
+	NamingSnake Naming = iota
+	// NamingLower gives swversion and interfaceid: the field name lower-cased
+	// and nothing else. Exists for a consumer whose topics already publish
+	// that shape and cannot rename them.
+	NamingLower
+)
+
 // Options tune the harvest.
 type Options struct {
 	// IncludeZero keeps fields at their zero value. Off by default: a device
@@ -81,8 +99,12 @@ type Options struct {
 	// meaningful — a consumer diffing two payloads, say.
 	IncludeZero bool
 
+	// Naming selects how an untagged field name becomes a payload key.
+	// The zero value is [NamingSnake].
+	Naming Naming
+
 	// UseAltNames prefers a tag's `alt=` spelling over the field's
-	// snake-cased name.
+	// derived name.
 	//
 	// Opt-in rather than always-on, because one struct serves two audiences: a
 	// device's own MQTT info topic wants the model's vocabulary ("address"),
@@ -124,7 +146,10 @@ func ForWith(obj any, k Kind, opts Options) map[string]any {
 		if !opts.IncludeZero && fv.IsZero() {
 			continue
 		}
-		name := f.name
+		name := f.snake
+		if opts.Naming == NamingLower {
+			name = f.lower
+		}
 		if opts.UseAltNames && f.alt != "" {
 			name = f.alt
 		}
@@ -158,7 +183,11 @@ func Merge(dst, src map[string]any) map[string]any {
 
 type field struct {
 	index []int
-	name  string
+	// snake and lower are both precomputed: the naming policy is chosen per
+	// call, but the reflection walk is cached per type, so the cache cannot
+	// depend on it.
+	snake string
+	lower string
 	alt   string
 }
 
@@ -217,7 +246,12 @@ func collect(t reflect.Type, k Kind, prefix []int) []field {
 		if !containsString(kinds, want) {
 			continue
 		}
-		out = append(out, field{index: index, name: snake(sf.Name), alt: alt})
+		out = append(out, field{
+			index: index,
+			snake: snake(sf.Name),
+			lower: strings.ToLower(sf.Name),
+			alt:   alt,
+		})
 	}
 	return out
 }
