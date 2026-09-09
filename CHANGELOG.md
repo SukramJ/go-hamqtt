@@ -3,6 +3,28 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-09-09
+
+### Added
+
+- **`Component.Device` and `Component.Origin`**, the per-entity
+  discovery form's frame.
+
+  A device bundle carries them once at the top, and `Bundle` is where
+  they belong there. But the per-entity form Home Assistant still
+  accepts repeats them in every retained config, and that is what five
+  of the six consuming projects publish today — Home Assistant
+  declares `device` on 31 of the 32 platforms and `origin` on 30, so
+  they are ordinary keys there.
+
+  Without them such a consumer cannot express its payload as a
+  `Component` at all, which is exactly what kept its discovery frame
+  untyped while its entity bodies moved over.
+
+  Both are pointers so a bundle component omits them instead of
+  emitting an empty object, which Home Assistant would read as a
+  device with no identifiers.
+
 ## [0.10.0] - 2026-09-09
 
 ### Added

@@ -117,6 +117,21 @@ type Component struct {
 	JSONAttributesTopic    string `json:"json_attributes_topic,omitempty"`
 	JSONAttributesTemplate string `json:"json_attributes_template,omitempty"`
 
+	// Device and Origin are the per-entity discovery form's frame.
+	//
+	// A device bundle carries them once at the top, and [Bundle] is where they
+	// belong there — a component inside a bundle leaves both nil. But the
+	// per-entity form Home Assistant still accepts repeats them in every
+	// retained config, and that is what five of the six consuming projects
+	// publish today. Without these fields such a consumer cannot express its
+	// payload as a Component at all, which is what kept its frame untyped.
+	//
+	// Pointers rather than values so the bundle form omits them instead of
+	// emitting an empty object, which Home Assistant would read as a device
+	// with no identifiers.
+	Device *DeviceInfo `json:"device,omitempty"`
+	Origin *Origin     `json:"origin,omitempty"`
+
 	// Fields carries platform-specific keys as a typed struct — see
 	// [ClimateFields]. Marshalled by flattening, so it must encode to a JSON
 	// object.
