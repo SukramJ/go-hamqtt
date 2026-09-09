@@ -62,8 +62,15 @@ func (k Kind) String() string {
 // Extra is the escape hatch for fields reflection cannot see: values behind a
 // mutex, computed properties, anything not a plain struct field. Whatever it
 // returns is merged over the tagged fields, so it can also override one.
+//
+// It receives the same [Options] the harvest runs under, and is expected to
+// honour them — an implementation that ignores IncludeZero emits a key the
+// rest of the payload would have dropped. That is not hypothetical: a field
+// moved behind a mutex to fix a data race becomes unreflectable in the same
+// stroke, and contributing it here is how it comes back. Losing it is silent —
+// the harvest simply returns one key fewer.
 type Extra interface {
-	ExtraPayload(k Kind) map[string]any
+	ExtraPayload(k Kind, opts Options) map[string]any
 }
 
 // Options tune the harvest.
@@ -125,7 +132,7 @@ func ForWith(obj any, k Kind, opts Options) map[string]any {
 	}
 
 	if extra, ok := obj.(Extra); ok {
-		for key, value := range extra.ExtraPayload(k) {
+		for key, value := range extra.ExtraPayload(k, opts) {
 			out[key] = value
 		}
 	}

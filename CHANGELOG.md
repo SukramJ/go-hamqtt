@@ -3,6 +3,19 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-09-09
+
+### Changed
+
+- **`payload.Extra` receives the harvest options.**
+  `ExtraPayload(Kind)` became `ExtraPayload(Kind, Options)`. Without
+  them a contributed property cannot honour `IncludeZero`, so the
+  escape hatch emits keys the rest of the payload would have dropped.
+  The case is concrete: a field moved behind a mutex to fix a data race
+  becomes unreflectable in the same stroke, and contributing it here is
+  how it comes back — the reference implementation's device name went
+  through exactly that.
+
 ## [0.3.0] - 2026-09-09
 
 Two API changes the openccu-loom migration needs (ADR 0070, phase 3,
