@@ -171,3 +171,28 @@ func jsonTags(t reflect.Type) []string {
 	}
 	return out
 }
+
+// TestPtrKeepsAZeroOnTheWire is the reason Ptr exists: the zero values are
+// exactly the ones a builder sets deliberately, and a bare int or bool would
+// lose them to omitempty.
+func TestPtrKeepsAZeroOnTheWire(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(discovery.CoverFields{
+		PositionClosed: discovery.Ptr(0),
+		TiltOptimistic: discovery.Ptr(false),
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got["position_closed"] != float64(0) {
+		t.Errorf("position_closed = %v, want 0", got["position_closed"])
+	}
+	if got["tilt_optimistic"] != false {
+		t.Errorf("tilt_optimistic = %v, want false", got["tilt_optimistic"])
+	}
+}
