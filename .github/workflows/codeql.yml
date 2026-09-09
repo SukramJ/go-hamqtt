@@ -1,0 +1,43 @@
+name: codeql
+
+# CodeQL static analysis (SAST) with data-flow and taint analysis. Findings
+# surface in the repository's Security → Code scanning tab; the job does not
+# fail the build on alerts.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "23 3 * * 1" # weekly Monday 03:23 UTC
+
+permissions:
+  contents: read
+  security-events: write # required to upload CodeQL results
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: codeql (go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: go
+          # Go's CodeQL extractor requires a real compile (build-mode: none is
+          # rejected for Go). autobuild runs the module's `go build`.
+          build-mode: autobuild
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:go"

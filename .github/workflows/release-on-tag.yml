@@ -1,0 +1,69 @@
+name: "Release: Create from Tag"
+# Creates the GitHub Release for a pushed module tag. The module is consumed
+# via the Go proxy, so there are no build artifacts — the release body is the
+# matching CHANGELOG.md section, and extraction fails loudly when it is
+# missing, so a tag cannot ship without release notes.
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: write
+
+# One concurrent release per tag — re-pushing the same tag overrides the
+# previous in-flight run instead of racing it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  create_release:
+    if: github.repository_owner == 'SukramJ'
+    name: Create GitHub Release (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tag object itself carries the release notes, so it has to be
+          # fetched, not just the commit it points at.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify the tagged tree
+        run: go test ./...
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Exact-string prefix match rather than a regex: VERSION is
+          # interpolated unescaped, so a "." in it must stay a literal dot.
+          awk -v hdr="## [${VERSION}]" '
+            index($0, hdr) == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_BODY.md
+          if ! grep -q '[^[:space:]]' RELEASE_BODY.md; then
+            echo "::error::CHANGELOG.md has no section for version ${VERSION}"
+            exit 1
+          fi
+          cat RELEASE_BODY.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: RELEASE_BODY.md
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,70 @@
+# GitHub Actions CI for go-hamqtt.
+#
+# Two jobs: lint (go vet + gofumpt + golangci-lint) and test (race detector
+# across the OS triplet consumers build on). The Home Assistant vocabulary
+# arrives as a pinned go-ha-catalog dependency, so CI needs no Python and no
+# Home Assistant checkout.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: gofumpt
+        run: |
+          # Pinned (not @latest): Dependabot tracks go.mod requires, not
+          # go-install lines in a workflow, so this version is bumped by hand.
+          go install mvdan.cc/gofumpt@v0.11.0
+          diff=$(gofumpt -l .)
+          if [ -n "$diff" ]; then
+            echo "::error::gofumpt would rewrite:"
+            echo "$diff"
+            exit 1
+          fi
+      - name: golangci-lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          golangci-lint run ./...
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go test
+        env:
+          # Race detector requires CGo; enable just for this step.
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 -timeout=120s ./...
