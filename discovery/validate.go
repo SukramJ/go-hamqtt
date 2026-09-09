@@ -20,24 +20,58 @@ import (
 // bad key means fixing a catalog one entry per test run.
 type ValidationError struct {
 	NodeID string
+	// Issues are the problems Home Assistant does not tolerate: a key it
+	// drops, a required key that is missing, a device class the platform does
+	// not declare. A payload with any of these is broken on arrival.
 	Issues []string
+	// Warnings are the things Home Assistant accepts and then rewrites. They
+	// belong in a report but must not stop a publish — treating them as
+	// failures is how a validator earns the reputation that gets it muted.
+	Warnings []string
 }
 
 // Error implements error.
 func (e *ValidationError) Error() string {
-	if len(e.Issues) == 1 {
-		return fmt.Sprintf("discovery: bundle %q: %s", e.NodeID, e.Issues[0])
+	var b strings.Builder
+	fmt.Fprintf(&b, "discovery: bundle %q:", e.NodeID)
+	if len(e.Issues)+len(e.Warnings) == 1 {
+		one := append(append([]string{}, e.Issues...), e.Warnings...)[0]
+		return b.String() + " " + one
 	}
-	return fmt.Sprintf("discovery: bundle %q: %d problems:\n  - %s",
-		e.NodeID, len(e.Issues), strings.Join(e.Issues, "\n  - "))
+	for _, issue := range e.Issues {
+		b.WriteString("\n  - " + issue)
+	}
+	for _, warning := range e.Warnings {
+		b.WriteString("\n  ~ " + warning)
+	}
+	return b.String()
 }
 
-// ErrInvalidBundle is what [ValidationError] matches against, so a caller can
-// tell a rejected payload from an I/O failure without a type assertion.
+// Blocking reports whether the payload is broken rather than merely untidy.
+// It is what a caller deciding whether to publish should ask.
+func (e *ValidationError) Blocking() bool { return len(e.Issues) > 0 }
+
+// ErrInvalidBundle matches a payload Home Assistant would reject or silently
+// mutilate, so a caller can tell it from an I/O failure without a type
+// assertion — and, since an advisory-only result does not match it, existing
+// `if errors.Is(err, ErrInvalidBundle) { do not publish }` code keeps
+// publishing the payloads Home Assistant is happy to accept.
 var ErrInvalidBundle = errors.New("discovery: invalid bundle")
 
+// ErrAdvisory matches a result that carries only warnings.
+var ErrAdvisory = errors.New("discovery: advisory")
+
 // Is implements errors.Is.
-func (e *ValidationError) Is(target error) bool { return target == ErrInvalidBundle }
+func (e *ValidationError) Is(target error) bool {
+	switch target {
+	case ErrInvalidBundle:
+		return e.Blocking()
+	case ErrAdvisory:
+		return !e.Blocking()
+	default:
+		return false
+	}
+}
 
 // Validate checks a bundle against the Home Assistant schemas the catalog
 // carries, and returns every problem it finds.
@@ -72,17 +106,9 @@ func Validate(b *Bundle) error {
 		issues.add("bundle has no components")
 	}
 
-	mqtt, err := hacatalog.LoadMQTT()
+	mqtt, relations, deviceClasses, err := loadTables()
 	if err != nil {
-		return fmt.Errorf("discovery: load catalog: %w", err)
-	}
-	relations, err := hacatalog.LoadRelations()
-	if err != nil {
-		return fmt.Errorf("discovery: load catalog relations: %w", err)
-	}
-	deviceClasses, err := hacatalog.LoadDeviceClasses()
-	if err != nil {
-		return fmt.Errorf("discovery: load catalog device classes: %w", err)
+		return err
 	}
 
 	seenUnique := map[string]string{}
@@ -91,11 +117,47 @@ func Validate(b *Bundle) error {
 		validateComponent(issues, key, comp, mqtt, relations, deviceClasses, seenUnique)
 	}
 
-	if len(issues.items) == 0 {
-		return nil
+	return issues.err(b.NodeID)
+}
+
+// ValidateBody checks one already-built discovery body against the platform's
+// Home Assistant schema, and returns every problem it finds.
+//
+// It exists for the consumers that still publish the per-entity discovery form
+// — one retained config per entity at <prefix>/<platform>/<node_id>/<object_id>
+// /config — rather than a device bundle. Those bodies are usually assembled as
+// a plain map, never pass through [Component], and so never reach [Validate];
+// this is the entry point that lets them be checked anyway.
+//
+// The rules are the same ones [Validate] applies per component, because they
+// are the same rules: this function is what [Validate] calls.
+func ValidateBody(platform hacatalog.Platform, body map[string]any) error {
+	issues := &issueList{}
+	mqtt, relations, deviceClasses, err := loadTables()
+	if err != nil {
+		return err
 	}
-	sort.Strings(issues.items)
-	return &ValidationError{NodeID: b.NodeID, Issues: issues.items}
+	validateBody(issues, string(platform), string(platform), body, mqtt, relations, deviceClasses, nil)
+	return issues.err(string(platform))
+}
+
+// componentBody encodes a component into the flat JSON object Home Assistant
+// actually receives, which is what every check below reads.
+//
+// Checking the encoded form rather than the struct fields is deliberate: the
+// keys a component carries come from three places — its typed fields, its
+// platform Fields struct and its Extra map — and only the encoded object shows
+// what was really published.
+func componentBody(comp Component) (map[string]any, error) {
+	raw, err := json.Marshal(comp)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]any{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 
 func validateComponent(
@@ -107,7 +169,24 @@ func validateComponent(
 	deviceClasses map[string][]string,
 	seenUnique map[string]string,
 ) {
-	platform := string(comp.Platform)
+	body, err := componentBody(comp)
+	if err != nil {
+		issues.add("%s: cannot encode component: %v", key, err)
+		return
+	}
+	validateBody(issues, key, string(comp.Platform), body, mqtt, relations, deviceClasses, seenUnique)
+}
+
+func validateBody(
+	issues *issueList,
+	key string,
+	platform string,
+	body map[string]any,
+	mqtt hacatalog.MQTT,
+	relations hacatalog.Relations,
+	deviceClasses map[string][]string,
+	seenUnique map[string]string,
+) {
 	if platform == "" {
 		issues.add("%s: platform is required", key)
 		return
@@ -117,71 +196,74 @@ func validateComponent(
 		return
 	}
 
+	uniqueID := str(body, "unique_id")
 	// A component with more than a platform must carry a unique id; Home
 	// Assistant rejects the bundle otherwise.
-	if comp.UniqueID == "" {
-		if !isRemoval(comp) {
+	if uniqueID == "" {
+		if !isRemoval(body) {
 			issues.add("%s: unique_id is required", key)
 		}
 		return
 	}
-	if prev, dup := seenUnique[comp.UniqueID]; dup {
-		issues.add("%s: unique_id %q already used by %q", key, comp.UniqueID, prev)
+	if seenUnique != nil {
+		if prev, dup := seenUnique[uniqueID]; dup {
+			issues.add("%s: unique_id %q already used by %q", key, uniqueID, prev)
+		}
+		seenUnique[uniqueID] = key
 	}
-	seenUnique[comp.UniqueID] = key
 
 	// Unknown keys: Home Assistant drops them silently (its discovery schema
 	// is extra=REMOVE_EXTRA), so a typo costs a feature with no diagnostic
 	// anywhere. Checking against the extracted schema is the only place this
 	// becomes visible.
-	schema, ok := mqtt.Platforms[platform]
-	if ok {
-		validateKeys(issues, key, comp, schema)
+	if schema, ok := mqtt.Platforms[platform]; ok {
+		validateKeys(issues, key, platform, body, schema)
 	}
 
-	if comp.DeviceClass != "" {
+	deviceClass := str(body, "device_class")
+	if deviceClass != "" {
 		if classes, known := deviceClasses[platform]; known {
-			if !slices.Contains(classes, comp.DeviceClass) {
+			if !slices.Contains(classes, deviceClass) {
 				issues.add("%s: device_class %q is not valid for platform %q",
-					key, comp.DeviceClass, platform)
+					key, deviceClass, platform)
 			}
 		}
 	}
 
-	validateSensorRelations(issues, key, comp, relations)
+	validateSensorRelations(issues, key, platform, body, relations)
 }
 
-// validateKeys compares the component's actual JSON keys against the
-// platform's discovery schema.
-func validateKeys(issues *issueList, key string, comp Component, schema hacatalog.PlatformSchema) {
+// validateKeys compares the body's actual JSON keys against the platform's
+// discovery schema.
+func validateKeys(issues *issueList, key, platform string, body map[string]any, schema hacatalog.PlatformSchema) {
 	allowed := schema.Keys
+	// A dispatching platform (light, infrared) has no flat key set: which
+	// sub-schema applies depends on a payload key, so read that key.
+	checkRequired := true
 	if len(allowed) == 0 {
-		// A dispatching platform (light, infrared) has no flat key set; the
-		// union of its variants is the closest honest approximation, since
-		// which variant applies depends on a payload key.
-		allowed = map[string]hacatalog.SchemaKey{}
-		for _, v := range schema.Variants {
-			for k, entry := range v.Keys {
-				allowed[k] = entry
+		if variant, ok := schema.Variants[str(body, schema.Discriminator)]; ok {
+			allowed = variant.Keys
+		} else {
+			// The body names no variant, or names one the catalog does not
+			// know. The union of the variants still says which keys could
+			// ever be legal, but it cannot say which are required: a light on
+			// the json schema would be told it is missing the template
+			// schema's command_on_template, which is exactly the false alarm
+			// that teaches a consumer to ignore the validator.
+			allowed = map[string]hacatalog.SchemaKey{}
+			for _, v := range schema.Variants {
+				for k, entry := range v.Keys {
+					allowed[k] = entry
+				}
 			}
+			checkRequired = false
 		}
 	}
 	if len(allowed) == 0 {
 		return
 	}
 
-	raw, err := json.Marshal(comp)
-	if err != nil {
-		issues.add("%s: cannot encode component: %v", key, err)
-		return
-	}
-	present := map[string]json.RawMessage{}
-	if err := json.Unmarshal(raw, &present); err != nil {
-		issues.add("%s: cannot re-read component: %v", key, err)
-		return
-	}
-
-	for name := range present {
+	for name := range body {
 		// `platform` is the bundle's own discriminator rather than a schema
 		// key, so it is legal on every component and appears in none.
 		if name == "platform" {
@@ -189,27 +271,35 @@ func validateKeys(issues *issueList, key string, comp Component, schema hacatalo
 		}
 		if _, legal := allowed[name]; !legal {
 			issues.add("%s: %q is not a valid key for platform %q (Home Assistant would drop it silently)",
-				key, name, comp.Platform)
+				key, name, platform)
 		}
+	}
+	if !checkRequired {
+		return
 	}
 	for name, entry := range allowed {
 		if !entry.Required {
 			continue
 		}
-		if _, have := present[name]; !have {
-			issues.add("%s: %q is required by platform %q", key, name, comp.Platform)
+		if _, have := body[name]; !have {
+			issues.add("%s: %q is required by platform %q", key, name, platform)
 		}
 	}
 }
 
 // validateSensorRelations checks the cross-field rules that make the
 // difference between a working sensor and a corrupted statistics history.
-func validateSensorRelations(issues *issueList, key string, comp Component, relations hacatalog.Relations) {
-	if comp.StateClass != "" && comp.DeviceClass != "" {
-		if allowed, known := relations.SensorDeviceClassStateClasses[comp.DeviceClass]; known {
-			if !slices.Contains(allowed, string(comp.StateClass)) {
+func validateSensorRelations(issues *issueList, key, platform string, body map[string]any, relations hacatalog.Relations) {
+	stateClass := str(body, "state_class")
+	deviceClass := str(body, "device_class")
+	unit := str(body, "unit_of_measurement")
+	options, hasOptions := body["options"]
+
+	if stateClass != "" && deviceClass != "" {
+		if allowed, known := relations.SensorDeviceClassStateClasses[deviceClass]; known {
+			if !slices.Contains(allowed, stateClass) {
 				issues.add("%s: state_class %q is not allowed for device_class %q (allowed: %s)",
-					key, comp.StateClass, comp.DeviceClass, joinOrNone(allowed))
+					key, stateClass, deviceClass, joinOrNone(allowed))
 			}
 		}
 	}
@@ -221,34 +311,69 @@ func validateSensorRelations(issues *issueList, key string, comp Component, rela
 	// all, so applying this rule everywhere rejected every select ever built —
 	// and since an invalid bundle publishes nothing for the whole device, one
 	// enum parameter would have silenced every entity of that device.
-	if len(comp.Options) > 0 && comp.Platform == hacatalog.PlatformSensor {
-		if comp.DeviceClass != "enum" {
-			issues.add("%s: options require device_class \"enum\", got %q", key, comp.DeviceClass)
+	if hasOptions && !isEmptyList(options) && platform == string(hacatalog.PlatformSensor) {
+		if deviceClass != "enum" {
+			issues.add("%s: options require device_class \"enum\", got %q", key, deviceClass)
 		}
-		if comp.StateClass != "" {
+		if stateClass != "" {
 			issues.add("%s: options cannot be combined with state_class", key)
 		}
-		if comp.UnitOfMeasure != "" {
+		if unit != "" {
 			issues.add("%s: options cannot be combined with unit_of_measurement", key)
 		}
 	}
 
-	// The silent rewrite: Home Assistant normalises some unit spellings —
-	// most importantly the legacy micro sign U+00B5 to U+03BC — and discards
-	// a config whose unit does not match the normalised form.
-	if comp.UnitOfMeasure != "" {
-		if canonical, ambiguous := relations.AmbiguousUnits[comp.UnitOfMeasure]; ambiguous && canonical != comp.UnitOfMeasure {
-			issues.add("%s: unit_of_measurement %q is the non-canonical spelling; Home Assistant expects %q",
-				key, comp.UnitOfMeasure, canonical)
+	// The silent rewrite. Home Assistant maps a handful of unit spellings
+	// through AMBIGUOUS_UNITS — most importantly the legacy micro sign U+00B5
+	// to U+03BC — in sensor/__init__.py's
+	// _native_unit_of_measurement_compat, which is a `.get(unit, unit)`:
+	// it *accepts* the legacy spelling and rewrites it. So this is a warning,
+	// not an issue. Publishing the canonical spelling is still the right thing
+	// — it is what Home Assistant stores, so the two agree without a
+	// translation step — but an entity spelled the old way works.
+	if unit != "" {
+		if canonical, ambiguous := relations.AmbiguousUnits[unit]; ambiguous && canonical != unit {
+			issues.warn("%s: unit_of_measurement %q is the legacy spelling; Home Assistant rewrites it to %q",
+				key, unit, canonical)
 		}
 	}
 }
 
-// isRemoval reports whether a component is the deletion marker: a platform and
+// isRemoval reports whether a body is the deletion marker: a platform and
 // nothing else.
-func isRemoval(comp Component) bool {
-	return comp.Name == "" && comp.UniqueID == "" && comp.StateTopic == "" &&
-		comp.CommandTopic == "" && comp.Fields == nil && len(comp.Extra) == 0
+func isRemoval(body map[string]any) bool {
+	for name := range body {
+		if name != "platform" {
+			return false
+		}
+	}
+	return true
+}
+
+func str(body map[string]any, key string) string {
+	v, _ := body[key].(string)
+	return v
+}
+
+func isEmptyList(v any) bool {
+	list, ok := v.([]any)
+	return ok && len(list) == 0
+}
+
+func loadTables() (hacatalog.MQTT, hacatalog.Relations, map[string][]string, error) {
+	mqtt, err := hacatalog.LoadMQTT()
+	if err != nil {
+		return mqtt, hacatalog.Relations{}, nil, fmt.Errorf("discovery: load catalog: %w", err)
+	}
+	relations, err := hacatalog.LoadRelations()
+	if err != nil {
+		return mqtt, relations, nil, fmt.Errorf("discovery: load catalog relations: %w", err)
+	}
+	deviceClasses, err := hacatalog.LoadDeviceClasses()
+	if err != nil {
+		return mqtt, relations, nil, fmt.Errorf("discovery: load catalog device classes: %w", err)
+	}
+	return mqtt, relations, deviceClasses, nil
 }
 
 func sanitizeCheck(s string) string {
@@ -262,8 +387,27 @@ func joinOrNone(values []string) string {
 	return strings.Join(values, ", ")
 }
 
-type issueList struct{ items []string }
+type issueList struct {
+	items    []string
+	warnings []string
+}
 
 func (l *issueList) add(format string, args ...any) {
 	l.items = append(l.items, fmt.Sprintf(format, args...))
+}
+
+func (l *issueList) warn(format string, args ...any) {
+	l.warnings = append(l.warnings, fmt.Sprintf(format, args...))
+}
+
+// err renders the collected problems, or nil when there were none. Sorting
+// makes one report comparable to the next, which is what lets a consumer diff
+// two runs instead of re-reading both.
+func (l *issueList) err(nodeID string) error {
+	if len(l.items) == 0 && len(l.warnings) == 0 {
+		return nil
+	}
+	sort.Strings(l.items)
+	sort.Strings(l.warnings)
+	return &ValidationError{NodeID: nodeID, Issues: l.items, Warnings: l.warnings}
 }

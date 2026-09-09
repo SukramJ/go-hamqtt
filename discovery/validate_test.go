@@ -171,10 +171,15 @@ func TestValidateEnforcesTheEnumRules(t *testing.T) {
 	})
 }
 
-// TestValidateCatchesTheMicroSign is the defect that costs a whole device's
-// entities in production and leaves no trace anywhere: Home Assistant rewrites
-// the legacy micro sign and discards a config that disagrees.
-func TestValidateCatchesTheMicroSign(t *testing.T) {
+// TestValidateWarnsAboutTheMicroSign pins a deliberate non-failure.
+//
+// Home Assistant maps the legacy micro sign U+00B5 through AMBIGUOUS_UNITS in
+// sensor/__init__.py's _native_unit_of_measurement_compat, and that mapping is
+// a `.get(unit, unit)`: the old spelling is accepted and rewritten, not
+// rejected. Reporting it as an error would fail a consumer's CI over twelve
+// entities that work — the false alarm that gets a validator muted, and with
+// it the real findings it was built for.
+func TestValidateWarnsAboutTheMicroSign(t *testing.T) {
 	t.Parallel()
 
 	relations, err := hacatalog.LoadRelations()
@@ -198,7 +203,20 @@ func TestValidateCatchesTheMicroSign(t *testing.T) {
 	comp.StateClass = ""
 	comp.UnitOfMeasure = legacy
 	b.Components["power"] = comp
-	requireIssue(t, b, canonical)
+
+	err = discovery.Validate(b)
+	if err == nil {
+		t.Fatalf("the legacy spelling was not even reported")
+	}
+	if errors.Is(err, discovery.ErrInvalidBundle) {
+		t.Errorf("the legacy spelling blocks the publish, but Home Assistant accepts it: %v", err)
+	}
+	if !errors.Is(err, discovery.ErrAdvisory) {
+		t.Errorf("err does not match ErrAdvisory: %v", err)
+	}
+	if !strings.Contains(err.Error(), canonical) {
+		t.Errorf("err = %v\nwant it to name %q", err, canonical)
+	}
 }
 
 // TestValidateReportsEveryProblem pins the batching: fixing a catalog one
