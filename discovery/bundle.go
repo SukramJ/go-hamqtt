@@ -209,3 +209,13 @@ func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string
 		b.Components[k] = Component{Platform: platformOf[k]}
 	}
 }
+
+// Ptr returns a pointer to v.
+//
+// Every numeric and boolean discovery key is a pointer so a legitimate zero
+// survives `omitempty`: a cover's position_closed is 0, a siren's
+// support_duration is false, and both are values a consumer means to publish
+// rather than omit. Go has no way to take the address of a literal, so without
+// this every call site needs a named variable — which is how a builder ends up
+// reusing one by accident.
+func Ptr[T any](v T) *T { return &v }

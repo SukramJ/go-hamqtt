@@ -3,6 +3,22 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] - 2026-09-09
+
+### Added
+
+- **`discovery.Ptr`**, the helper every consumer filling a `Fields`
+  struct needs. The numeric and boolean discovery keys are pointers so
+  a legitimate zero survives `omitempty` — a cover's `position_closed`
+  is 0, a siren's `support_duration` is false — and Go cannot take the
+  address of a literal, so without this every call site needs a named
+  variable, which is how a builder ends up reusing one by accident.
+
+  It lives here rather than in each consumer because the pointers are
+  this module's design: a consumer that defines its own copy adds an
+  export its dead-code analysis cannot see through, which is exactly
+  what happened in the first project to convert its builders.
+
 ## [0.9.1] - 2026-09-09
 
 ### Dependencies
