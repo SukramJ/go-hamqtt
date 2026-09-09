@@ -154,12 +154,17 @@ type withExtra struct {
 	hidden string
 }
 
-func (w *withExtra) ExtraPayload(k payload.Kind) map[string]any {
+func (w *withExtra) ExtraPayload(k payload.Kind, opts payload.Options) map[string]any {
 	if k != payload.Info {
 		return nil
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Honouring IncludeZero is the implementation's job, and the reason the
+	// options are passed in at all.
+	if w.hidden == "" && !opts.IncludeZero {
+		return map[string]any{"public": "overridden"}
+	}
 	return map[string]any{"hidden": w.hidden, "public": "overridden"}
 }
 
@@ -175,6 +180,23 @@ func TestExtraOverridesTaggedFields(t *testing.T) {
 	}
 	if got["public"] != "overridden" {
 		t.Errorf("public = %v, want ExtraPayload to win", got["public"])
+	}
+}
+
+// TestExtraHonoursOptions covers why Extra receives them: a contributed
+// property must be able to drop itself under the same rule the reflected
+// fields follow, or the escape hatch emits keys the rest of the payload would
+// have omitted.
+func TestExtraHonoursOptions(t *testing.T) {
+	t.Parallel()
+
+	empty := &withExtra{Public: "tagged"}
+	if got := payload.For(empty, payload.Info); got["hidden"] != nil {
+		t.Errorf("hidden = %v, want it omitted at its zero value", got["hidden"])
+	}
+	got := payload.ForWith(empty, payload.Info, payload.Options{IncludeZero: true})
+	if _, ok := got["hidden"]; !ok {
+		t.Errorf("IncludeZero = %#v, want the zero-valued contribution kept", got)
 	}
 }
 
