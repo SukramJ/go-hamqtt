@@ -3,6 +3,27 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-09-09
+
+Two API changes the openccu-loom migration needs (ADR 0070, phase 3,
+steps 1 and 3). Both are behaviour changes, not additions.
+
+### Changed
+
+- **`alt=` is now opt-in**, through `payload.Options.UseAltNames`.
+  It was applied unconditionally, which cannot serve the requirement
+  it exists for: one struct feeds two audiences — a device's own MQTT
+  info topic, which wants the model's vocabulary ("address"), and Home
+  Assistant's device block, which wants its own ("serial_number"). The
+  tag carries both spellings and the caller picks. This matches the
+  reference implementation, which had the same two call sites.
+- **`topic.Slug` preserves the hyphen.** It folded `-` into `_`, which
+  destroys a sub-device id composed as `<parent>-<group>` by collapsing
+  it onto a sibling that legitimately contains an underscore. Home
+  Assistant's own topic matcher accepts `[a-zA-Z0-9_-]` in a node id,
+  so the fold was stricter than necessary and lossy. Entity ids are
+  unaffected: Home Assistant slugifies `-` to `_` when it derives one.
+
 ## [0.2.0] - 2026-09-09
 
 Four defects found by mapping openccu-loom onto this module before

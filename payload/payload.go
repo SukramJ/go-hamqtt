@@ -17,6 +17,9 @@
 //
 //	payload.For(dev, payload.Info) // {"address": …, "manufacturer": …}
 //
+// The `alt=` spelling is opt-in through [Options.UseAltNames], because one
+// struct serves two audiences — see that field.
+//
 // The package knows nothing about MQTT or Home Assistant. It is reflection over
 // struct tags and nothing else, which is why it sits at the bottom of the
 // dependency graph and why a consumer can use it for its own topics without
@@ -70,6 +73,16 @@ type Options struct {
 	// not 37 nulls. Turn it on where the absence of a key is itself
 	// meaningful — a consumer diffing two payloads, say.
 	IncludeZero bool
+
+	// UseAltNames prefers a tag's `alt=` spelling over the field's
+	// snake-cased name.
+	//
+	// Opt-in rather than always-on, because one struct serves two audiences: a
+	// device's own MQTT info topic wants the model's vocabulary ("address"),
+	// while Home Assistant's device block wants its own ("serial_number").
+	// A tag carries both and the caller picks — which is exactly why `alt=`
+	// exists rather than the field simply being renamed.
+	UseAltNames bool
 }
 
 // For harvests the fields of obj tagged with kind, keyed by their tag name.
@@ -104,7 +117,11 @@ func ForWith(obj any, k Kind, opts Options) map[string]any {
 		if !opts.IncludeZero && fv.IsZero() {
 			continue
 		}
-		out[f.name] = fv.Interface()
+		name := f.name
+		if opts.UseAltNames && f.alt != "" {
+			name = f.alt
+		}
+		out[name] = fv.Interface()
 	}
 
 	if extra, ok := obj.(Extra); ok {
@@ -135,6 +152,7 @@ func Merge(dst, src map[string]any) map[string]any {
 type field struct {
 	index []int
 	name  string
+	alt   string
 }
 
 // cache is keyed by (type, kind). Reflection over a struct's tags is pure and
@@ -192,11 +210,7 @@ func collect(t reflect.Type, k Kind, prefix []int) []field {
 		if !containsString(kinds, want) {
 			continue
 		}
-		name := alt
-		if name == "" {
-			name = snake(sf.Name)
-		}
-		out = append(out, field{index: index, name: name})
+		out = append(out, field{index: index, name: snake(sf.Name), alt: alt})
 	}
 	return out
 }

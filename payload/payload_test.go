@@ -54,9 +54,10 @@ func TestPartitionsByKind(t *testing.T) {
 		t.Errorf("Info = %#v\nwant %#v", info, want)
 	}
 
+	// alt= is opt-in, so the plain harvest uses the field's own name.
 	cfg := payload.For(d, payload.Config)
-	if _, ok := cfg["operation_modes"]; !ok || len(cfg) != 1 {
-		t.Errorf("Config = %#v, want just the renamed modes", cfg)
+	if _, ok := cfg["modes"]; !ok || len(cfg) != 1 {
+		t.Errorf("Config = %#v, want the field-named modes", cfg)
 	}
 
 	state := payload.For(d, payload.State)
@@ -65,6 +66,34 @@ func TestPartitionsByKind(t *testing.T) {
 	}
 	if _, leaked := state["manufacturer"]; leaked {
 		t.Error("an info field leaked into the state payload")
+	}
+}
+
+// TestAltNamesAreOptIn pins the two-audience requirement the flag exists for:
+// one struct feeds both a device's own info topic, which wants the model's
+// vocabulary, and Home Assistant's device block, which wants its own.
+func TestAltNamesAreOptIn(t *testing.T) {
+	t.Parallel()
+
+	d := device{Modes: []string{"heat"}}
+
+	plain := payload.For(d, payload.Config)
+	if _, ok := plain["modes"]; !ok {
+		t.Errorf("without the flag: %#v, want the field name", plain)
+	}
+
+	renamed := payload.ForWith(d, payload.Config, payload.Options{UseAltNames: true})
+	if _, ok := renamed["operation_modes"]; !ok {
+		t.Errorf("with the flag: %#v, want the alt spelling", renamed)
+	}
+	if _, leaked := renamed["modes"]; leaked {
+		t.Errorf("with the flag: %#v, the field name survived alongside the alt", renamed)
+	}
+
+	// A field with no alt= is unaffected either way.
+	both := payload.ForWith(device{Manufacturer: "Daikin"}, payload.Info, payload.Options{UseAltNames: true})
+	if _, ok := both["manufacturer"]; !ok {
+		t.Errorf("a field without alt= changed name: %#v", both)
 	}
 }
 

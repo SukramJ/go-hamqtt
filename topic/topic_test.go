@@ -20,7 +20,7 @@ func TestSlugTransliteratesUmlauts(t *testing.T) {
 		"Größe":           "groesse",
 		"Außentemperatur": "aussentemperatur",
 		"Wärmepumpe":      "waermepumpe",
-		"Öl-Füllstand":    "oel_fuellstand",
+		"Öl-Füllstand":    "oel-fuellstand",
 		"Übertemperatur":  "uebertemperatur",
 	} {
 		if got := topic.Slug(in); got != want {
@@ -30,13 +30,15 @@ func TestSlugTransliteratesUmlauts(t *testing.T) {
 }
 
 // TestSlugProducesLegalSegments pins the shape Home Assistant needs and the
-// collapse rules that keep it readable.
+// collapse rules that keep it readable. The hyphen survives: it is legal in a
+// node id, and a consumer that builds a sub-device id as "<parent>-<group>"
+// needs it to stay distinct from an underscore.
 func TestSlugProducesLegalSegments(t *testing.T) {
 	t.Parallel()
 
 	for in, want := range map[string]string{
 		"Living Room AC": "living_room_ac",
-		"serial:AC-1":    "serial_ac_1",
+		"serial:AC-1":    "serial_ac-1",
 		"  padded  ":     "padded",
 		"a///b":          "a_b",
 		"UPPER":          "upper",
