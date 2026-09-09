@@ -5,6 +5,9 @@ package discovery
 
 import (
 	"fmt"
+	"sync"
+
+	hacatalog "github.com/SukramJ/go-ha-catalog"
 
 	"github.com/SukramJ/go-hamqtt/model"
 )
@@ -139,10 +142,31 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 		EntityCategory:   desc.Category,
 		EnabledByDefault: desc.Enabled,
 		Precision:        desc.Precision,
-		Min:              desc.Min,
-		Max:              desc.Max,
-		Step:             desc.Step,
 		Availability:     ctx.Availability(dev, e),
+	}
+
+	// One schema lookup drives every conditional projection below. Home
+	// Assistant drops a key its platform does not declare without a word, so a
+	// key emitted on the wrong platform is not an error anyone would ever see.
+	accepts, err := platformAccepts(e.Platform())
+	if err != nil {
+		return Component{}, err
+	}
+
+	// Bounds go to the plain keys only where the platform declares them:
+	// `min` and `max` exist on number and text, `step` on number alone.
+	// Climate spells them min_temp/max_temp/temp_step and water_heater
+	// min_temp/max_temp, so those platforms carry bounds through their own
+	// Fields struct — a Builder's job, since only it knows the spelling.
+	// Projecting unconditionally emitted keys Home Assistant drops in silence.
+	if accepts["min"] {
+		comp.Min = desc.Min
+	}
+	if accepts["max"] {
+		comp.Max = desc.Max
+	}
+	if accepts["step"] {
+		comp.Step = desc.Step
 	}
 
 	if _, mode := desc.Availability.Resolved(); mode != "" {
@@ -164,14 +188,18 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	comp.DefaultEntityID = string(e.Platform()) + "." + ObjectID(dev, e)
 
 	// Default projection: the state and command roles map to the two plain
-	// topics. A composite entity has neither and fills its own Fields.
-	if b, ok := model.Bind(e, model.RoleState); ok && b.Mode.CanRead() {
+	// topics — but only on the platforms that declare them. Ten platforms have
+	// no `state_topic` and eleven no `command_topic`: climate, water_heater and
+	// lawn_mower name a topic per role instead, and button, scene and notify
+	// are write-only. A composite entity on one of those fills its own Fields,
+	// which is where the right spelling lives.
+	if b, ok := model.Bind(e, model.RoleState); ok && b.Mode.CanRead() && accepts["state_topic"] {
 		comp.StateTopic = ctx.StateTopic(b.Slot)
-		if ctx.Encoding() == EnvelopeEncoding {
+		if ctx.Encoding() == EnvelopeEncoding && accepts["value_template"] {
 			comp.ValueTemplate = ValueTemplate
 		}
 	}
-	if b, ok := model.Bind(e, model.RoleCommand); ok && b.Mode.CanWrite() {
+	if b, ok := model.Bind(e, model.RoleCommand); ok && b.Mode.CanWrite() && accepts["command_topic"] {
 		comp.CommandTopic = ctx.CommandTopic(b.Slot)
 	}
 
@@ -180,7 +208,18 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 			return Component{}, err
 		}
 	}
-	comp.Extra = desc.Extra
+
+	// Merge, do not replace. Extra is the only route for the platform keys that
+	// have no typed field, and a Builder is the only stage that holds the
+	// Context needed to compute topics for them — so overwriting here closed
+	// the escape hatch exactly where it is needed. The description still wins
+	// on a shared key, which is the documented precedence.
+	for k, v := range desc.Extra {
+		if comp.Extra == nil {
+			comp.Extra = make(map[string]any, len(desc.Extra))
+		}
+		comp.Extra[k] = v
+	}
 	return comp, nil
 }
 
@@ -206,4 +245,45 @@ func deviceInfo(dev *model.Device, lang string) DeviceInfo {
 		info.ViaDevice = dev.Via.UID()
 	}
 	return info
+}
+
+// acceptedKeys caches, per platform, the set of JSON keys Home Assistant's
+// discovery schema declares. The catalog is embedded and its decode is cached,
+// but the per-platform set is rebuilt on every lookup without this.
+var acceptedKeys sync.Map // map[hacatalog.Platform]map[string]bool
+
+// platformAccepts reports which keys a platform's schema declares.
+//
+// For the two platforms that dispatch to sub-schemas (light, infrared) the
+// union of the variants is used: which variant applies depends on a payload
+// key, so the union is the closest answer available at projection time.
+func platformAccepts(p hacatalog.Platform) (map[string]bool, error) {
+	if cached, ok := acceptedKeys.Load(p); ok {
+		keys, _ := cached.(map[string]bool)
+		return keys, nil
+	}
+
+	mqtt, err := hacatalog.LoadMQTT()
+	if err != nil {
+		return nil, fmt.Errorf("discovery: load catalog: %w", err)
+	}
+	schema, ok := mqtt.Platforms[string(p)]
+	if !ok {
+		// An unknown platform is Validate's problem to report, with a better
+		// message than anything this could produce. Accept nothing so no
+		// illegal key is projected in the meantime.
+		return map[string]bool{}, nil
+	}
+
+	keys := make(map[string]bool, len(schema.Keys))
+	for k := range schema.Keys {
+		keys[k] = true
+	}
+	for _, v := range schema.Variants {
+		for k := range v.Keys {
+			keys[k] = true
+		}
+	}
+	acceptedKeys.Store(p, keys)
+	return keys, nil
 }

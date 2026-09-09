@@ -216,7 +216,12 @@ func validateSensorRelations(issues *issueList, key string, comp Component, rela
 
 	// Home Assistant's own sensor validator: options belong to enum sensors
 	// and cannot coexist with a state class or a unit.
-	if len(comp.Options) > 0 {
+	//
+	// Sensor only. `select` *requires* options and declares no device_class at
+	// all, so applying this rule everywhere rejected every select ever built —
+	// and since an invalid bundle publishes nothing for the whole device, one
+	// enum parameter would have silenced every entity of that device.
+	if len(comp.Options) > 0 && comp.Platform == hacatalog.PlatformSensor {
 		if comp.DeviceClass != "enum" {
 			issues.add("%s: options require device_class \"enum\", got %q", key, comp.DeviceClass)
 		}
