@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1] - 2026-09-09
+
+### Dependencies
+
+- **go-ha-catalog v0.2.1**, which v0.9.0's notes already claimed as a
+  dependency without the module actually requiring it. The bump is what
+  makes that true; the catalog change is a documentation correction and
+  carries no data or API change.
+
 ## [0.9.0] - 2026-09-09
 
 ### Added
