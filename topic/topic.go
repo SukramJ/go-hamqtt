@@ -39,8 +39,8 @@ type Layout interface {
 
 // Default renders
 //
-//	<root>/<uid>[/<channel>]/<bucket>/<path...>          state
-//	<root>/<uid>[/<channel>]/<bucket>/<path...>/set      command
+//	<root>[/<scope...>]/<uid>[/<channel>]/<bucket>/<path...>      state
+//	<root>[/<scope...>]/<uid>[/<channel>]/<bucket>/<path...>/set  command
 //	<root>/<uid>/availability                            device
 //	<root>/bridge/status                                 daemon LWT
 //
@@ -70,8 +70,10 @@ func (d Default) Availability(id model.Identity) string {
 func (d Default) Bridge() string { return Join(d.Root, "bridge", "status") }
 
 func (d Default) slotParts(s model.Slot) []string {
-	parts := make([]string, 0, len(s.Path)+4)
-	parts = append(parts, d.Root, s.Address)
+	parts := make([]string, 0, len(s.Path)+len(s.Scope)+4)
+	parts = append(parts, d.Root)
+	parts = append(parts, s.Scope...)
+	parts = append(parts, s.Address)
 	if s.Channel != "" {
 		parts = append(parts, s.Channel)
 	}

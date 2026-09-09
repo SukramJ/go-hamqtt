@@ -3,6 +3,27 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-09-09
+
+### Added
+
+- **`model.Slot.Scope`** and **`Slot.In(...)`** — the containers a
+  device sits in, outermost first. openccu-loom has two (a CCU name
+  and a wire interface), go-unifi2mqtt one (a site); the other four
+  consumers have none and are unaffected.
+
+  It lives on the slot rather than being looked up from the device so
+  that a Slot stays a complete coordinate: `topic.Layout` resolves one
+  without further context, and the runtime never has to carry a device
+  around to render a topic. That is not a new liberty — `Address` is
+  already a device property (it *is* `Identity.UID`), so a Slot
+  already embeds enough identity to stand alone.
+
+  `Slot.Key` includes the scope, so two devices with the same address
+  under different controllers no longer collide. `Slot.Valid` rejects
+  an empty scope segment: it would vanish from the rendered topic and
+  move the datapoint one level up, into another device's tree.
+
 ## [0.6.0] - 2026-09-09
 
 ### Added
