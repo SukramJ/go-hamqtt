@@ -3,6 +3,68 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] - 2026-09-09
+
+### Added
+
+- **A typed `Fields` struct for every MQTT platform**, generated from
+  the catalog into `discovery/gen_fields.go` — 334 fields across 30
+  structs, covering every discovery key Home Assistant accepts.
+
+  Home Assistant's discovery schema is `extra=REMOVE_EXTRA`: a key a
+  platform does not declare is dropped without an error on the wire or
+  a line in any log, so a typo costs a feature and leaves nothing to
+  debug. Until now only `climate` had a struct, hand-written and
+  covering 20 of its 59 keys; everything else went through `Extra`,
+  which is untyped and unvalidated.
+
+  The structs are generated rather than typed out because the catalog
+  already knows the exact key set per platform. `make generate`
+  rebuilds them and CI fails when they are stale, so a Home Assistant
+  release that adds a key produces a field on the next catalog bump
+  rather than a bug report.
+
+  `ClimateFields` is now the generated one. It is a superset of the
+  hand-written struct it replaces and keeps every field name, so no
+  call site changes.
+
+- **`discovery.FieldsIndex`** maps a platform — `"<platform>"`, or
+  `"<platform>/<variant>"` for the two that dispatch on a payload key
+  (`light`, `infrared`) — to a zero value of its `Fields` struct, so
+  nothing has to hand-maintain a switch from a platform to its type.
+
+- **Thirteen near-universal keys on `Component`**: `command_template`,
+  `optimistic`, `entity_picture`, `visible_by_default`, `encoding`,
+  `qos`, `retain`, `message_expiry_interval`, `availability_topic`,
+  `availability_template`, `payload_available`,
+  `payload_not_available`, `group`, and the pair
+  `json_attributes_topic` / `json_attributes_template`. Each is
+  accepted by at least 16 of the 32 platforms — `group` and `qos` by
+  all 32 — which puts them in the same class as `state_topic` (22)
+  and `command_topic` (21), already on `Component`.
+
+  `json_attributes_topic` is how a consumer publishes a datapoint's
+  descriptor — ranges, value lists, units — alongside its value
+  without inventing an entity per field.
+
+### Changed
+
+- **Numeric and boolean discovery fields are pointers.** A minimum of
+  `0` and an explicit `false` are exactly the values a consumer sets
+  deliberately, and `omitempty` on a bare `int` or `bool` drops both.
+
+- **`make cover-check` exempts `script/`** — build tooling, not
+  library code.
+
+### Dependencies
+
+- **go-ha-catalog v0.2.0**, which records each discovery key's value
+  type. Without it the generator had to guess whether `min_temp` is an
+  integer or a float from a hand-maintained list of key names — and
+  the answer is not even constant per key name: `max` is a float on
+  `number` and an integer on `cover`, and `group`, which reads like a
+  name, is a list.
+
 ## [0.7.0] - 2026-09-09
 
 ### Added
