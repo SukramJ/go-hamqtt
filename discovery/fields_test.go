@@ -265,3 +265,48 @@ func TestBundleComponentOmitsTheFrame(t *testing.T) {
 		}
 	}
 }
+
+// TestNameNullIsNotTheSameAsAnAbsentName pins a distinction that decides how
+// every entity of a device is labelled.
+//
+// entity.py's _set_entity_name reads `config.get(CONF_NAME, UNDEFINED)`: an
+// explicit null comes back as None and becomes the entity's name — Home
+// Assistant then shows the device's name alone — while an absent key comes
+// back UNDEFINED and makes Home Assistant derive a default instead. A consumer
+// publishing one composite entity per device needs the null, or the device
+// name appears twice in every label.
+func TestNameNullIsNotTheSameAsAnAbsentName(t *testing.T) {
+	t.Parallel()
+
+	decode := func(comp discovery.Component) map[string]any {
+		t.Helper()
+		raw, err := json.Marshal(comp)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		out := map[string]any{}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return out
+	}
+
+	absent := decode(discovery.Component{Platform: hacatalog.PlatformSensor, UniqueID: "u"})
+	if _, present := absent["name"]; present {
+		t.Error("an unset Name emitted the key")
+	}
+
+	null := decode(discovery.Component{Platform: hacatalog.PlatformSensor, UniqueID: "u", NameNull: true})
+	value, present := null["name"]
+	if !present {
+		t.Fatal("NameNull did not emit the key at all")
+	}
+	if value != nil {
+		t.Errorf("name = %v, want null", value)
+	}
+
+	named := decode(discovery.Component{Platform: hacatalog.PlatformSensor, UniqueID: "u", Name: "Hallway"})
+	if named["name"] != "Hallway" {
+		t.Errorf("name = %v, want Hallway", named["name"])
+	}
+}

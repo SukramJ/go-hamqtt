@@ -117,6 +117,20 @@ type Component struct {
 	JSONAttributesTopic    string `json:"json_attributes_topic,omitempty"`
 	JSONAttributesTemplate string `json:"json_attributes_template,omitempty"`
 
+	// NameNull publishes `name: null`.
+	//
+	// That is how Home Assistant is told the entity has no name of its own
+	// and should be shown as the device's name alone, and it is *not* the
+	// same as leaving Name empty. entity.py's _set_entity_name reads
+	// `config.get(CONF_NAME, UNDEFINED)`: an explicit null comes back as None
+	// and becomes the entity's name, while an absent key comes back UNDEFINED
+	// and makes Home Assistant derive a default from the platform or the
+	// device class instead.
+	//
+	// A consumer that publishes one composite entity per device needs the
+	// null: without it every entity carries the device name twice.
+	NameNull bool `json:"-"`
+
 	// Device and Origin are the per-entity discovery form's frame.
 	//
 	// A device bundle carries them once at the top, and [Bundle] is where they
@@ -171,6 +185,11 @@ func (c Component) MarshalJSON() ([]byte, error) {
 	}
 	for k, v := range c.Extra {
 		merged[k] = v
+	}
+	if c.NameNull {
+		// After Fields and Extra, so an explicit request for the device's own
+		// name is not undone by a stray name key from either.
+		merged["name"] = nil
 	}
 	return json.Marshal(merged)
 }
