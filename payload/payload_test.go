@@ -231,3 +231,43 @@ func TestMergePrecedence(t *testing.T) {
 		t.Errorf("Merge into nil = %#v", got)
 	}
 }
+
+// TestNamingPolicy covers why the policy is a choice rather than a constant:
+// two published surfaces disagree on the spelling, both are already on the
+// wire, and a renamed key is a break for whoever reads it.
+func TestNamingPolicy(t *testing.T) {
+	t.Parallel()
+
+	// Address is the interesting field: all three spellings differ.
+	type s struct {
+		SWVersion   string `payload:"info"`
+		InterfaceID string `payload:"info"`
+		Address     string `payload:"info,alt=serial_number"`
+	}
+	in := s{SWVersion: "1", InterfaceID: "2", Address: "3"}
+
+	snake := payload.For(in, payload.Info)
+	for _, want := range []string{"sw_version", "interface_id", "address"} {
+		if _, ok := snake[want]; !ok {
+			t.Errorf("default naming: missing %q in %#v", want, snake)
+		}
+	}
+
+	lower := payload.ForWith(in, payload.Info, payload.Options{Naming: payload.NamingLower})
+	for _, want := range []string{"swversion", "interfaceid", "address"} {
+		if _, ok := lower[want]; !ok {
+			t.Errorf("lower naming: missing %q in %#v", want, lower)
+		}
+	}
+
+	// alt= outranks either policy — it names the key outright.
+	for name, opts := range map[string]payload.Options{
+		"snake": {UseAltNames: true},
+		"lower": {Naming: payload.NamingLower, UseAltNames: true},
+	} {
+		got := payload.ForWith(in, payload.Info, opts)
+		if _, ok := got["serial_number"]; !ok {
+			t.Errorf("%s + alt=: did not outrank the naming policy: %#v", name, got)
+		}
+	}
+}

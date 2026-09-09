@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-09-09
+
+### Added
+
+- **`payload.Options.Naming`** — `NamingSnake` (default,
+  `sw_version`) or `NamingLower` (`swversion`).
+
+  The field→key mapping was an accidental constant, and two published
+  surfaces disagree on it: this module derives `interface_id`, the
+  reference implementation publishes `interfaceid` on its own MQTT
+  topics today. Neither can adopt the other's spelling without
+  renaming a key someone reads. Making the policy explicit lets a
+  consumer migrate onto this package without a wire break, and leaves
+  new consumers on the better default.
+
+  `alt=` still outranks either policy — it names the key outright.
+
 ## [0.4.0] - 2026-09-09
 
 ### Changed
