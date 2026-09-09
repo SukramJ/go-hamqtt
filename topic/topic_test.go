@@ -135,3 +135,16 @@ func TestBridgeAndAvailabilityTopics(t *testing.T) {
 		t.Errorf("Availability = %q, want %q", got, want)
 	}
 }
+
+// TestUnsetBucketDropsTheSegment is the other half of BucketUnset: an empty
+// bucket must vanish from the topic rather than render a placeholder, which is
+// what lets a hub datapoint sit one level shallower than a channel one.
+func TestUnsetBucketDropsTheSegment(t *testing.T) {
+	t.Parallel()
+
+	l := topic.Default{Root: "loom"}
+	slot := model.S("hub:ccu1", "", model.BucketUnset, "sysvar", "Anwesenheit")
+	if got, want := l.State(slot), "loom/hub:ccu1/sysvar/Anwesenheit"; got != want {
+		t.Errorf("State = %q, want %q", got, want)
+	}
+}

@@ -13,9 +13,17 @@ import "strings"
 type Bucket uint8
 
 const (
+	// BucketUnset is the zero value: a datapoint that belongs to no paramset
+	// at all. A hub-level value — a system variable, a program — is not on a
+	// channel and has no configuration/runtime distinction to make.
+	//
+	// It renders as the empty string, and [topic.Join] drops empty segments,
+	// so such a datapoint's topic simply has one level fewer rather than a
+	// placeholder nobody can interpret.
+	BucketUnset Bucket = iota
 	// BucketValues is live runtime state — the default and by far the common
 	// case.
-	BucketValues Bucket = iota + 1
+	BucketValues
 	// BucketMaster is device configuration: parameters an operator sets, not
 	// values the device reports. Conventionally rendered as
 	// entity_category: config.
@@ -29,9 +37,12 @@ const (
 	BucketCustom
 )
 
-// String returns the topic-segment spelling of the bucket.
+// String returns the topic-segment spelling of the bucket. [BucketUnset]
+// renders empty so the segment disappears rather than reading "unknown".
 func (b Bucket) String() string {
 	switch b {
+	case BucketUnset:
+		return ""
 	case BucketValues:
 		return "values"
 	case BucketMaster:
@@ -45,8 +56,10 @@ func (b Bucket) String() string {
 	}
 }
 
-// Valid reports whether b is a declared bucket.
-func (b Bucket) Valid() bool { return b >= BucketValues && b <= BucketCustom }
+// Valid reports whether b is a declared bucket. [BucketUnset] is one: a
+// hub-level datapoint has no paramset, and refusing it would make the model
+// unable to address half of a consumer's tree.
+func (b Bucket) Valid() bool { return b >= BucketUnset && b <= BucketCustom }
 
 // Slot is a datapoint's coordinate — never a topic string.
 //

@@ -107,11 +107,26 @@ func TestSlotRejectsUnaddressable(t *testing.T) {
 		"no address": model.S("", "", model.BucketValues, "x"),
 		"no path":    model.S("d", "", model.BucketValues),
 		"empty seg":  model.S("d", "", model.BucketValues, "a", "", "b"),
-		"no bucket":  {Address: "d", Path: []string{"x"}},
+		"bad bucket": {Address: "d", Bucket: model.Bucket(99), Path: []string{"x"}},
 	} {
 		if slot.Valid() {
 			t.Errorf("%s: reported valid", name)
 		}
+	}
+}
+
+// TestUnsetBucketAddressesAHubDatapoint pins the zero value as a legitimate
+// coordinate: a system variable or a program is not on a channel and has no
+// paramset, so refusing it would leave half a consumer's tree unaddressable.
+func TestUnsetBucketAddressesAHubDatapoint(t *testing.T) {
+	t.Parallel()
+
+	slot := model.S("hub:ccu1", "", model.BucketUnset, "sysvar", "Anwesenheit")
+	if !slot.Valid() {
+		t.Fatal("a hub datapoint with no paramset reported invalid")
+	}
+	if got := slot.Bucket.String(); got != "" {
+		t.Errorf("Bucket.String() = %q, want empty so the segment disappears", got)
 	}
 }
 
