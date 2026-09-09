@@ -12,7 +12,7 @@
 // Two normalisers live here and they are deliberately different strengths.
 // [Safe] only removes characters MQTT itself forbids in a topic segment, so a
 // device name survives recognisably. [Slug] is aggressive, producing the
-// [a-z0-9_] Home Assistant wants for an object id — including transliterating
+// [a-z0-9_-] Home Assistant accepts for an object id — including transliterating
 // German umlauts the way Home Assistant's own slugify does, so "Größe" becomes
 // "groesse" rather than "gr_e".
 package topic
@@ -138,9 +138,9 @@ var transliterations = strings.NewReplacer(
 	"ñ", "n", "ç", "c",
 )
 
-// Slug produces the [a-z0-9_] form Home Assistant uses for a node id or an
+// Slug produces the [a-z0-9_-] form Home Assistant accepts for a node id or an
 // object id: transliterated, lowercased, runs of separators collapsed, ends
-// trimmed.
+// trimmed. The hyphen is preserved — see the case below.
 //
 // An input that reduces to nothing yields "x" rather than an empty string,
 // because an empty segment would produce a malformed discovery topic that
@@ -153,7 +153,12 @@ func Slug(s string) string {
 	lastSep := true // leading separators are trimmed by never writing them
 	for _, r := range s {
 		switch {
-		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			// The hyphen survives. Home Assistant's own topic matcher accepts
+			// [a-zA-Z0-9_-] in a node id, and a consumer that composes a
+			// sub-device id as "<parent>-<group>" needs the two separators to
+			// stay distinguishable — folding it to "_" collides that id with a
+			// sibling that legitimately contains an underscore.
 			b.WriteRune(r)
 			lastSep = false
 		case r >= 'A' && r <= 'Z':
