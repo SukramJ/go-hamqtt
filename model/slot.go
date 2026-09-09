@@ -73,6 +73,17 @@ func (b Bucket) Valid() bool { return b >= BucketUnset && b <= BucketCustom }
 // six segments deep; a UniFi port is named, not numbered. A fixed arity or an
 // integer channel would fit exactly one of those.
 type Slot struct {
+	// Scope names the containers the device sits in, outermost first: a
+	// controller and a wire interface, a site, a gateway. Empty for a consumer
+	// whose devices hang directly off the root.
+	//
+	// It lives here rather than being looked up from the device because a Slot
+	// is a complete coordinate — [topic.Layout] resolves one without further
+	// context, and the runtime therefore never has to carry a device around to
+	// render a topic. That is not a new liberty: Address is already a device
+	// property (it *is* [Identity.UID]), so a Slot already embeds enough
+	// identity to stand alone. Scope is the same kind of field.
+	Scope []string
 	// Address is the owning device's [Identity.UID].
 	Address string
 	// Channel sub-addresses within the device. Empty at device level.
@@ -90,6 +101,17 @@ type Slot struct {
 //	model.S(dev, "3", model.BucketMaster, "BSH", "Common", "Setting", "PowerState")
 func S(address, channel string, bucket Bucket, path ...string) Slot {
 	return Slot{Address: address, Channel: channel, Bucket: bucket, Path: path}
+}
+
+// In returns a copy of s scoped to the given containers, outermost first:
+//
+//	model.S(dev, "3", model.BucketValues, "TEMPERATURE").In(central, iface)
+//
+// Separate from [S] so the common case — a consumer whose devices hang off the
+// root — stays a four-argument call.
+func (s Slot) In(scope ...string) Slot {
+	s.Scope = scope
+	return s
 }
 
 // Leaf is the last path segment — the datapoint's own name, without its
@@ -112,6 +134,13 @@ func (s Slot) Valid() bool {
 			return false
 		}
 	}
+	// An empty scope segment would silently vanish from the rendered topic and
+	// move the datapoint one level up, into another device's tree.
+	for _, sc := range s.Scope {
+		if sc == "" {
+			return false
+		}
+	}
 	return true
 }
 
@@ -121,6 +150,10 @@ func (s Slot) Valid() bool {
 // legality, only about being unique and stable for a given coordinate.
 func (s Slot) Key() string {
 	var b strings.Builder
+	for _, sc := range s.Scope {
+		b.WriteString(sc)
+		b.WriteByte('|')
+	}
 	b.WriteString(s.Address)
 	b.WriteByte('|')
 	b.WriteString(s.Channel)

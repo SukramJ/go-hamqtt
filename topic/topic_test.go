@@ -148,3 +148,53 @@ func TestUnsetBucketDropsTheSegment(t *testing.T) {
 		t.Errorf("State = %q, want %q", got, want)
 	}
 }
+
+// TestScopeRendersAboveTheDevice covers the segments a consumer puts between
+// the root and the device: openccu-loom has two (a CCU name and a wire
+// interface), go-unifi2mqtt one (a site), and the other four have none.
+func TestScopeRendersAboveTheDevice(t *testing.T) {
+	t.Parallel()
+
+	l := topic.Default{Root: "loom"}
+	slot := model.S("VCU1234", "3", model.BucketValues, "TEMPERATURE").In("ccu-1", "HmIP-RF")
+
+	if got, want := l.State(slot), "loom/ccu-1/HmIP-RF/VCU1234/3/values/TEMPERATURE"; got != want {
+		t.Errorf("State = %q, want %q", got, want)
+	}
+	if got, want := l.Command(slot), "loom/ccu-1/HmIP-RF/VCU1234/3/values/TEMPERATURE/set"; got != want {
+		t.Errorf("Command = %q, want %q", got, want)
+	}
+
+	// One segment, and none, are the other two shapes in the family.
+	one := model.S("aabbcc", "", model.BucketValues, "poe").In("default")
+	if got, want := one.String(), "default|aabbcc||values|poe"; got != want {
+		t.Errorf("Key = %q, want %q", got, want)
+	}
+	if got, want := l.State(model.S("d", "", model.BucketValues, "x")), "loom/d/values/x"; got != want {
+		t.Errorf("unscoped State = %q, want %q", got, want)
+	}
+}
+
+// TestScopeDistinguishesSlots guards the map key: two devices with the same
+// address under different controllers are different datapoints, and collapsing
+// them would merge one CCU's state into another's.
+func TestScopeDistinguishesSlots(t *testing.T) {
+	t.Parallel()
+
+	a := model.S("VCU1234", "3", model.BucketValues, "STATE").In("ccu-1", "HmIP-RF")
+	b := model.S("VCU1234", "3", model.BucketValues, "STATE").In("ccu-2", "HmIP-RF")
+	if a.Equal(b) {
+		t.Errorf("slots under different scopes compared equal (%q)", a.Key())
+	}
+}
+
+// TestEmptyScopeSegmentIsInvalid: an empty segment would vanish from the
+// rendered topic and move the datapoint one level up, into another device's
+// tree — silently.
+func TestEmptyScopeSegmentIsInvalid(t *testing.T) {
+	t.Parallel()
+
+	if model.S("d", "", model.BucketValues, "x").In("ccu-1", "").Valid() {
+		t.Error("a slot with an empty scope segment reported valid")
+	}
+}
