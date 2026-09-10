@@ -24,6 +24,9 @@ type StdContext struct {
 	// Enc selects the state payload shape. The zero value is
 	// [EnvelopeEncoding].
 	Enc Encoding
+	// Translator resolves a catalogue key into [Lang]. Nil means the key is
+	// its own label, which is what a consumer with no catalogue wants.
+	Translator func(key string) string
 }
 
 var _ Context = StdContext{}
@@ -44,6 +47,60 @@ func (c StdContext) Language() string { return c.Lang }
 
 // Encoding implements [Context].
 func (c StdContext) Encoding() Encoding { return c.Enc }
+
+// EntityStateTopic implements [Context].
+//
+// The aggregate is addressed as [model.BucketCustom] on the entity's own
+// channel, with the entity key as the path — the coordinate a composite would
+// use for a datapoint it owns rather than reads. Deriving it from the first
+// binding keeps scope, address and channel identical to the parts, so the
+// aggregate lands beside them in the tree instead of at the device root.
+func (c StdContext) EntityStateTopic(dev *model.Device, e model.Entity) string {
+	return c.Layout.State(entitySlot(dev, e))
+}
+
+// MethodTopic implements [Context].
+//
+// The method is one segment below the aggregate's command topic, so one
+// wildcard subscription covers every method an entity declares — a consumer
+// that subscribed per method would have to know the list up front and would
+// silently ignore a method it had not enumerated.
+func (c StdContext) MethodTopic(dev *model.Device, e model.Entity, method string) string {
+	base := c.Layout.Command(entitySlot(dev, e))
+	if method == "" {
+		return base
+	}
+	return base + "/" + topic.Safe(method)
+}
+
+// Translate implements [Context]. Without a translator a key is its own
+// label, so a consumer with no catalogue still renders something readable
+// rather than an empty string.
+func (c StdContext) Translate(key string) string {
+	if c.Translator == nil {
+		return key
+	}
+	return c.Translator(key)
+}
+
+// entitySlot is the coordinate of an entity's own aggregate.
+func entitySlot(dev *model.Device, e model.Entity) model.Slot {
+	slot := model.Slot{Bucket: model.BucketCustom, Path: []string{e.Key()}}
+	if dev != nil {
+		slot.Address = dev.UID()
+	}
+	// Inherit the scope and channel of what the entity binds, so the
+	// aggregate sits with its parts. A composite spanning channels takes the
+	// first, which is the one its key is scoped to.
+	if binds := e.Bindings(); len(binds) > 0 {
+		slot.Scope = binds[0].Slot.Scope
+		slot.Channel = binds[0].Slot.Channel
+		if slot.Address == "" {
+			slot.Address = binds[0].Slot.Address
+		}
+	}
+	return slot
+}
 
 // Availability implements [Context], turning the entity's declared levels into
 // Home Assistant's availability list.

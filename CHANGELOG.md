@@ -3,6 +3,40 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.0] - 2026-09-10
+
+### Added
+
+- **`Context.EntityStateTopic`, `Context.MethodTopic` and
+  `Context.Translate`** — the three things a composite entity needs
+  that the contract could not express.
+
+  `EntityStateTopic` is the entity's *own* aggregate topic, carrying
+  the curated document its derived roles are read out of. A climate
+  reads its current temperature from a sensor's topic and its
+  `hvac_action` from an aggregate no datapoint publishes; only the
+  first of those was expressible.
+
+  `MethodTopic` is where an entity listens for a named action. Not
+  every command is a write to a datapoint — a cover's stop, a siren's
+  turn_on, a port reset — and pointing Home Assistant at one of the
+  parameters involved makes the other payloads write nonsense to it.
+  The method sits one segment below the aggregate's command topic, so
+  one wildcard subscription covers every method an entity declares.
+
+  `Translate` resolves a catalogue key. `Language` alone was not
+  enough: the catalogues live with the consumer, so the model could
+  ask for a label but not look one up. `StdContext` returns the key
+  unchanged without a translator, which keeps a consumer with no
+  catalogue rendering something readable and lets a caller tell a
+  missing translation from an empty one.
+
+### Changed
+
+- **`Context` gained three methods**, so an implementation that is not
+  `StdContext` must add them. `StdContext` implements all three, and
+  a consumer embedding it inherits them.
+
 ## [0.12.0] - 2026-09-09
 
 ### Fixed
