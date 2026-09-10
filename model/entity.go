@@ -80,10 +80,16 @@ func Bind(e Entity, role string) (Binding, bool) {
 type Command struct {
 	// Entity is the entity the command addressed.
 	Entity Entity
-	// Role is the writable binding it arrived on.
+	// Role is the writable binding it arrived on. Empty for a method.
 	Role string
-	// Slot is that binding's datapoint.
+	// Slot is that binding's datapoint. Zero for a method, which writes no
+	// datapoint by definition.
 	Slot Slot
+	// Method is the named action this command invokes, for a command that
+	// arrived on a method topic rather than a binding's. Empty otherwise, so
+	// a [Commander] tells the two apart by asking rather than by inspecting
+	// a zero Slot.
+	Method string
 	// Payload is the raw bytes Home Assistant sent.
 	Payload []byte
 }
@@ -100,6 +106,28 @@ type Command struct {
 // that.
 type Commander interface {
 	Command(ctx context.Context, cmd Command) error
+}
+
+// Invoker declares the named actions an entity accepts.
+//
+// A method is an instruction that writes no datapoint: running a program,
+// stopping a cover mid-travel, resetting a counter. Pointing Home Assistant at
+// one of the parameters such an action happens to touch makes every other
+// payload on that topic write nonsense to it, which is why these are addressed
+// separately — see [discovery.Context]'s MethodTopic.
+//
+// Declaring one is what makes it reachable. Without this interface the model
+// could render a method topic but nothing could say a method existed, so the
+// topic had no way of being advertised and an inbound command on it had no way
+// of being routed.
+//
+// An entity with exactly one method and no writable binding is the common case
+// — a button — and the render path wires it up on its own. An entity with
+// several needs a [discovery.Builder]: Home Assistant names a key per action
+// on the platforms that have them (`pause_command_topic`,
+// `start_mowing_command_topic`), and only the entity knows which is which.
+type Invoker interface {
+	Methods() []string
 }
 
 // Suppressor names entities of the same device that this one replaces.

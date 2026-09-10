@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.17.0] - 2026-09-10
+
+### Added
+
+- **`model.Invoker`** — an entity declares the named actions it
+  accepts. 0.13.0 added `Context.MethodTopic` without any way to say a
+  method existed, so the topic could be rendered but never advertised,
+  and an inbound command on it had nowhere to be routed.
+
+  An entity with exactly one method and no writable binding is the
+  common case — a button that runs a program — and the render path
+  wires it to `command_topic` on its own. Before this, such an entity
+  rendered with no `command_topic` at all, which `Validate` rejects:
+  `"command_topic" is required by platform "button"`.
+
+  An entity with several methods is left alone deliberately. Home
+  Assistant names a key per action on the platforms that have them
+  (`pause_command_topic`, `start_mowing_command_topic`), so choosing
+  one here would silently make the rest unreachable. Those entities
+  fill their own `Fields` through a `Builder`.
+
+  A writable `RoleCommand` binding still wins. A method is the
+  fallback for an entity with no datapoint to write, never an
+  override of one that has.
+
+- **`Command.Method`** — the named action an inbound command invoked,
+  empty for a command that arrived on a binding's topic. A
+  `Commander` tells the two apart by asking rather than by inspecting
+  a zero `Slot`.
+
 ## [0.16.0] - 2026-09-10
 
 ### Fixed
