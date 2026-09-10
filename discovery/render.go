@@ -249,6 +249,19 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	}
 	if b, ok := model.Bind(e, model.RoleCommand); ok && b.Mode.CanWrite() && accepts["command_topic"] {
 		comp.CommandTopic = ctx.CommandTopic(b.Slot)
+	} else if accepts["command_topic"] {
+		// An entity whose only inbound instruction is a named action — a
+		// button that runs a program, say — has no writable binding to take a
+		// topic from. One method is unambiguous, so it becomes the command
+		// topic; several are not, because Home Assistant names a key per
+		// action on the platforms that have them, and picking one here would
+		// silently make the rest unreachable. Those entities fill their own
+		// Fields through a [Builder].
+		if inv, ok := e.(model.Invoker); ok {
+			if methods := inv.Methods(); len(methods) == 1 {
+				comp.CommandTopic = ctx.MethodTopic(dev, e, methods[0])
+			}
+		}
 	}
 
 	if builder, ok := e.(Builder); ok {
