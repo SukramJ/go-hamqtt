@@ -31,6 +31,35 @@ type Context interface {
 	// Encoding says whether state topics carry a JSON envelope or a bare
 	// value, which decides whether a component needs a value template.
 	Encoding() Encoding
+
+	// EntityStateTopic is a composite entity's own aggregate topic — the one
+	// carrying the curated document its roles are read out of, rather than
+	// any single datapoint's.
+	//
+	// A composite needs both: [StateTopic] for the datapoints it reads
+	// directly, and this for the fields it derives. A climate reads its
+	// current temperature from the sensor's own topic and its hvac_action
+	// from an aggregate no datapoint publishes.
+	EntityStateTopic(dev *model.Device, e model.Entity) string
+
+	// MethodTopic is where an entity listens for a named action.
+	//
+	// Not every command is a write to a datapoint. A cover's "stop", a
+	// siren's "turn_on", a lock's short-time open: each reduces to one
+	// operation the entity performs, and pointing Home Assistant at one of
+	// the parameters involved makes the other payloads write nonsense to it.
+	// Consumers whose devices expose actions rather than settable values —
+	// a port reset, a scene trigger — need this as their only command
+	// surface.
+	MethodTopic(dev *model.Device, e model.Entity, method string) string
+
+	// Translate resolves a catalogue key into the context's language.
+	//
+	// [Language] alone is not enough: the catalogues live with the consumer,
+	// so the model can ask for a label but cannot look one up. A key with no
+	// entry comes back unchanged, which is what lets a caller tell a missing
+	// translation from an empty one.
+	Translate(key string) string
 }
 
 // Encoding is the shape of a state payload.

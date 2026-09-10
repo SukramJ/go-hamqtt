@@ -291,3 +291,79 @@ func TestRenderedCompositeValidates(t *testing.T) {
 		t.Fatalf("Validate: %v", err)
 	}
 }
+
+// TestCompositeAggregateAndMethodTopics covers the two topics a composite
+// entity needs that no single datapoint can supply.
+//
+// A climate reads its current temperature from a sensor's own topic but its
+// derived fields from an aggregate nothing publishes on its own, and its
+// commands often reduce to a named operation rather than a write to one of
+// the parameters involved — pointing Home Assistant at one of them makes the
+// other payloads write nonsense to it.
+func TestCompositeAggregateAndMethodTopics(t *testing.T) {
+	t.Parallel()
+
+	dev := testDevice()
+	c := newClimate(dev.UID())
+	ctx := testContext()
+
+	const wantAggregate = "daikin/serial:AC-1/custom/climate"
+	if got := ctx.EntityStateTopic(dev, c); got != wantAggregate {
+		t.Errorf("EntityStateTopic = %q, want %q", got, wantAggregate)
+	}
+	if got := ctx.MethodTopic(dev, c, "set_temperature"); got != wantAggregate+"/set/set_temperature" {
+		t.Errorf("MethodTopic = %q, want the aggregate's command topic plus the method", got)
+	}
+	// One wildcard covers every method: a consumer subscribing per method
+	// would have to enumerate them and would ignore any it had missed.
+	if got := ctx.MethodTopic(dev, c, ""); got != wantAggregate+"/set" {
+		t.Errorf("MethodTopic with no method = %q, want the bare command topic", got)
+	}
+	// A slash in a method name cannot add a topic level.
+	if got := ctx.MethodTopic(dev, c, "a/b"); got != wantAggregate+"/set/a_b" {
+		t.Errorf("MethodTopic did not sanitise the method: %q", got)
+	}
+}
+
+// TestAggregateSitsWithItsParts pins the coordinate choice: the aggregate
+// inherits the scope and channel of what the entity binds, so it lands beside
+// the datapoints instead of at the device root where nothing relates it to
+// them.
+func TestAggregateSitsWithItsParts(t *testing.T) {
+	t.Parallel()
+
+	dev := testDevice()
+	e := &model.Basic{
+		EntityKey:      "lock",
+		EntityPlatform: hacatalog.PlatformLock,
+		Binds: []model.Binding{{
+			Role: model.RoleState,
+			Slot: model.S(dev.UID(), "3", model.BucketValues, "STATE").In("ccu-01", "HmIP-RF"),
+			Mode: model.Read,
+		}},
+	}
+	const want = "daikin/ccu-01/HmIP-RF/serial:AC-1/3/custom/lock"
+	if got := testContext().EntityStateTopic(dev, e); got != want {
+		t.Errorf("EntityStateTopic = %q, want %q", got, want)
+	}
+}
+
+// TestTranslateFallsBackToTheKey keeps a consumer without a catalogue from
+// rendering empty labels, and lets a caller tell a missing translation from
+// an empty one.
+func TestTranslateFallsBackToTheKey(t *testing.T) {
+	t.Parallel()
+
+	if got := (discovery.StdContext{}).Translate("discovery.entity_name.boost"); got != "discovery.entity_name.boost" {
+		t.Errorf("Translate = %q, want the key unchanged", got)
+	}
+	ctx := discovery.StdContext{Translator: func(k string) string {
+		if k == "discovery.entity_name.boost" {
+			return "Boost"
+		}
+		return k
+	}}
+	if got := ctx.Translate("discovery.entity_name.boost"); got != "Boost" {
+		t.Errorf("Translate = %q, want Boost", got)
+	}
+}
