@@ -119,6 +119,19 @@ type Description struct {
 	// Name is the entity's display name.
 	Name Localized
 
+	// NameKey is a catalogue key resolved through [discovery.Context]'s
+	// Translate when Name carries no text. It exists because a rule table
+	// names entities by key rather than by string: the table is written once
+	// and the catalogues are per-consumer and per-language, so a rule that
+	// set a literal name would pin one language into the table.
+	//
+	// Name wins when both are set — a literal is a deliberate override of
+	// whatever the catalogue says, and the other precedence would make the
+	// override unreachable. A key with no translator behind it resolves to
+	// itself rather than to nothing, so a consumer with no catalogue still
+	// renders something readable.
+	NameKey string
+
 	// DeviceClass, StateClass and Unit are Home Assistant's measurement
 	// vocabulary. Their legal combinations are not free — see
 	// [hacatalog.Relations] — and [discovery.Validate] enforces them.

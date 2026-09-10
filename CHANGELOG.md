@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.14.0] - 2026-09-10
+
+### Added
+
+- **`Description.NameKey` and `Overlay.NameKey`** — a catalogue key
+  instead of a literal name. 0.13.0 added `Context.Translate` without
+  the field it resolves, so nothing on the render path ever called it;
+  this is the other half. A rule table names entities by key because
+  the table outlives any one language, and the catalogues live with
+  the consumer.
+
+  `Name` wins when both are set: a literal is a deliberate override of
+  whatever the catalogue says, and the other precedence would make the
+  override unreachable. A key with no translator behind it resolves to
+  itself, so a consumer with no catalogue still renders something
+  readable.
+
+### Changed
+
+- **`Match.Leaves` and `Match.KeyContains` now fold case.** `Models`
+  already did, so one rule table matched case-insensitively on the
+  device and case-sensitively on the parameter — a split nothing
+  justified. A vendor vocabulary has a house style, and a rule author
+  writes a parameter the way the vendor prints it.
+
+  `Match.Keys` deliberately stays case-sensitive. An entity key is the
+  consumer's own identifier and doubles as the component key inside a
+  bundle, where two keys differing only in case are two components. A
+  substring probe makes no such claim about identity.
+
 ## [0.13.0] - 2026-09-10
 
 ### Added

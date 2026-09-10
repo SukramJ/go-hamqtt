@@ -33,7 +33,10 @@ type Match struct {
 	// Keys matches the entity key exactly.
 	Keys []string
 	// Leaves matches the last path segment of the entity's state slot, which
-	// is usually the vendor's parameter name.
+	// is usually the vendor's parameter name. Matched case-insensitively:
+	// a vendor vocabulary has a house style — Homematic shouts, Home Connect
+	// uses dotted CamelCase — and a rule author writes the name the way the
+	// vendor prints it, which is not always the way the wire spells it.
 	Leaves []string
 	// Models matches the device model, case-insensitively, by prefix. A
 	// device family shares a prefix far more often than an exact name.
@@ -44,8 +47,13 @@ type Match struct {
 	// Unit matches the description's current unit, for a rule that refines
 	// what an earlier one established.
 	Unit *model.Unit
-	// KeyContains is a substring test on the entity key, for the long tail
-	// that no exact list covers.
+	// KeyContains is a case-insensitive substring test on the entity key, for
+	// the long tail that no exact list covers.
+	//
+	// Keys, by contrast, stays case-sensitive: an entity key is the
+	// consumer's own identifier and is also the component key inside a
+	// bundle, where two keys differing only in case are two components. A
+	// substring probe makes no such claim about identity.
 	KeyContains *string
 }
 
@@ -54,7 +62,10 @@ type Match struct {
 // clears an icon and a rule that says nothing about icons are different
 // things.
 type Overlay struct {
-	Name        *model.Localized
+	Name *model.Localized
+	// NameKey sets [model.Description.NameKey] — the usual way a rule table
+	// names an entity, since the table outlives any one language.
+	NameKey     *string
 	DeviceClass *model.DeviceClass
 	StateClass  *hacatalog.StateClass
 	Unit        *model.Unit
@@ -159,7 +170,7 @@ func (m Match) matches(dev *model.Device, e model.Entity) bool {
 	if len(m.Keys) > 0 && !containsString(m.Keys, e.Key()) {
 		return false
 	}
-	if m.KeyContains != nil && !strings.Contains(e.Key(), *m.KeyContains) {
+	if m.KeyContains != nil && !containsFold(e.Key(), *m.KeyContains) {
 		return false
 	}
 	if len(m.Models) > 0 && !hasModelPrefix(m.Models, dev) {
@@ -176,7 +187,7 @@ func (m Match) matches(dev *model.Device, e model.Entity) bool {
 		if !ok {
 			return false
 		}
-		if len(m.Leaves) > 0 && !containsString(m.Leaves, slot.Leaf()) {
+		if len(m.Leaves) > 0 && !containsFoldString(m.Leaves, slot.Leaf()) {
 			return false
 		}
 		if len(m.Buckets) > 0 && !containsBucket(m.Buckets, slot.Bucket) {
@@ -207,6 +218,9 @@ func (o Overlay) applyTo(d *model.Description) {
 	}
 	if o.Name != nil {
 		d.Name = *o.Name
+	}
+	if o.NameKey != nil {
+		d.NameKey = *o.NameKey
 	}
 	if o.DeviceClass != nil {
 		d.DeviceClass = *o.DeviceClass
@@ -305,6 +319,19 @@ func containsString(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func containsFoldString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if strings.EqualFold(s, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsFold(haystack, needle string) bool {
+	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
 }
 
 func containsPlatform(haystack []hacatalog.Platform, needle hacatalog.Platform) bool {
