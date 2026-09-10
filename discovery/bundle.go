@@ -30,8 +30,13 @@ const DefaultPrefix = "homeassistant"
 // orphan sweep — tell one bridge's retained topics from another's.
 type Origin struct {
 	Name string `json:"name"`
-	SW   string `json:"sw,omitempty"`
-	URL  string `json:"url,omitempty"`
+	// SW and URL carry Home Assistant's canonical spellings, `sw_version` and
+	// `support_url`. Its abbreviation table maps `sw` and `url` onto them and
+	// it accepts either, but every other key this package emits is the long
+	// form — a payload that mixes the two reads as though one of them were a
+	// different key.
+	SW  string `json:"sw_version,omitempty"`
+	URL string `json:"support_url,omitempty"`
 }
 
 // DeviceInfo is the `device` block.
