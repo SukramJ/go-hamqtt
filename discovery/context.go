@@ -127,30 +127,59 @@ func (c StdContext) Availability(dev *model.Device, e model.Entity) []Availabili
 			}
 
 		case model.LevelSelf:
-			b, ok := model.Bind(e, model.RoleAvailability)
-			if !ok {
-				// Fall back to the state binding: with an envelope, the state
-				// payload already carries the availability flag, so a
-				// datapoint that reports its own validity needs no second
-				// topic. With raw encoding there is nothing to read, so the
-				// level is dropped.
-				if c.Enc != EnvelopeEncoding {
-					continue
-				}
-				b, ok = model.Bind(e, model.RoleState)
-				if !ok {
-					continue
-				}
+			if entry, ok := c.selfAvailability(e); ok {
+				out = append(out, entry)
 			}
-			out = append(out, AvailabilityEntry{
-				Topic:               c.Layout.State(b.Slot),
-				ValueTemplate:       AvailabilityTemplate,
-				PayloadAvailable:    "true",
-				PayloadNotAvailable: "false",
-			})
 		}
 	}
 	return out
+}
+
+// selfAvailability resolves [model.LevelSelf], which has two shapes that read
+// different things and must not be conflated.
+//
+// An explicit [model.RoleAvailability] binding is a datapoint whose *value*
+// says whether the entity is available. Its envelope's own `available` flag
+// says something else entirely — whether that datapoint is itself reachable —
+// so the template reads `.value`, exactly as any other state binding does.
+// Reading `.available` here would make the explicit binding indistinguishable
+// from the fallback below except for which topic it points at, and would
+// answer a question nobody asked.
+//
+// Without such a binding the fallback reads the state datapoint's envelope
+// flag, where `.available` is the right field. That shape needs the envelope:
+// a raw payload carries no flag, and the level is dropped.
+func (c StdContext) selfAvailability(e model.Entity) (AvailabilityEntry, bool) {
+	if b, ok := model.Bind(e, model.RoleAvailability); ok {
+		entry := AvailabilityEntry{
+			Topic:               c.Layout.State(b.Slot),
+			PayloadAvailable:    "true",
+			PayloadNotAvailable: "false",
+		}
+		// Raw encoding publishes the bare boolean, so there is nothing to
+		// reach into. Templating it anyway renders `value_json` undefined,
+		// which matches neither payload — and Home Assistant ignores an
+		// availability payload it does not recognise, leaving the entity
+		// permanently unavailable with nothing on the wire to show why.
+		if c.Enc == EnvelopeEncoding {
+			entry.ValueTemplate = SelfAvailabilityTemplate
+		}
+		return entry, true
+	}
+
+	if c.Enc != EnvelopeEncoding {
+		return AvailabilityEntry{}, false
+	}
+	b, ok := model.Bind(e, model.RoleState)
+	if !ok {
+		return AvailabilityEntry{}, false
+	}
+	return AvailabilityEntry{
+		Topic:               c.Layout.State(b.Slot),
+		ValueTemplate:       AvailabilityTemplate,
+		PayloadAvailable:    "true",
+		PayloadNotAvailable: "false",
+	}, true
 }
 
 func plainAvailability(t string) AvailabilityEntry {

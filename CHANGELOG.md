@@ -3,6 +3,41 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.15.0] - 2026-09-10
+
+### Fixed
+
+- **`LevelSelf` read the wrong field of the right topic.** An entity
+  naming a [`RoleAvailability`] binding got
+  `{{ value_json.available | lower }}` — the envelope's *reachability*
+  flag for that datapoint, not the value the datapoint publishes.
+  Those are different questions, and reading the first made the
+  explicit binding indistinguishable from the fallback except for
+  which topic it pointed at.
+
+  `RoleAvailability` is documented as "a binding whose value says
+  whether the entity is available", so the template now reads
+  `.value`, as any other state binding does. The new
+  `SelfAvailabilityTemplate` is that shape; `AvailabilityTemplate`
+  keeps its meaning and stays correct for the fallback, where the
+  state datapoint's own `available` flag is the right field and the
+  only one there is.
+
+- **`LevelSelf` templated a raw payload.** Under `RawEncoding` an
+  explicit availability binding still got a Jinja template applied to
+  a bare value. `value_json` renders undefined, which equals neither
+  `payload_available` nor `payload_not_available`, and Home Assistant
+  silently ignores an availability payload it does not recognise — so
+  the entity stayed unavailable forever with nothing on the wire, and
+  nothing in any log, to show why. The template is now omitted where
+  there is no envelope to reach into.
+
+  The implicit fallback is unchanged: with no binding and no envelope
+  there is no flag at all, so the level still resolves to nothing
+  rather than to a broken entry.
+
+Neither branch had a single test before this change.
+
 ## [0.14.0] - 2026-09-10
 
 ### Added
