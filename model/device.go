@@ -37,7 +37,30 @@ type Identifier struct {
 }
 
 // String renders the identifier as Home Assistant sees it in `identifiers`.
-func (id Identifier) String() string { return id.Namespace + ":" + id.Value }
+//
+// An empty namespace renders the value alone, and that is the escape hatch
+// rather than an edge case. Home Assistant keys its *device* registry on these
+// strings, and it has no migration path for them any more than it has one for
+// a unique id: change a device's identifier and the old device stays behind
+// with its area, its name override and its place in the hierarchy, while the
+// entities move to a new one. A consumer whose devices are already published
+// under its own spelling therefore has to be able to keep it verbatim, which a
+// hard-coded separator would make impossible.
+//
+// New consumers should use the namespace. It is what stops two bridges'
+// devices from colliding in the registry the moment their identifiers happen
+// to match.
+func (id Identifier) String() string {
+	if id.Namespace == "" {
+		return id.Value
+	}
+	return id.Namespace + ":" + id.Value
+}
+
+// IsZero reports whether the identifier names nothing. An identifier with no
+// value is not an identifier: Home Assistant would register the device under
+// the empty string, where it collides with every other such device.
+func (id Identifier) IsZero() bool { return id.Value == "" }
 
 // Connection is a network-level identity Home Assistant can match against
 // other integrations — the `connections` block. Type is Home Assistant's own
@@ -66,7 +89,7 @@ type Identity struct {
 // An Identity with no identifiers has no UID; callers get an empty string and
 // [Identity.Valid] reports false.
 func (id Identity) UID() string {
-	if len(id.IDs) == 0 {
+	if len(id.IDs) == 0 || id.IDs[0].IsZero() {
 		return ""
 	}
 	return id.IDs[0].String()
@@ -77,7 +100,12 @@ func (id Identity) UID() string {
 // this is the same condition, checked before the payload is built rather than
 // after the broker has it.
 func (id Identity) Valid() bool {
-	return len(id.IDs) > 0 || len(id.Connections) > 0
+	for _, i := range id.IDs {
+		if !i.IsZero() {
+			return true
+		}
+	}
+	return len(id.Connections) > 0
 }
 
 // Equal reports whether two identities describe the same device: any shared

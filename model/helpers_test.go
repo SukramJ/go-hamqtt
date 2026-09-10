@@ -320,3 +320,47 @@ func TestAvailabilityHasResolvesDefaults(t *testing.T) {
 		t.Error("the zero Availability claimed a level it does not have")
 	}
 }
+
+// TestVerbatimIdentifierSpelling: Home Assistant keys its device registry on
+// these strings and has no migration path for them, so a consumer already
+// publishing under its own spelling must be able to keep it byte for byte. A
+// hard-coded separator made that impossible — and produced a leading colon
+// for anyone who tried.
+func TestVerbatimIdentifierSpelling(t *testing.T) {
+	t.Parallel()
+
+	verbatim := model.Identifier{Value: "openccu-loom_hmip_0001abc"}
+	if got := verbatim.String(); got != "openccu-loom_hmip_0001abc" {
+		t.Errorf("String() = %q, want the value unchanged", got)
+	}
+
+	namespaced := model.Identifier{Namespace: "serial", Value: "AC-1"}
+	if got := namespaced.String(); got != "serial:AC-1" {
+		t.Errorf("String() = %q, want the namespaced form", got)
+	}
+}
+
+// TestAnIdentifierWithNoValueNamesNothing: without this an empty identifier
+// registers the device under "", where it collides with every other device
+// whose identity was built from a field that happened to be blank.
+func TestAnIdentifierWithNoValueNamesNothing(t *testing.T) {
+	t.Parallel()
+
+	empty := model.Identity{IDs: []model.Identifier{{}}}
+	if empty.Valid() {
+		t.Error("an identity whose only identifier is empty reported valid")
+	}
+	if got := empty.UID(); got != "" {
+		t.Errorf("UID() = %q, want empty", got)
+	}
+
+	// A connection alone still identifies a device — that is Home
+	// Assistant's own rule, not a concession.
+	withConn := model.Identity{
+		IDs:         []model.Identifier{{}},
+		Connections: []model.Connection{{Type: "mac", Value: "aa:bb:cc:dd:ee:ff"}},
+	}
+	if !withConn.Valid() {
+		t.Error("an identity with a connection reported invalid")
+	}
+}

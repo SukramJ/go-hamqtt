@@ -3,6 +3,33 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.16.0] - 2026-09-10
+
+### Fixed
+
+- **`Identifier.String()` forced one spelling on every consumer.** It
+  hard-coded `namespace + ":" + value`, so a consumer whose devices
+  are already published under its own identifier format could not
+  express them without changing them.
+
+  That is the same break the shared `unique_id` turned out to be, one
+  layer down and less visible. Home Assistant keys its *device*
+  registry on these strings and has no migration path for them: change
+  one and the old device stays behind with its area, its name override
+  and its place in the hierarchy, while the entities move to a new
+  device. The guarantee a consumer needs is not only about entities.
+
+  An empty namespace now renders the value alone, verbatim. A
+  namespaced identifier is unchanged, and remains the recommendation
+  for a new consumer — it is what stops two bridges' devices from
+  colliding in the registry.
+
+- **An empty identifier no longer names a device.** `Identity.Valid()`
+  counted `Identifier{}` as an identifier and `UID()` rendered it as
+  `":"`, so an identity built from a field that happened to be blank
+  registered a device under a string every other such device shares.
+  Both now look at the value.
+
 ## [0.15.0] - 2026-09-10
 
 ### Fixed
