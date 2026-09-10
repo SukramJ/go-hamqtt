@@ -85,7 +85,13 @@ const (
 const ValueTemplate = `{% if value_json is defined and value_json.value is not none %}{{ value_json.value }}{% endif %}`
 
 // AvailabilityTemplate reads the availability flag out of the same envelope.
+// It is the shape for a datapoint that reports whether *it* is reachable.
 const AvailabilityTemplate = `{{ value_json.available | lower }}`
+
+// SelfAvailabilityTemplate reads the value of a datapoint that reports the
+// entity's availability, which is a different question from whether that
+// datapoint is itself reachable — see [model.RoleAvailability].
+const SelfAvailabilityTemplate = `{{ value_json.value | lower }}`
 
 // Payload strings for availability topics.
 const (
