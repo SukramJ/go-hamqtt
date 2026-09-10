@@ -367,3 +367,75 @@ func TestTranslateFallsBackToTheKey(t *testing.T) {
 		t.Errorf("Translate = %q, want Boost", got)
 	}
 }
+
+// TestNameKeyIsResolvedThroughTheTranslator closes the loop opened by
+// Context.Translate: the resolver was there, the field it resolves was not, so
+// nothing on the render path ever called it.
+func TestNameKeyIsResolvedThroughTheTranslator(t *testing.T) {
+	t.Parallel()
+
+	dev := testDevice()
+	e := sensor("level", "level", dev.UID())
+	e.Description = model.Description{NameKey: "pipe_level"}
+
+	ctx := discovery.StdContext{
+		Layout:    topic.Default{Root: "daikin"},
+		Namespace: "daikin",
+		Lang:      "de",
+		Translator: func(key string) string {
+			if key == "pipe_level" {
+				return "Ventilstellung"
+			}
+			return key
+		},
+	}
+	bundle, err := discovery.Render(ctx, dev, []model.Entity{e}, discovery.Origin{Name: "x"})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := bundle.Components["level"].Name; got != "Ventilstellung" {
+		t.Errorf("name = %q, want the translated key", got)
+	}
+}
+
+// TestLiteralNameBeatsNameKey: a literal is a deliberate override of whatever
+// the catalogue says, and the other precedence would make it unreachable.
+func TestLiteralNameBeatsNameKey(t *testing.T) {
+	t.Parallel()
+
+	dev := testDevice()
+	e := sensor("level", "level", dev.UID())
+	e.Description = model.Description{Name: model.L("Valve"), NameKey: "pipe_level"}
+
+	ctx := discovery.StdContext{
+		Layout:     topic.Default{Root: "daikin"},
+		Namespace:  "daikin",
+		Translator: func(string) string { return "Ventilstellung" },
+	}
+	bundle, err := discovery.Render(ctx, dev, []model.Entity{e}, discovery.Origin{Name: "x"})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := bundle.Components["level"].Name; got != "Valve" {
+		t.Errorf("name = %q, want the literal", got)
+	}
+}
+
+// TestNameKeyWithoutATranslatorIsItsOwnFallback: a consumer with no catalogue
+// still renders something readable, and a caller can tell a missing
+// translation from an empty one.
+func TestNameKeyWithoutATranslatorIsItsOwnFallback(t *testing.T) {
+	t.Parallel()
+
+	dev := testDevice()
+	e := sensor("level", "level", dev.UID())
+	e.Description = model.Description{NameKey: "pipe_level"}
+
+	bundle, err := discovery.Render(testContext(), dev, []model.Entity{e}, discovery.Origin{Name: "x"})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got := bundle.Components["level"].Name; got != "pipe_level" {
+		t.Errorf("name = %q, want the key itself", got)
+	}
+}

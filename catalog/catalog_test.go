@@ -439,3 +439,65 @@ func TestUnitCriterionRefinesAnEarlierRule(t *testing.T) {
 		t.Error("the unit criterion did not match")
 	}
 }
+
+// TestLeafMatchIsCaseInsensitive: a rule table is written the way the vendor
+// prints its parameter names, which is not always the way the wire spells
+// them. Models already matched case-insensitively; Leaves did not, so the same
+// table matched on one criterion and missed on the other.
+func TestLeafMatchIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	rules := catalog.Rules{{
+		Match: catalog.Match{Leaves: []string{"ACTUAL_TEMPERATURE"}},
+		Set:   catalog.Overlay{Icon: model.Ptr("mdi:hit")},
+	}}
+	e := entity("actual_temperature", "actual_temperature")
+	if err := rules.Enrich(device("HmIP-BWTH"), e); err != nil {
+		t.Fatalf("Enrich: %v", err)
+	}
+	if e.Description.Icon != "mdi:hit" {
+		t.Error("a leaf spelled in another case did not match")
+	}
+}
+
+// TestKeyContainsIsCaseInsensitiveButKeysAreNot pins the deliberate split: a
+// substring probe is a heuristic over the long tail, an exact key is identity
+// — and inside a bundle two keys differing only in case are two components.
+func TestKeyContainsIsCaseInsensitiveButKeysAreNot(t *testing.T) {
+	t.Parallel()
+
+	rules := catalog.Rules{{
+		Match: catalog.Match{KeyContains: model.Ptr("TEMPERATURE")},
+		Set:   catalog.Overlay{Icon: model.Ptr("mdi:substring")},
+	}, {
+		Match: catalog.Match{Keys: []string{"ACTUAL_TEMPERATURE"}},
+		Set:   catalog.Overlay{Icon: model.Ptr("mdi:exact")},
+	}}
+
+	e := entity("actual_temperature", "x")
+	if err := rules.Enrich(device("HmIP-BWTH"), e); err != nil {
+		t.Fatalf("Enrich: %v", err)
+	}
+	if e.Description.Icon != "mdi:substring" {
+		t.Errorf("KeyContains should fold case and Keys should not, got %q", e.Description.Icon)
+	}
+}
+
+// TestNameKeyIsHowARuleTableNamesAnEntity: the table outlives any one
+// language, so it carries a key. A literal Name set by another rule still
+// wins at render time — see the render tests.
+func TestNameKeyIsHowARuleTableNamesAnEntity(t *testing.T) {
+	t.Parallel()
+
+	rules := catalog.Rules{{
+		Match: catalog.Match{Leaves: []string{"level"}},
+		Set:   catalog.Overlay{NameKey: model.Ptr("pipe_level")},
+	}}
+	e := entity("level", "level")
+	if err := rules.Enrich(device("HmIP-eTRV"), e); err != nil {
+		t.Fatalf("Enrich: %v", err)
+	}
+	if e.Description.NameKey != "pipe_level" {
+		t.Errorf("NameKey = %q, want pipe_level", e.Description.NameKey)
+	}
+}

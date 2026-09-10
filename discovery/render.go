@@ -153,6 +153,19 @@ func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Orig
 	return bundle, nil
 }
 
+// entityName resolves the display name: a literal wins, a catalogue key is
+// translated, and neither leaves the name empty so Home Assistant derives one
+// from the platform or the device class.
+func entityName(ctx Context, desc *model.Description, lang string) string {
+	if name := desc.Name.In(lang); name != "" {
+		return name
+	}
+	if desc.NameKey == "" {
+		return ""
+	}
+	return ctx.Translate(desc.NameKey)
+}
+
 func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component, error) {
 	desc := e.Desc()
 	if desc == nil {
@@ -162,7 +175,7 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 
 	comp := Component{
 		Platform:         e.Platform(),
-		Name:             desc.Name.In(lang),
+		Name:             entityName(ctx, desc, lang),
 		UniqueID:         ctx.UniqueID(dev, e),
 		DeviceClass:      string(desc.DeviceClass),
 		StateClass:       desc.StateClass,
