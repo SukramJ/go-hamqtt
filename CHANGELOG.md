@@ -3,6 +3,38 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.21.0] - 2026-09-11
+
+### Added
+
+- **`ValidateIgnoring` and `ValidateBodyIgnoring`** — validation with a
+  set of keys the consumer publishes on purpose and Home Assistant is
+  known to drop.
+
+  Measured, not anticipated: the validator was run over one consumer's
+  9,996 real retained configs for the first time. It produced 164
+  blocking findings and **zero false positives** — and every one of the
+  164 was the same key, `translation_key`, which that consumer
+  publishes so its cross-stack parity tooling can compare against the
+  Python integration it mirrors. Home Assistant declares the key on no
+  platform and discards it, so the validator is right.
+
+  The consequence was structural rather than semantic: regrouped into
+  device bundles, that one key turned **64 of 398 bundles**
+  `Blocking()`. An invalid bundle publishes nothing at all, so a
+  consumer gating its publish on the validator would have withheld a
+  sixth of its devices.
+
+  The set is a parameter rather than a field on `Bundle`: it is a
+  property of the consumer's judgement, not of the document, and the
+  same document validated by a tool that did not make that judgement
+  should still report the key. `Validate` therefore ignores nothing —
+  a caller has to say so deliberately.
+
+  An ignored key is excused from the unknown-key check and nothing
+  else. A missing required key is still missing, because an entity
+  without it does not work.
+
 ## [0.20.0] - 2026-09-11
 
 Phase 3 of openccu-loom's ADR 0070 asks one question: can that daemon's
