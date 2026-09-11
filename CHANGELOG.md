@@ -3,6 +3,77 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.20.0] - 2026-09-11
+
+Phase 3 of openccu-loom's ADR 0070 asks one question: can that daemon's
+discovery layer be expressed on this model? All eleven of its discovery
+planes were measured, every claimed gap was put through an adversarial
+refutation, and the answer is yes — with these four additions. None is a
+redesign; the ADR stands.
+
+### Added
+
+- **`Context.NodeID` and `Context.ObjectID`.** All three identity
+  strings are now Context methods, for the reason `UniqueID` always
+  was: Home Assistant has no migration path for any of them, so a
+  consumer with a published fleet owns its spellings — and they need
+  not agree with each other. One measured consumer's node id and
+  device identifier are deliberately different strings, which made
+  deriving both from `Identity.UID` wrong whichever way the identity
+  was filled in.
+
+  **An empty `ObjectID` suppresses `default_entity_id` entirely.** A
+  consumer whose fleet never carried the key cannot accept one now:
+  it seeds the entity id where Home Assistant currently derives its
+  own, and Home Assistant does not rename an entity back. Before
+  this the only escape was a `Builder` on every entity whose whole
+  job was to undo the field the pipeline had just set.
+
+  `StdContext` answers all three from this package's own functions,
+  so a consumer with no opinion is unaffected.
+
+- **`RenderComponent` and `NewDeviceInfo`** — the per-entity form as
+  a supported output. It renders one entity with the `device` and
+  `origin` blocks attached and omits `platform`, which the bundle
+  needs as a discriminator and a per-entity topic already states.
+
+  Without it a consumer on that form had to call `Render`, discard
+  the bundle, pull the components back out of the map and re-stamp
+  the frame — post-processing the pipeline, which is the pattern the
+  extraction exists to remove.
+
+- **`Description.ValueTemplate`, with the `model.NoValueTemplate`
+  sentinel.** `Context.Encoding` is one answer for a whole consumer,
+  and a consumer is rarely uniform: bare datapoint topics,
+  composites assembled by a hand-written template, and event
+  entities that must carry none. Five of the eleven measured planes
+  reported a template added where none is published, or the wrong
+  constant. The sentinel exists because an empty string already
+  means "no opinion", and "publish none" is a different statement.
+
+### Changed
+
+- **`topic.Layout.Availability` takes a `model.Slot`, not a
+  `model.Identity`.** Breaking for anyone implementing `Layout`;
+  `Default` is updated.
+
+  An identity carries no scope, and a consumer whose devices sit
+  inside containers — a controller and a wire interface, a site —
+  publishes availability inside them too. The measurement found one
+  such topic **unrenderable by any Layout**: the only item in the
+  whole exercise that no escape hatch could reach, because
+  `Identity` has no scope field and `model` may not import `topic`
+  to acquire one.
+
+- **`Component.Platform` gained `omitempty`**, so the per-entity form
+  can drop it. Inside a bundle it is never empty — see below.
+
+- **`Bundle.Remove` skips a key whose platform it does not know**
+  instead of writing a component without one. Such an entry marshals
+  to `{}`, which Home Assistant ignores, so it was noise in every
+  future publish while the entity it was meant to delete stayed on
+  screen.
+
 ## [0.19.0] - 2026-09-11
 
 ### Added

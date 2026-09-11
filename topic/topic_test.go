@@ -126,12 +126,36 @@ func TestBridgeAndAvailabilityTopics(t *testing.T) {
 	t.Parallel()
 
 	l := topic.Default{Root: "bridge"}
-	id := model.Identity{IDs: []model.Identifier{{Namespace: "serial", Value: "A"}}}
 
 	if got, want := l.Bridge(), "bridge/bridge/status"; got != want {
 		t.Errorf("Bridge = %q, want %q", got, want)
 	}
-	if got, want := l.Availability(id), "bridge/serial:A/availability"; got != want {
+	if got, want := l.Availability(model.Slot{Address: "serial:A"}),
+		"bridge/serial:A/availability"; got != want {
+		t.Errorf("Availability = %q, want %q", got, want)
+	}
+}
+
+// TestAvailabilityCarriesScope is why the call takes a slot rather than an
+// identity. A consumer whose devices sit inside containers — a controller and
+// a wire interface, a site, a gateway — publishes availability inside them
+// too, and an identity has no way to say so: [model.Identity] carries no
+// scope, and `model` cannot import `topic` to acquire one without breaking
+// the rule the layout enforces. One measured consumer's device availability
+// was unrenderable by any Layout because of it.
+func TestAvailabilityCarriesScope(t *testing.T) {
+	t.Parallel()
+
+	l := topic.Default{Root: "loom"}
+	s := model.Slot{Address: "0001ABC"}.In("ccu-01", "HmIP-RF")
+	if got, want := l.Availability(s), "loom/ccu-01/HmIP-RF/0001ABC/availability"; got != want {
+		t.Errorf("Availability = %q, want %q", got, want)
+	}
+
+	// Bucket and Path are not part of a device-level topic and must not leak
+	// into one: the slot passed here is whatever coordinate the caller had.
+	noisy := model.S("0001ABC", "3", model.BucketValues, "TEMPERATURE").In("ccu-01")
+	if got, want := l.Availability(noisy), "loom/ccu-01/0001ABC/availability"; got != want {
 		t.Errorf("Availability = %q, want %q", got, want)
 	}
 }

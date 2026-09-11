@@ -48,7 +48,14 @@ lets six projects with six topic schemas share one model. A change that makes
 
 ## Decisions that are settled
 
-- **Device-based discovery only.** No per-entity form. Recorded in ADR 0070.
+- **Device-based discovery is the recommendation, not the only output.**
+  That decision (ADR 0070) predates this module having a consumer, and the
+  first full one publishes the per-entity form and cannot switch: its
+  retained configs are on brokers, and Home Assistant refuses a bundle while
+  a per-entity config for the same entity is still retained. `Render`
+  produces bundles; `RenderComponent` produces one standalone config with
+  the frame attached. A new consumer should take the bundle — one retained
+  document per device, updated atomically.
 - **One precedence rule**: `Description → enricher chain → default projection
   → Builder → Extra`, later winning. loom had two builder interfaces with
   *opposite* precedence; collapsing them was a precondition for extraction.

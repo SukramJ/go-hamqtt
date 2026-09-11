@@ -163,6 +163,25 @@ type Description struct {
 	// Availability says which sources gate this entity.
 	Availability Availability
 
+	// ValueTemplate overrides the template the render pipeline would derive
+	// from the context's encoding.
+	//
+	// [discovery.Context]'s Encoding is one answer for a whole consumer, and
+	// a consumer is rarely uniform: the same bridge publishes bare datapoint
+	// topics, composite entities whose value is assembled from several
+	// fields by a hand-written template, and event entities that must carry
+	// no template at all. One global answer is wrong for two of those three
+	// whichever way it is set — five of one measured consumer's eleven
+	// discovery planes reported exactly that.
+	//
+	// Set [NoValueTemplate] to publish none. Leaving this empty keeps the
+	// derived behaviour, which is what a uniform consumer wants and why the
+	// zero value is not "suppress".
+	//
+	// It is a template string rather than a topic, so it does not make
+	// `model` depend on `topic` — the rule the package layout enforces.
+	ValueTemplate string
+
 	// Extra carries platform keys the model does not model. Applied last in
 	// the discovery pipeline, so it wins over everything — which makes it
 	// both the escape hatch and the footgun.
@@ -205,6 +224,16 @@ func (d *Description) Clone() *Description {
 	}
 	return &out
 }
+
+// NoValueTemplate is the [Description.ValueTemplate] value that publishes no
+// template at all.
+//
+// A sentinel rather than a second boolean field, because the two states this
+// has to distinguish from each other are "say nothing, let the pipeline
+// decide" and "say explicitly that there is none" — and an empty string
+// already means the first. An event entity that inherited a value template
+// would read its payload through a filter that does not apply to it.
+const NoValueTemplate = "-"
 
 // Ptr returns a pointer to v. It exists because Description's tri-state fields
 // are pointers and a struct literal cannot take the address of a constant.
