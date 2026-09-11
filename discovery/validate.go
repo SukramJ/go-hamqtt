@@ -83,7 +83,29 @@ func (e *ValidationError) Is(target error) bool {
 // that never spoke. The reference implementation published unvalidated, which
 // is how a wrong micro sign could cost a whole device's entities without
 // anyone learning why.
-func Validate(b *Bundle) error {
+func Validate(b *Bundle) error { return ValidateIgnoring(b, nil) }
+
+// ValidateIgnoring is [Validate] with a set of keys the consumer publishes on
+// purpose and Home Assistant is known to drop.
+//
+// Such a key exists: one consumer publishes `translation_key` so its
+// cross-stack parity tooling can compare against the Python integration it
+// mirrors. Home Assistant declares that key on no platform and discards it,
+// which the validator correctly reports — and on a real fleet that one key
+// accounted for every blocking finding on 164 of 9,996 entities, turning 64
+// of 398 device bundles Blocking(). A consumer wiring the validator into its
+// publish path would therefore withhold a sixth of its devices entirely,
+// because an invalid bundle publishes nothing at all.
+//
+// The set is a parameter rather than a field on Bundle: it is a property of
+// the consumer's judgement, not of the document, and the same document
+// validated by a tool that did not make that judgement should still report
+// the key. That is why [Validate] ignores nothing — a caller has to say so
+// deliberately.
+//
+// An ignored key is not checked for anything: not its type, not its
+// platform. The consumer has taken responsibility for it.
+func ValidateIgnoring(b *Bundle, ignore map[string]bool) error {
 	if b == nil {
 		return fmt.Errorf("discovery: nil bundle")
 	}
@@ -114,7 +136,7 @@ func Validate(b *Bundle) error {
 	seenUnique := map[string]string{}
 	for _, key := range b.Keys() {
 		comp := b.Components[key]
-		validateComponent(issues, key, comp, mqtt, relations, deviceClasses, seenUnique)
+		validateComponent(issues, key, comp, mqtt, relations, deviceClasses, seenUnique, ignore)
 	}
 
 	return issues.err(b.NodeID)
@@ -132,12 +154,18 @@ func Validate(b *Bundle) error {
 // The rules are the same ones [Validate] applies per component, because they
 // are the same rules: this function is what [Validate] calls.
 func ValidateBody(platform hacatalog.Platform, body map[string]any) error {
+	return ValidateBodyIgnoring(platform, body, nil)
+}
+
+// ValidateBodyIgnoring is [ValidateBody] with the same deliberate-key set
+// [ValidateIgnoring] takes, for a consumer on the per-entity form.
+func ValidateBodyIgnoring(platform hacatalog.Platform, body map[string]any, ignore map[string]bool) error {
 	issues := &issueList{}
 	mqtt, relations, deviceClasses, err := loadTables()
 	if err != nil {
 		return err
 	}
-	validateBody(issues, string(platform), string(platform), body, mqtt, relations, deviceClasses, nil)
+	validateBody(issues, string(platform), string(platform), body, mqtt, relations, deviceClasses, nil, ignore)
 	return issues.err(string(platform))
 }
 
@@ -168,13 +196,14 @@ func validateComponent(
 	relations hacatalog.Relations,
 	deviceClasses map[string][]string,
 	seenUnique map[string]string,
+	ignore map[string]bool,
 ) {
 	body, err := componentBody(comp)
 	if err != nil {
 		issues.add("%s: cannot encode component: %v", key, err)
 		return
 	}
-	validateBody(issues, key, string(comp.Platform), body, mqtt, relations, deviceClasses, seenUnique)
+	validateBody(issues, key, string(comp.Platform), body, mqtt, relations, deviceClasses, seenUnique, ignore)
 }
 
 func validateBody(
@@ -186,6 +215,7 @@ func validateBody(
 	relations hacatalog.Relations,
 	deviceClasses map[string][]string,
 	seenUnique map[string]string,
+	ignore map[string]bool,
 ) {
 	if platform == "" {
 		issues.add("%s: platform is required", key)
@@ -217,7 +247,7 @@ func validateBody(
 	// anywhere. Checking against the extracted schema is the only place this
 	// becomes visible.
 	if schema, ok := mqtt.Platforms[platform]; ok {
-		validateKeys(issues, key, platform, body, schema)
+		validateKeys(issues, key, platform, body, schema, ignore)
 	}
 
 	deviceClass := str(body, "device_class")
@@ -235,7 +265,7 @@ func validateBody(
 
 // validateKeys compares the body's actual JSON keys against the platform's
 // discovery schema.
-func validateKeys(issues *issueList, key, platform string, body map[string]any, schema hacatalog.PlatformSchema) {
+func validateKeys(issues *issueList, key, platform string, body map[string]any, schema hacatalog.PlatformSchema, ignore map[string]bool) {
 	allowed := schema.Keys
 	// A dispatching platform (light, infrared) has no flat key set: which
 	// sub-schema applies depends on a payload key, so read that key.
@@ -267,6 +297,11 @@ func validateKeys(issues *issueList, key, platform string, body map[string]any, 
 		// `platform` is the bundle's own discriminator rather than a schema
 		// key, so it is legal on every component and appears in none.
 		if name == "platform" {
+			continue
+		}
+		// A key the consumer declared it publishes on purpose. Not checked
+		// for anything — it has taken responsibility for it.
+		if ignore[name] {
 			continue
 		}
 		if _, legal := allowed[name]; !legal {
