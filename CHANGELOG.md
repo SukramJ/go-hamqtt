@@ -3,6 +3,44 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.18.0] - 2026-09-11
+
+### Added
+
+- **`cmd/hacheck`** — the first of the four tools ADR 0070 calls for:
+  validate retained discovery payloads against the platform schemas
+  extracted from Home Assistant itself.
+
+  It exists for the one property that makes discovery defects
+  expensive. Home Assistant's MQTT schemas are `extra=REMOVE_EXTRA`:
+  a key a platform does not declare is dropped on arrival, with no
+  error on the wire and no line in any log. The entity works except
+  for the one thing that key was for, and nobody notices until
+  someone reads the payload and the schema side by side.
+
+  Run against the retained configs of two shipped bridges, it found
+  that both publish `object_id` — replaced by `default_entity_id`,
+  declared by none of the 32 platforms, and dropped in silence. They
+  publish `default_entity_id` too, which is why it went unnoticed:
+  the entity id is right, so nothing looks wrong.
+
+  Input is NDJSON (`{"topic": …, "payload": …}`) on stdin, with the
+  payload as an object or a string, because a broker dump produces
+  one and Home Assistant's own diagnostics the other. Both discovery
+  forms are read. A component carrying a platform and nothing else is
+  a deletion, not a broken entity, and is not reported.
+
+  Reading a dump rather than a broker is deliberate: subscribing
+  needs credentials, a network path and a transport dependency this
+  module does not have and should not grow. That is `hadoctor`'s job,
+  and it can pipe into this.
+
+  Exit 0 when the only findings are advisories — values Home
+  Assistant accepts and rewrites — 1 when a payload carries something
+  it would reject or strip, and 2 when the dump itself could not be
+  read, because "your input is broken" and "your payloads are" send
+  an operator looking in different places.
+
 ## [0.17.0] - 2026-09-10
 
 ### Added
