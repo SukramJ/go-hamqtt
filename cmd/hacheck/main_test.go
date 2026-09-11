@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/SukramJ/go-hamqtt/internal/dump"
 )
 
 // TestObjectIDIsFoundOnARealPayload is the defect this tool exists for, on a
@@ -72,7 +74,7 @@ func TestBundleComponentsAreCheckedIndividually(t *testing.T) {
 			"gone": map[string]any{"platform": "sensor"},
 		},
 	}
-	raw, err := json.Marshal(record{Topic: "homeassistant/device/n/config", Payload: mustJSON(t, body)})
+	raw, err := json.Marshal(dump.Record{Topic: "homeassistant/device/n/config", Payload: mustJSON(t, body)})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestATombstoneIsNotABrokenEntity(t *testing.T) {
 		"device":     map[string]any{"identifiers": []string{"n"}},
 		"components": map[string]any{"gone": map[string]any{"platform": "sensor"}},
 	}
-	raw, err := json.Marshal(record{Topic: "homeassistant/device/n/config", Payload: mustJSON(t, body)})
+	raw, err := json.Marshal(dump.Record{Topic: "homeassistant/device/n/config", Payload: mustJSON(t, body)})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -176,40 +178,6 @@ func TestRetractionsAndForeignTopicsAreSkipped(t *testing.T) {
 		// The two non-config topics are not payloads; the two retractions
 		// are read and then skipped as configs.
 		t.Errorf("scanned = %d, want the two retracted configs counted as read", scanned)
-	}
-}
-
-func TestParseTopicForms(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		topic    string
-		platform string
-		node     string
-		object   string
-		form     topicForm
-		ok       bool
-	}{
-		{"homeassistant/sensor/node/obj/config", "sensor", "node", "obj", formEntity, true},
-		{"homeassistant/device/node/config", "", "node", "", formBundle, true},
-		{"homeassistant/sensor/obj/config", "sensor", "", "obj", formEntity, true},
-		{"homeassistant/device_tracker/node/phone/config", "device_tracker", "node", "phone", formEntity, true},
-		{"homeassistant/sensor/node/obj/state", "", "", "", 0, false},
-		{"hass/sensor/node/obj/config", "", "", "", 0, false},
-		{"homeassistant/a/b/c/d/config", "", "", "", 0, false},
-	}
-	for _, tc := range cases {
-		platform, node, object, form, ok := parseTopic(tc.topic, "homeassistant")
-		if ok != tc.ok {
-			t.Errorf("%s: ok = %v, want %v", tc.topic, ok, tc.ok)
-			continue
-		}
-		if !ok {
-			continue
-		}
-		if platform != tc.platform || node != tc.node || object != tc.object || form != tc.form {
-			t.Errorf("%s: got (%q,%q,%q,%v)", tc.topic, platform, node, object, form)
-		}
 	}
 }
 
@@ -344,18 +312,5 @@ func TestAComponentThatIsNotAnObject(t *testing.T) {
 	}
 	if !sawNotObject || !sawNoPlatform {
 		t.Errorf("findings = %+v, want both malformed components named", findings)
-	}
-}
-
-// TestLabelDropsAnAbsentNode: Home Assistant lets the per-entity form omit
-// the node id, and a bare "/object" reads like a path with a hole in it.
-func TestLabelDropsAnAbsentNode(t *testing.T) {
-	t.Parallel()
-
-	if got := label("", "obj"); got != "obj" {
-		t.Errorf("label = %q, want the object alone", got)
-	}
-	if got := label("node", "obj"); got != "node/obj" {
-		t.Errorf("label = %q", got)
 	}
 }
