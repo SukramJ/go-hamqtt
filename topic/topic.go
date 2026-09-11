@@ -32,7 +32,19 @@ type Layout interface {
 	// Command is where a writable datapoint listens.
 	Command(s model.Slot) string
 	// Availability is a device's own reachability topic.
-	Availability(id model.Identity) string
+	//
+	// It takes a [model.Slot] rather than a [model.Identity] because an
+	// identity carries no scope, and a consumer whose devices sit inside
+	// containers — a controller, a wire interface, a site — needs those
+	// segments to render the topic at all. A measured consumer's device
+	// availability lives at <root>/<central>/<interface>/<address>/…, which
+	// no Layout could produce from an identity: [model.Identity] has no
+	// Scope field, and `model` cannot import `topic` to acquire one without
+	// breaking the rule the layout enforces.
+	//
+	// The slot's Address and Scope are what matter here; Bucket and Path are
+	// not part of a device-level topic and a Layout should ignore them.
+	Availability(s model.Slot) string
 	// Bridge is the daemon's own status topic, carrying its LWT.
 	Bridge() string
 }
@@ -41,7 +53,7 @@ type Layout interface {
 //
 //	<root>[/<scope...>]/<uid>[/<channel>]/<bucket>/<path...>      state
 //	<root>[/<scope...>]/<uid>[/<channel>]/<bucket>/<path...>/set  command
-//	<root>/<uid>/availability                            device
+//	<root>[/<scope...>]/<uid>/availability                device
 //	<root>/bridge/status                                 daemon LWT
 //
 // Every segment goes through [Safe], so a device identifier containing a
@@ -62,8 +74,12 @@ func (d Default) Command(s model.Slot) string {
 }
 
 // Availability implements [Layout].
-func (d Default) Availability(id model.Identity) string {
-	return Join(d.Root, id.UID(), "availability")
+func (d Default) Availability(s model.Slot) string {
+	parts := make([]string, 0, len(s.Scope)+3)
+	parts = append(parts, d.Root)
+	parts = append(parts, s.Scope...)
+	parts = append(parts, s.Address, "availability")
+	return Join(parts...)
 }
 
 // Bridge implements [Layout].

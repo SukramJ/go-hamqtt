@@ -26,6 +26,28 @@ type Context interface {
 	Availability(dev *model.Device, e model.Entity) []AvailabilityEntry
 	// UniqueID is the entity's stable Home Assistant identity.
 	UniqueID(dev *model.Device, e model.Entity) string
+
+	// NodeID is the topic segment this device's discovery is published
+	// under, and ObjectID seeds the entity id Home Assistant assigns.
+	//
+	// All three identity strings are Context methods for the same reason
+	// UniqueID always was: Home Assistant has no migration path for any of
+	// them. A consumer whose fleet is already published owns its spellings,
+	// and they need not agree with each other — one measured consumer's node
+	// id and device identifier are deliberately different strings, so
+	// deriving both from [model.Identity.UID] makes one of them wrong
+	// whichever way the identity is filled in.
+	//
+	// [StdContext] answers all three from this package's own functions, so a
+	// consumer with no opinion inherits the defaults and a consumer with a
+	// published fleet overrides what it must.
+	NodeID(dev *model.Device) string
+	// ObjectID returns the entity-id seed, published as
+	// `default_entity_id`. An EMPTY string suppresses the key entirely,
+	// which is what a consumer whose fleet never carried one needs: adding
+	// it would seed an entity id where Home Assistant currently derives one,
+	// and that is a rename nobody downstream can undo.
+	ObjectID(dev *model.Device, e model.Entity) string
 	// Language is the locale display strings are rendered in.
 	Language() string
 	// Encoding says whether state topics carry a JSON envelope or a bare
@@ -140,7 +162,7 @@ func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Orig
 	}
 
 	bundle := &Bundle{
-		NodeID:     NodeID(dev),
+		NodeID:     ctx.NodeID(dev),
 		Device:     deviceInfo(dev, ctx.Language()),
 		Origin:     origin,
 		Components: map[string]Component{},
@@ -170,6 +192,27 @@ func entityName(ctx Context, desc *model.Description, lang string) string {
 		return ""
 	}
 	return ctx.Translate(desc.NameKey)
+}
+
+// valueTemplateFor picks the template for one entity.
+//
+// The description wins over the context's encoding, because the encoding is
+// one answer for a whole consumer and a consumer is rarely uniform. An
+// explicit [model.NoValueTemplate] publishes none — which an event entity
+// needs, and which an empty string cannot express, since that is also what
+// "no opinion" looks like.
+func valueTemplateFor(ctx Context, desc *model.Description) string {
+	switch desc.ValueTemplate {
+	case model.NoValueTemplate:
+		return ""
+	case "":
+		if ctx.Encoding() == EnvelopeEncoding {
+			return ValueTemplate
+		}
+		return ""
+	default:
+		return desc.ValueTemplate
+	}
 }
 
 func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component, error) {
@@ -233,7 +276,14 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	// Note this is `default_entity_id`, not `object_id`: the latter is no
 	// longer a legal MQTT discovery key on any platform, and Home Assistant
 	// drops unknown keys silently.
-	comp.DefaultEntityID = string(e.Platform()) + "." + ObjectID(dev, e)
+	//
+	// An empty seed suppresses the key. A consumer whose fleet never carried
+	// one must be able to keep it that way: publishing one now would seed an
+	// entity id where Home Assistant currently derives its own, which is a
+	// rename of every entity at once and one nobody downstream can undo.
+	if seed := ctx.ObjectID(dev, e); seed != "" {
+		comp.DefaultEntityID = string(e.Platform()) + "." + seed
+	}
 
 	// Default projection: the state and command roles map to the two plain
 	// topics — but only on the platforms that declare them. Ten platforms have
@@ -243,8 +293,8 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	// which is where the right spelling lives.
 	if b, ok := model.Bind(e, model.RoleState); ok && b.Mode.CanRead() && accepts["state_topic"] {
 		comp.StateTopic = ctx.StateTopic(b.Slot)
-		if ctx.Encoding() == EnvelopeEncoding && accepts["value_template"] {
-			comp.ValueTemplate = ValueTemplate
+		if accepts["value_template"] {
+			comp.ValueTemplate = valueTemplateFor(ctx, desc)
 		}
 	}
 	if b, ok := model.Bind(e, model.RoleCommand); ok && b.Mode.CanWrite() && accepts["command_topic"] {
@@ -347,4 +397,54 @@ func platformAccepts(p hacatalog.Platform) (map[string]bool, error) {
 	}
 	acceptedKeys.Store(p, keys)
 	return keys, nil
+}
+
+// RenderComponent renders one entity as a standalone per-entity discovery
+// config: the same component a bundle carries, plus the device and origin
+// blocks the per-entity form repeats in every config.
+//
+// It exists because CLAUDE.md's "device-based discovery only" was decided
+// before this module had a consumer, and the first full consumer publishes
+// the other form. That is not a preference it can revise: its retained
+// configs are already on brokers, Home Assistant refuses a bundle while a
+// per-entity config for the same entity is still retained, and moving an
+// established fleet across is a migration with a measured ordering hazard
+// (openccu-loom ADR 0070, amendment of 2026-09-10). A module whose only
+// output is the form its consumer cannot publish forces that consumer to
+// call [Render], throw the bundle away, pull the components back out of the
+// map and re-stamp the frame — post-processing the pipeline, which is the
+// pattern the extraction exists to remove.
+//
+// The bundle path is unchanged and remains the recommendation for a new
+// consumer: one retained document per device, updated atomically, instead of
+// one per entity each repeating the whole device block.
+//
+// `platform` is omitted. It is the bundle's discriminator, carried because a
+// component inside a document has no topic to say what it is; a per-entity
+// config says so in its topic, and Home Assistant declares the key on no
+// platform.
+func RenderComponent(ctx Context, dev *model.Device, e model.Entity, origin Origin) (Component, error) {
+	if dev == nil || !dev.Identity.Valid() {
+		return Component{}, fmt.Errorf("discovery: device has no identity")
+	}
+	comp, err := renderComponent(ctx, dev, e)
+	if err != nil {
+		return Component{}, fmt.Errorf("discovery: entity %q: %w", e.Key(), err)
+	}
+	info := NewDeviceInfo(dev, ctx.Language())
+	comp.Device = &info
+	if origin.Name != "" {
+		comp.Origin = &origin
+	}
+	comp.Platform = ""
+	return comp, nil
+}
+
+// NewDeviceInfo builds the `device` block for a device.
+//
+// Exported for the per-entity form, which needs the same block [Render] puts
+// at the top of a bundle — and needs it on every config, which is the cost
+// of that form rather than a fault in it.
+func NewDeviceInfo(dev *model.Device, lang string) DeviceInfo {
+	return deviceInfo(dev, lang)
 }

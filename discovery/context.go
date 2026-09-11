@@ -42,6 +42,18 @@ func (c StdContext) UniqueID(dev *model.Device, e model.Entity) string {
 	return UniqueID(c.Namespace, dev, e)
 }
 
+// NodeID implements [Context], from this package's [NodeID].
+func (c StdContext) NodeID(dev *model.Device) string { return NodeID(dev) }
+
+// ObjectID implements [Context], from this package's [ObjectID].
+//
+// A consumer that publishes no entity-id seed today overrides this to return
+// the empty string rather than accepting one: the key is not decoration, it
+// decides the entity id, and Home Assistant will not rename an entity back.
+func (c StdContext) ObjectID(dev *model.Device, e model.Entity) string {
+	return ObjectID(dev, e)
+}
+
 // Language implements [Context].
 func (c StdContext) Language() string { return c.Lang }
 
@@ -83,6 +95,22 @@ func (c StdContext) Translate(key string) string {
 	return c.Translator(key)
 }
 
+// deviceSlot is the device-level coordinate an availability topic is
+// rendered from: the device's address, in the containers its entities sit in.
+//
+// The scope is taken from what the entity binds rather than from the device,
+// because that is where it lives — a [model.Slot] is a complete coordinate by
+// design, and [model.Device] deliberately carries no scope of its own. An
+// entity with no bindings leaves it empty, which is right for a consumer
+// whose devices hang off the root.
+func deviceSlot(dev *model.Device, e model.Entity) model.Slot {
+	s := model.Slot{Address: dev.UID()}
+	if binds := e.Bindings(); len(binds) > 0 {
+		s.Scope = binds[0].Slot.Scope
+	}
+	return s
+}
+
 // entitySlot is the coordinate of an entity's own aggregate.
 func entitySlot(dev *model.Device, e model.Entity) model.Slot {
 	slot := model.Slot{Bucket: model.BucketCustom, Path: []string{e.Key()}}
@@ -119,11 +147,13 @@ func (c StdContext) Availability(dev *model.Device, e model.Entity) []Availabili
 			out = append(out, plainAvailability(c.Layout.Bridge()))
 
 		case model.LevelDevice:
-			out = append(out, plainAvailability(c.Layout.Availability(dev.Identity)))
+			out = append(out, plainAvailability(c.Layout.Availability(deviceSlot(dev, e))))
 
 		case model.LevelParent:
 			if dev.Via != nil {
-				out = append(out, plainAvailability(c.Layout.Availability(*dev.Via)))
+				parent := deviceSlot(dev, e)
+				parent.Address = dev.Via.UID()
+				out = append(out, plainAvailability(c.Layout.Availability(parent)))
 			}
 
 		case model.LevelSelf:

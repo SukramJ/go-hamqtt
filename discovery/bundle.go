@@ -70,7 +70,13 @@ type AvailabilityEntry struct {
 // marshal, in that order, later winning — the same single precedence rule the
 // whole render pipeline uses.
 type Component struct {
-	Platform hacatalog.Platform `json:"platform"`
+	// Platform is the bundle's discriminator: a component inside a document
+	// has no topic to say what it is. `omitempty` is what lets
+	// [RenderComponent] drop it for the per-entity form, whose topic already
+	// carries it and on whose platforms Home Assistant declares no such key.
+	// Inside a bundle it is never empty — [Bundle.Remove] refuses to write a
+	// component without one.
+	Platform hacatalog.Platform `json:"platform,omitempty"`
 	Name     string             `json:"name,omitempty"`
 	UniqueID string             `json:"unique_id,omitempty"`
 	// DefaultEntityID seeds the entity id Home Assistant assigns. There is
@@ -245,7 +251,17 @@ func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string
 		b.Components = map[string]Component{}
 	}
 	for _, k := range keys {
-		b.Components[k] = Component{Platform: platformOf[k]}
+		// A key whose platform is unknown is skipped rather than written as
+		// a component with none. Such an entry marshals to `{}`, which Home
+		// Assistant ignores — so it would be noise in every future publish
+		// while the entity it was meant to delete stays on screen. Refusing
+		// makes the caller notice it is deleting something it never
+		// declared.
+		platform, known := platformOf[k]
+		if !known || platform == "" {
+			continue
+		}
+		b.Components[k] = Component{Platform: platform}
 	}
 }
 
