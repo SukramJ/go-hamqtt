@@ -33,26 +33,18 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"sort"
-	"strings"
 
 	hacatalog "github.com/SukramJ/go-ha-catalog"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
+	"github.com/SukramJ/go-hamqtt/internal/dump"
 )
-
-// record is one retained discovery message.
-type record struct {
-	Topic   string          `json:"topic"`
-	Payload json.RawMessage `json:"payload"`
-}
 
 // finding is one problem with one entity.
 type finding struct {
@@ -90,80 +82,43 @@ func run(in io.Reader, prefix string) ([]finding, int, error) {
 		findings []finding
 		scanned  int
 	)
-	sc := bufio.NewScanner(in)
-	// Discovery payloads are small, but a device bundle for a forty-entity
-	// device is not: the default 64 KiB token would truncate one and report
-	// the tail as a parse error on a line that is perfectly valid.
-	sc.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
-
-	for line := 1; sc.Scan(); line++ {
-		text := strings.TrimSpace(sc.Text())
-		if text == "" {
-			continue
-		}
-		var rec record
-		if err := json.Unmarshal([]byte(text), &rec); err != nil {
-			return nil, scanned, fmt.Errorf("line %d: %w", line, err)
-		}
+	err := dump.Read(in, func(rec dump.Record) error {
 		// Decide on the topic before touching the payload. An operator
 		// dumping `homeassistant/#` catches the integration's own status
 		// topic, whose payload is the bare word `online` — refusing to
-		// parse that as a discovery config would turn a correct dump into
-		// an error about a topic this tool has no opinion on.
-		platform, node, object, form, ok := parseTopic(rec.Topic, prefix)
+		// parse that as a discovery config would turn a correct capture
+		// into an error about a topic this tool has no opinion on.
+		topic, ok := dump.ParseTopic(rec.Topic, prefix)
 		if !ok {
-			continue
+			return nil
 		}
-		body, err := decodePayload(rec.Payload)
+		body, err := dump.Object(rec.Payload)
 		if err != nil {
-			return nil, scanned, fmt.Errorf("line %d (%s): %w", line, rec.Topic, err)
+			return err
 		}
 		scanned++
 		if body == nil {
 			// An empty retained payload is a retraction, not a config. It
-			// counts as read — a dump full of them is a fleet being torn
+			// counts as read — a capture full of them is a fleet being torn
 			// down, which the summary should not hide.
-			continue
+			return nil
 		}
-		findings = append(findings, check(rec.Topic, platform, node, object, form, body)...)
-	}
-	if err := sc.Err(); err != nil {
+		findings = append(findings, check(rec.Topic, topic, body)...)
+		return nil
+	})
+	if err != nil {
 		return nil, scanned, err
 	}
 	return findings, scanned, nil
 }
 
-// decodePayload accepts the object itself or a string containing it. A broker
-// dump produces strings; Home Assistant's own diagnostics produce objects.
-func decodePayload(raw json.RawMessage) (map[string]any, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == "null" || trimmed == `""` {
-		return nil, nil
-	}
-	if trimmed[0] == '"' {
-		var s string
-		if err := json.Unmarshal(raw, &s); err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(s) == "" {
-			return nil, nil
-		}
-		raw = json.RawMessage(s)
-	}
-	var body map[string]any
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, err
-	}
-	return body, nil
-}
-
 // check validates one retained config, in whichever of the two discovery
 // forms its topic said it is.
-func check(topic, platform, node, object string, form topicForm, body map[string]any) []finding {
-	if form == formBundle {
-		return checkBundle(topic, node, body)
+func check(topic string, t dump.Topic, body map[string]any) []finding {
+	if t.Form == dump.FormBundle {
+		return checkBundle(topic, t.Node, body)
 	}
-	return collect(topic, label(node, object), discovery.ValidateBody(hacatalog.Platform(platform), body))
+	return collect(topic, t.Label(), discovery.ValidateBody(hacatalog.Platform(t.Platform), body))
 }
 
 func checkBundle(topic, node string, body map[string]any) []finding {
@@ -202,7 +157,7 @@ func checkBundle(topic, node string, body map[string]any) []finding {
 			// Platform and nothing else is a deletion, not a broken entity.
 			continue
 		}
-		out = append(out, collect(topic, label(node, key),
+		out = append(out, collect(topic, node+"/"+key,
 			discovery.ValidateBody(hacatalog.Platform(platform), comp))...)
 	}
 	return out
@@ -227,49 +182,6 @@ func collect(topic, entity string, err error) []finding {
 		out = append(out, finding{topic: topic, entity: entity, text: warning})
 	}
 	return out
-}
-
-// label names an entity in a finding. Home Assistant lets the per-entity
-// form omit the node id, and a bare "/object" reads like a path with a hole
-// in it rather than like a name.
-func label(node, object string) string {
-	if node == "" {
-		return object
-	}
-	return node + "/" + object
-}
-
-type topicForm int
-
-const (
-	formEntity topicForm = iota
-	formBundle
-)
-
-// parseTopic reads the two discovery forms Home Assistant accepts:
-//
-//	<prefix>/<platform>/[<node_id>/]<object_id>/config
-//	<prefix>/device/<node_id>/config
-//
-// `device` is not ambiguous with a platform name — Home Assistant declares 32
-// and none is called that — so the first segment separates the three-segment
-// bundle from the three-segment per-entity form that omits its node id.
-func parseTopic(topic, prefix string) (platform, node, object string, form topicForm, ok bool) {
-	prefix = strings.TrimSuffix(prefix, "/") + "/"
-	if !strings.HasPrefix(topic, prefix) || !strings.HasSuffix(topic, "/config") {
-		return "", "", "", 0, false
-	}
-	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(topic, prefix), "/config"), "/")
-	switch {
-	case len(parts) == 3:
-		return parts[0], parts[1], parts[2], formEntity, true
-	case len(parts) == 2 && parts[0] == "device":
-		return "", parts[1], "", formBundle, true
-	case len(parts) == 2:
-		return parts[0], "", parts[1], formEntity, true
-	default:
-		return "", "", "", 0, false
-	}
 }
 
 func report(w io.Writer, findings []finding, scanned int, quiet bool) int {

@@ -3,6 +3,50 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.19.0] - 2026-09-11
+
+### Added
+
+- **`cmd/hadoctor`** — the second tool, and the one that sees what a
+  single payload cannot.
+
+  `hacheck` reads one discovery config at a time and asks whether it
+  satisfies its platform's schema. It is blind by construction to
+  every defect that exists *between* payloads: a topic an entity
+  points at that nobody publishes, an availability list no producer
+  feeds, an entity that therefore sits unavailable forever with
+  nothing anywhere to say why. Those are the defects operators
+  actually report.
+
+  Three findings, ordered by how much they hurt:
+
+  - `dead-availability` — the entity names an availability topic the
+    capture never saw a payload on. It is unavailable right now and
+    nothing says why. Exits 1.
+  - `dead-state` — the entity reads from a topic nothing publishes.
+    Exits 1.
+  - `no-availability` — the entity declares none at all, so it never
+    goes unavailable: everything works until the bridge dies, and
+    then Home Assistant keeps showing the last value as current.
+    Advisory, exits 0, because nothing is broken yet.
+
+  Run against retained configs from a live broker it reports the
+  third on a shipped bridge, which is the defect ADR 0070 predicted
+  this tool would find.
+
+  A capture holding only `<prefix>/#` is **refused**, not reported:
+  every state topic would look unpublished and every entity broken,
+  and an operator would act on that. Subscribe to `#`.
+
+  A component inside a device bundle inherits the document's
+  availability list, so it is not counted as an entity without one; a
+  platform-only tombstone is not counted as an entity at all.
+
+### Changed
+
+- `cmd/hacheck` reads its input through the new `internal/dump`,
+  shared with `hadoctor`. No behaviour change.
+
 ## [0.18.0] - 2026-09-11
 
 ### Added

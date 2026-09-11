@@ -33,7 +33,9 @@ payload/    struct-tag partitioning; no domain knowledge at all
 topic/      the ONLY place that turns a Slot into a string
 discovery/  the device bundle, the render pipeline, the validator
 catalog/    rules as an Enricher, a static table as an EntitySource
-cmd/        the tools: hacheck validates a dump of retained payloads
+cmd/        the tools: hacheck validates payloads one at a time,
+            hadoctor reads a whole capture and sees between them
+internal/   dump/ reads an NDJSON capture; shared by the tools only
 ```
 
 Dependencies point strictly downward:
