@@ -115,13 +115,39 @@ type Config struct {
 	Layout hatopic.Layout
 
 	// QoS applies to every publish and subscribe the runtime performs.
-	// The zero value is QoS 1, which is what a retained config wants: at
-	// most once loses the config a consumer may never publish again.
-	QoS byte
+	// [QoSUnset] — the zero value — is QoS 1, which is what a retained
+	// config wants: at most once loses the config a consumer may never
+	// publish again.
+	//
+	// The default is unchanged from v0.26.0; what is new is that
+	// [QoSAtMostOnce] states QoS 0 and is honoured. See [QoS] for the
+	// measured consumer that could not say it.
+	QoS QoS
 
 	// SweepWindow is how long [Runtime.Sweep] listens before judging. Zero
 	// means [DefaultSweepWindow].
 	SweepWindow time.Duration
+
+	// LegacyEntityTopics states which per-entity config topics this
+	// consumer's installed fleet is on, so [Runtime.PublishBundle] retracts
+	// the topics that actually exist rather than the ones this module would
+	// have rendered.
+	//
+	// Nil — the zero value — means [LegacyTopicWithNodeID] alone, which is
+	// what every release before v0.27.0 did, so a consumer that says
+	// nothing behaves exactly as before. Naming any form replaces that
+	// default rather than adding to it: a stated list is a statement about
+	// a fleet, and quietly retracting an extra shape on top of it would
+	// reach into a discovery tree the consumer shares with other writers.
+	// A fleet on two forms names both.
+	//
+	// The measured need is go-zendure2mqtt (ADR 0070 phase 5, measured
+	// 2026-09-12): 29 retained configs in the node-id-less four-segment
+	// form, against which the five-segment default retracted nothing — so
+	// the device bundle was published while the per-entity configs were
+	// still retained, which Home Assistant refuses with one `WARNING` line
+	// and no entities. See [LegacyTopicFunc].
+	LegacyEntityTopics []LegacyTopicFunc
 
 	// OnResync is called after a birth-triggered republish, with the number
 	// of configs replayed and whatever error the replay produced.
@@ -173,6 +199,11 @@ type Runtime struct {
 	tr  Transport
 	cfg Config
 	log *slog.Logger
+	// qos is [Config.QoS] resolved once, at construction, to the wire byte
+	// a [Transport] takes. Resolved once rather than per call so an
+	// unrecognised level is a panic at the composition root instead of a
+	// publish at a level nobody chose.
+	qos byte
 
 	sweepMu sync.Mutex
 
@@ -206,9 +237,6 @@ func New(tr Transport, cfg Config) *Runtime {
 	if cfg.Prefix == "" {
 		cfg.Prefix = discovery.DefaultPrefix
 	}
-	if cfg.QoS == 0 {
-		cfg.QoS = 1
-	}
 	if cfg.SweepWindow <= 0 {
 		cfg.SweepWindow = DefaultSweepWindow
 	}
@@ -234,6 +262,7 @@ func New(tr Transport, cfg Config) *Runtime {
 	return &Runtime{
 		tr:         tr,
 		cfg:        cfg,
+		qos:        resolveQoS("publisher.Config.QoS", cfg.QoS, QoSAtLeastOnce),
 		log:        logger,
 		declared:   map[string][]byte{},
 		announced:  map[string]bool{},
@@ -295,7 +324,7 @@ func (r *Runtime) Publish(ctx context.Context, topic string, payload []byte) (bo
 		r.mu.Unlock()
 	}
 
-	if err := r.tr.Publish(ctx, topic, payload, r.cfg.QoS, true); err != nil {
+	if err := r.tr.Publish(ctx, topic, payload, r.qos, true); err != nil {
 		// The claim is dropped again on failure. Leaving it standing would
 		// keep the sweep off a topic that carries a previous build's config
 		// and that this process has just failed to overwrite — the one case
@@ -381,7 +410,7 @@ func (r *Runtime) PublishBundle(ctx context.Context, b *discovery.Bundle) (bool,
 		return false, nil
 	}
 
-	if err := r.supersede(ctx, SupersededTopics(r.cfg.Prefix, b)); err != nil {
+	if err := r.supersede(ctx, SupersededTopics(r.cfg.Prefix, b, r.cfg.LegacyEntityTopics...)); err != nil {
 		return false, err
 	}
 	return r.Publish(ctx, topic, payload)
@@ -446,7 +475,7 @@ func (r *Runtime) supersede(ctx context.Context, topics []string) error {
 		if done {
 			continue
 		}
-		if err := r.tr.Publish(ctx, t, nil, r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, nil, r.qos, true); err != nil {
 			return fmt.Errorf("publisher: retract superseded %s: %w", t, err)
 		}
 		r.mu.Lock()
@@ -481,7 +510,7 @@ func (r *Runtime) Retract(ctx context.Context, topics ...string) error {
 			errs = append(errs, err)
 			break
 		}
-		if err := r.tr.Publish(ctx, t, nil, r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, nil, r.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: retract %s: %w", t, err))
 			continue
 		}
@@ -542,7 +571,7 @@ func (r *Runtime) Republish(ctx context.Context) (int, error) {
 			errs = append(errs, err)
 			break
 		}
-		if err := r.tr.Publish(ctx, t, snapshot[t], r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, snapshot[t], r.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: republish %s: %w", t, err))
 			continue
 		}
@@ -561,21 +590,52 @@ func (r *Runtime) Republish(ctx context.Context) (int, error) {
 // [discovery.Bundle.Remove] writes — are included, because their retained
 // per-entity config is exactly what has to go.
 //
+// forms states which per-entity topic shape the consumer's fleet is on.
+// Passing none means [LegacyTopicWithNodeID] alone, which is what this
+// function did before v0.27.0 — and which retracted nothing at all for the
+// fleet that found this: go-zendure2mqtt's 29 configs are keyed
+// `<prefix>/<platform>/<unique_id>/config`, with no node-id level, measured
+// on 2026-09-12. Several forms are unioned and de-duplicated, for a fleet
+// that spans releases. See [LegacyTopicFunc] for why this module will not
+// guess.
+//
 // Exported because a consumer that publishes its bundles through something
 // other than [Runtime.PublishBundle] still needs the list, and deriving it a
 // second time is how two call sites end up disagreeing about the object-id
 // segment.
-func SupersededTopics(prefix string, b *discovery.Bundle) []string {
+func SupersededTopics(prefix string, b *discovery.Bundle, forms ...LegacyTopicFunc) []string {
 	if b == nil {
 		return nil
 	}
-	out := make([]string, 0, len(b.Components))
+	if len(forms) == 0 {
+		forms = []LegacyTopicFunc{LegacyTopicWithNodeID}
+	}
+	seen := make(map[string]bool, len(b.Components)*len(forms))
+	out := make([]string, 0, len(b.Components)*len(forms))
 	for _, key := range b.Keys() {
-		platform := b.Components[key].Platform
-		if platform == "" {
+		comp := b.Components[key]
+		if comp.Platform == "" {
 			continue
 		}
-		out = append(out, EntityConfigTopic(prefix, string(platform), b.NodeID, key))
+		e := LegacyEntity{
+			Prefix:    prefix,
+			Platform:  string(comp.Platform),
+			NodeID:    b.NodeID,
+			ObjectID:  key,
+			UniqueID:  comp.UniqueID,
+			Component: comp,
+		}
+		for _, form := range forms {
+			if form == nil {
+				continue
+			}
+			topic := form(e)
+			if topic == "" || seen[topic] {
+				continue
+			}
+			seen[topic] = true
+			out = append(out, topic)
+		}
 	}
 	sort.Strings(out)
 	return out

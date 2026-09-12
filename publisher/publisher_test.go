@@ -350,8 +350,8 @@ func TestNewAppliesDefaults(t *testing.T) {
 	if r.Prefix() != discovery.DefaultPrefix {
 		t.Fatalf("prefix %q", r.Prefix())
 	}
-	if r.cfg.QoS != 1 || r.cfg.SweepWindow != DefaultSweepWindow {
-		t.Fatalf("qos %d window %v", r.cfg.QoS, r.cfg.SweepWindow)
+	if r.qos != 1 || r.cfg.SweepWindow != DefaultSweepWindow {
+		t.Fatalf("qos %d window %v", r.qos, r.cfg.SweepWindow)
 	}
 	if _, err := r.Publish(context.Background(), "t", []byte("p")); err != nil {
 		t.Fatal(err)

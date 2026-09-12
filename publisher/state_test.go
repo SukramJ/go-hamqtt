@@ -743,8 +743,8 @@ func TestStateForInheritsTheRuntimesTransportAndQoS(t *testing.T) {
 	f := newFake()
 	r := New(f, Config{QoS: 2, StatusTopic: "b/bridge/status"})
 	p := StateFor(r, StateConfig{})
-	if p.cfg.QoS != 2 {
-		t.Fatalf("qos = %d, want the runtime's 2", p.cfg.QoS)
+	if p.qos != 2 {
+		t.Fatalf("qos = %d, want the runtime's 2", p.qos)
 	}
 	if p.log != r.log {
 		t.Fatal("the state publisher must inherit the runtime's logger")
@@ -758,8 +758,8 @@ func TestStateForInheritsTheRuntimesTransportAndQoS(t *testing.T) {
 
 	// An explicit setting still wins over the inherited one.
 	q := StateFor(r, StateConfig{QoS: 1})
-	if q.cfg.QoS != 1 {
-		t.Fatalf("qos = %d, want the explicit 1", q.cfg.QoS)
+	if q.qos != 1 {
+		t.Fatalf("qos = %d, want the explicit 1", q.qos)
 	}
 }
 

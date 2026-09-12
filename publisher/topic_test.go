@@ -40,10 +40,16 @@ func TestParseConfigTopic(t *testing.T) {
 		},
 		{
 			// Three segments not starting with `device` is the per-entity
-			// form with the node id omitted, which this sweep cannot scope
-			// and therefore must not claim.
-			name:  "node-less per-entity form is not claimed",
+			// form with the node id omitted, which Home Assistant permits
+			// and go-zendure2mqtt's whole fleet uses. It parses, with an
+			// empty NodeID — so a node-id-scoped Owns still declines it,
+			// but a consumer that knows its own fleet can claim it. Before
+			// v0.27.0 it did not parse at all and was therefore invisible
+			// to the sweep and retained forever.
+			name:  "node-less per-entity form parses without a node id",
 			topic: "homeassistant/sensor/objectid/config",
+			want:  ConfigTopic{Platform: "sensor", ObjectID: "objectid"},
+			ok:    true,
 		},
 		{
 			name:   "a custom prefix is honoured",
@@ -67,6 +73,13 @@ func TestParseConfigTopic(t *testing.T) {
 			topic: "homeassistant/status",
 		},
 		{name: "another integration's tree", topic: "zigbee2mqtt/device/n/config"},
+		{
+			// Two segments is neither form: a platform with no object id
+			// and no node id names no entity.
+			name:  "two segments is no entity",
+			topic: "homeassistant/sensor/config",
+		},
+		{name: "empty object id in the node-less form", topic: "homeassistant/sensor//config"},
 		{name: "not a config leaf", topic: "homeassistant/sensor/n/o/state"},
 		{name: "too many segments", topic: "homeassistant/sensor/n/o/x/config"},
 		{name: "empty node id", topic: "homeassistant/device//config"},
