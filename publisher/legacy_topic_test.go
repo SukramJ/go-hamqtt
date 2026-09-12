@@ -59,8 +59,12 @@ func TestSupersededTopicsHonoursAStatedLegacyForm(t *testing.T) {
 			"homeassistant/sensor/u1/config",
 			"homeassistant/switch/ccu_abc/gone/config",
 		}
-		got := SupersededTopics("", b,
-			LegacyTopicWithNodeID, LegacyTopicByUniqueID, LegacyTopicWithNodeID)
+		// The five-segment form twice, to pin that a form named more than
+		// once — which a consumer assembling its list from config will do
+		// — contributes its topic once.
+		five := LegacyTopicWithNodeID
+		forms := []LegacyTopicFunc{five, LegacyTopicByUniqueID, five}
+		got := SupersededTopics("", b, forms...)
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("got %v want %v", got, want)
 		}

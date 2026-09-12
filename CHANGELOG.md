@@ -3,6 +3,158 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.27.0] - 2026-09-12
+
+Three gaps the ADR 0070 phase-5 pilot measurement found, all of the
+same kind: the library silently imposed openccu-loom's shape on a
+consumer that is not openccu-loom. None of the three is a design
+conflict with loom — loom remains the tiebreaker where there is one —
+and none was visible from the code that contained it. Two were
+measured on `go-zendure2mqtt` before any of its code moved
+(`docs/adr0070-pilot-measurement.md`, 2026-09-12) and both were
+blockers for the pilot; the third was measured by openccu-loom PR #797
+trying to use v0.26.0's newest feature and giving up.
+
+### Added
+
+- **`publisher.QoS`** — a configured quality-of-service level, as
+  distinct from the byte on the wire, so that **QoS 0 can be stated**.
+  All four runtime types read a zero `QoS byte` as *unset* and coerced
+  it to 1, which made "unset" and "deliberately QoS 0" one statement.
+  The measured consumer publishes and subscribes at **QoS 0
+  everywhere** (`discovery.go:78`, `coordinator.go:88,128,138,171,269`)
+  and the measurement recorded "cannot be preserved" against the
+  column: adopting the runtime would have changed the delivery
+  guarantees of a whole installed base on the wire, inside a migration
+  step whose purpose was de-duplication, with a broker capture as the
+  only evidence.
+
+  `QoSUnset` is the zero value and every existing default is
+  unchanged. `QoSAtLeastOnce` and `QoSExactlyOnce` **are** the wire's
+  1 and 2, so a v0.26.0 struct literal keeps its meaning;
+  `QoSAtMostOnce` sits outside the wire range because 0 was already
+  taken by "unset", and resolves to wire 0. An unrecognised value is a
+  panic at construction — the third state the old `byte` had no answer
+  for — because it is a composition-root mistake and this package no
+  longer quietly decides what a consumer meant.
+
+  **Availability keeps QoS 1 as a default and not a floor**, and the
+  reasoning is in `AvailabilityConfig.QoS` rather than only here. It
+  has the strongest case for a floor in the package: openccu-loom's own
+  PR evidence is two availability topics in one daemon with different
+  guarantees, and an availability marker lost at QoS 0 leaves an entity
+  wrongly available until the next flip, which for a crash is never.
+  Three things still point the other way — a floor would be this
+  package deciding what a consumer meant, which is the silent
+  imposition the type exists to remove; it would make one of the four
+  types disagree with the rest, and three answers to one question is a
+  defect this package has already fixed once; and the defect the
+  evidence records is two topics *differing by accident*, which one
+  stated level per publisher makes unreachable. `NewAvailability`
+  therefore logs a warning naming the consequence when a consumer
+  states QoS 0 there: honoured, and said out loud.
+
+- **`publisher.LegacyTopicFunc`**, `LegacyEntity`,
+  `LegacyTopicWithNodeID`, `LegacyTopicByUniqueID`,
+  `LegacyTopicByObjectID` and **`Config.LegacyEntityTopics`** — a
+  consumer can state which per-entity discovery topic form its
+  installed fleet is on.
+
+  `SupersededTopics` rendered exactly one shape,
+  `<prefix>/<platform>/<node_id>/<object_id>/config`, so
+  `PublishBundle` retracted **nothing at all** for a fleet on the
+  four-segment form Home Assistant equally permits. The measured
+  consumer's 29 configs are at
+  `<prefix>/<platform>/<unique_id>/config`, with no node-id level. The
+  consequence is the one measured live on Home Assistant 2026.9 on
+  2026-09-10/11: a bundle published while a per-entity config for the
+  same `unique_id` is still retained is **refused**, symmetrically,
+  with one `WARNING [mqtt.entity] Received a conflicting MQTT
+  discovery message` line and nothing else. The entities would simply
+  not appear. The measurement called it "the single highest-risk step
+  in the whole migration and the one most likely to be missed, because
+  everything *looks* right: the bundle publishes, the log is clean,
+  and the entities keep their old configs."
+
+  The library cannot guess the form — too narrow misses the
+  retractions, too wide retracts a topic belonging to another writer in
+  a shared discovery tree — so the consumer states it and a consumer
+  that states nothing gets v0.26.0 exactly. Several forms are unioned
+  and de-duplicated, for a fleet that spans releases; a component with
+  nothing to key on contributes no topic rather than one with a blank
+  segment.
+
+- **`SweepRequest.ReportOnly`** and **`SweepResult.Owned`** — the
+  sweep can report without acting.
+
+  v0.26.0's `SweepRequest.Inspect` let a consumer judge an orphan on
+  its retained payload, but `Inspect` fires only for topics `Owns`
+  accepted and every owned-and-unclaimed topic in that same pass was
+  retracted: there was no way to look without clearing. openccu-loom
+  PR #797 tried and gave up. Its one-off scrub must run *before* the
+  first snapshot — the retraction is what makes Home Assistant forget a
+  stale `unique_id`, and the snapshot that follows re-announces under
+  the corrected one — and at that moment the claim set is empty, so an
+  `Owns` wide enough for `Inspect` to see anything makes the pass
+  delete the entire retained discovery fleet, which is the hazard
+  `Runtime.Sweep`'s own doc comment warns about. Running it afterwards
+  finds nothing, because the retained payload is by then already the
+  corrected one. So that consumer kept a second hand-rolled broker
+  snapshot beside the library's, purely because the library could not
+  be asked to report without acting.
+
+  `ReportOnly` returns before the retraction loop rather than
+  branching inside it, so "not one message goes out" is a property of
+  the control flow and not of five conditions staying in agreement. It
+  is the pass that is **safe before the first publish**, which the
+  retracting one explicitly is not, and the one mode in which a
+  deliberately wide `Owns` costs nothing. `SweepResult.Owned` carries
+  the topics the pass judged, in arrival order, on **both** kinds of
+  pass: a caller doing its own judging needs the list and not only its
+  size, and on a retracting pass Owned minus Retracted is what this
+  process still claims.
+
+### Changed
+
+- **BREAKING (types, not values): five config fields change from
+  `byte` to `publisher.QoS`** — `Config.QoS`, `StateConfig.QoS`,
+  `StateConfig.PulseQoS`, `AvailabilityConfig.QoS` and
+  `CommandConfig.QoS`.
+
+  Migration: a struct literal with an untyped constant —
+  `Config{QoS: 1}`, `StateConfig{PulseQoS: 0}` — compiles and means
+  exactly what it meant before, because `QoSAtLeastOnce` and
+  `QoSExactlyOnce` are the wire values. Only code that assigns a
+  `byte`-typed *variable* or expression into one of these fields
+  breaks, and the fix is one conversion or the named constant:
+  `QoS: publisher.QoS(cfgFromFile.QoS)` or, better,
+  `QoS: publisher.QoSAtMostOnce`. `Will.QoS` stays a `byte` — it is
+  the one place a QoS crosses back out to the consumer's own MQTT
+  client, and a client takes a byte.
+
+  A consumer that wants QoS 0 must now say `QoSAtMostOnce`; the
+  literal `0` still means "unset", which is still QoS 1 (and still
+  QoS 0 for `PulseQoS`, whose default it already was).
+
+- **`SupersededTopics` takes a variadic `...LegacyTopicFunc`.**
+  Source-compatible: every existing call site keeps compiling and
+  keeps returning the five-segment form.
+
+### Fixed
+
+- **`ParseConfigTopic` rejected the node-id-less per-entity form its
+  own doc comment described as handled.** `<prefix>/<platform>/
+  <object_id>/config` — three segments, which Home Assistant permits —
+  returned `ok=false`, so such a config was invisible to the sweep and
+  retained forever: the same defect the device-document form had
+  before v0.26.0, and the same class as the four-segment case the
+  pilot measurement hit. It now parses, with an empty
+  `ConfigTopic.NodeID`, because the topic carries no node id and
+  inventing one would be a guess an ownership predicate would then
+  trust — so a node-id-scoped `Owns` still declines it, and a consumer
+  that knows its own fleet can claim it. `Platform != "" && NodeID ==
+  ""` is exactly that form. The doc comment is true again.
+
 ## [0.26.0] - 2026-09-12
 
 The rest of the runtime layer ADR 0070 scoped — state publishing,
