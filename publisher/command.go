@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
 )
@@ -41,8 +42,30 @@ var (
 	ErrDuplicateRoute = errors.New("publisher: duplicate command route")
 
 	// ErrAmbiguousRoutes is returned when two registered filters can both
-	// match some topic and neither is strictly more specific than the
-	// other, so no rule could pick one.
+	// match some topic — any overlap, not only one no specificity rule
+	// could order.
+	//
+	// The router cannot resolve an overlap after the fact, because by the
+	// time a message reaches it the overlap has already multiplied it.
+	// Two fan-outs compose: the broker sends one copy per matching
+	// subscription (MQTT 3.1.1 §4.7.3 / 5.0 §3.3.4 permit it and both
+	// Mosquitto and EMQX do it), and go-mqtt then re-matches each arriving
+	// copy against its whole local filter list and calls every matching
+	// handler, never correlating a copy with the subscription it arrived
+	// on. N overlapping routes therefore turn one message into N
+	// indistinguishable dispatches, and nothing the router can see tells
+	// them apart from N genuine publishes on the same topic.
+	//
+	// Measured against Mosquitto 2.1.2, on 3.1.1 and 5.0 alike and with
+	// two separate clients so No-Local is not in play: the routes
+	// `ccu/+/+/set` and `ccu/+/PRESS_SHORT/set` — exactly the "one
+	// wildcard per command shape" granularity — turned one published
+	// message into two handler runs. A toggle toggles twice, a relay pulse
+	// fires twice, a dimmer step doubles, and nothing logs anything.
+	//
+	// Refusing the pair at registration is the only resolution that holds
+	// on both protocol versions; [CommandRouter.Handle] documents what it
+	// costs and what to do instead.
 	ErrAmbiguousRoutes = errors.New("publisher: ambiguous command routes")
 
 	// ErrInvalidFilter is returned for a filter MQTT does not permit —
@@ -167,11 +190,17 @@ type CommandHandler func(ctx context.Context, cmd Command)
 //
 // MQTT 5.0 §3.8.3.1 has an option for exactly this, and go-mqtt exposes it
 // as WithNoLocal. A transport that can pass it implements this interface and
-// the router uses it; one that cannot — the shipped go-mqtt adapter today,
-// whose Subscribe takes no options — is subscribed to normally. Either way
-// [CommandRouter.CheckDisjoint] remains the load-bearing guard: No Local is
-// v5-only, and it does nothing about a second process in the same deployment
-// publishing the same tree.
+// the router uses it; one that cannot — a consumer's own hand-rolled
+// transport, or a test fake — is subscribed to normally. The shipped go-mqtt
+// adapter does implement it: publisher/gomqtt compile-asserts the interface
+// and passes mqtt.WithNoLocal, so a consumer on the shipped adapter takes
+// the safe path without asking for it.
+//
+// Either way [CommandRouter.CheckDisjoint] remains the load-bearing guard,
+// and on two counts. No Local is v5-only — go-mqtt sets the bit only for
+// V50, so a v3.1.1 link silently ignores the option and the echo class is
+// wide open — and it says nothing about a second process in the same
+// deployment publishing the same tree.
 type NoLocalSubscriber interface {
 	// SubscribeNoLocal is [Transport.Subscribe] with the MQTT 5.0 No Local
 	// option set.
@@ -246,15 +275,28 @@ type route struct {
 // Three properties are worth stating before the lock order, because they are
 // what the type is for:
 //
-//   - Exactly one handler runs per message. A broker fans a message out to
-//     every matching subscription, not the most specific one, so two
-//     overlapping filters mean two deliveries — the measured consumer
-//     dispatched a profile selection both to the profile handler and, as a
-//     parameter write named `week_profile`, to the data-point handler, and
-//     patched it with a hand-maintained list of reserved segments. The
-//     router resolves overlap by specificity instead, once, at registration
-//     time, and refuses a pair no rule can order.
+//   - Exactly one handler runs per message, and the router buys that by
+//     refusing overlapping routes outright — see [ErrAmbiguousRoutes] for
+//     why nothing weaker works. A broker fans a message out to every
+//     matching subscription and go-mqtt then calls every locally matching
+//     handler per copy, so the measured consumer dispatched a profile
+//     selection both to the profile handler and, as a parameter write named
+//     `week_profile`, to the data-point handler. It patched that with a
+//     hand-maintained list of reserved segments; this type makes the route
+//     pair that causes it unregisterable.
+//
+//     One overlap remains outside the router's reach and is worth naming:
+//     the local fan-out is the whole go-mqtt client's, so a SECOND
+//     subscription on the same client whose filter also matches a command
+//     topic reintroduces the multiplication. This module's own other
+//     subscriptions (the discovery-tree snapshot and the birth topic) live
+//     under the discovery prefix, not in the consumer's command tree, so
+//     they do not; a consumer that adds a broad subscription of its own
+//     must keep it off the command tree, which is the subscription-side
+//     twin of [CommandRouter.CheckDisjoint].
+//
 //   - Handlers run off the read loop. See [CommandHandler].
+//
 //   - Unroutable is a diagnostic, never a failure. A shared broker delivers
 //     things that are none of this consumer's business.
 //
@@ -268,10 +310,19 @@ type route struct {
 // [CommandRouter.Stop] end-to-end; there must never be two of those in
 // flight, because each is a sequence of transport calls whose interleaving
 // would leave the broker's subscription set disagreeing with the router's.
-// mu guards the route set and the started/stopped flags and is never held
-// across a [Transport] call, a handler call or an enqueue — a subscribe
-// blocks on a SUBACK, and holding the route lock across one would stall
-// every inbound message behind it.
+// mu guards the route set, the started/stopped flags and the pool pointer,
+// and is never held across a [Transport] call or a handler call — a
+// subscribe blocks on a SUBACK, and holding the route lock across one would
+// stall every inbound message behind it.
+//
+// It IS held across the enqueue, deliberately, and that is what makes the
+// shutdown promise on [CommandRouter.Stop] true rather than probable: the
+// stopped check and the enqueue have to be one step, or a command whose
+// check passed can still land on a queue Stop closed in between and be
+// discarded with a `dropped_after_close` warning. Measured at roughly one
+// in four thousand deliveries racing a Stop. The enqueue can be held under
+// a lock because it never blocks — an unbounded slice, not a buffered
+// channel, for the separate reason [commandQueue] documents.
 type CommandRouter struct {
 	tr  Transport
 	cfg CommandConfig
@@ -283,13 +334,25 @@ type CommandRouter struct {
 	routes  []route
 	started bool
 	stopped bool
-
+	// pool is nil until Start and nil again after Stop, so a router that
+	// is built and abandoned owns no goroutines. See
+	// [NewCommandRouter].
 	pool *commandPool
 }
 
 // NewCommandRouter builds a router over tr. A nil transport panics here
 // rather than on the first subscribe, where the stack no longer names the
 // composition root that got it wrong — the same bargain [New] makes.
+//
+// Construction starts no goroutines: the worker pool belongs to
+// [CommandRouter.Start] and is reclaimed by [CommandRouter.Stop]. It used
+// to be started here, and a router that never reached Start therefore
+// leaked [CommandConfig.Workers] goroutines parked on a condition variable
+// with nothing left to reclaim them — measured at eight per router, 2 -> 82
+// goroutines over ten routers built and discarded. Three ordinary paths get
+// there: a [CommandRouter.Handle] that reports an error at a composition
+// root, a config reload replacing the router (see
+// [CommandConfig.Lifecycle]), and a failed Start the consumer gives up on.
 func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if tr == nil {
 		panic("publisher: nil transport")
@@ -310,12 +373,7 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CommandRouter{
-		tr:   tr,
-		cfg:  cfg,
-		log:  logger,
-		pool: newCommandPool(cfg.Workers, cfg.QueueDepth, logger),
-	}
+	return &CommandRouter{tr: tr, cfg: cfg, log: logger}
 }
 
 // Handle registers handler for filter. Call it for every route before
@@ -335,9 +393,16 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 //     entities is a real but survivable boot cost.
 //   - One wildcard per command shape, which is what the measured consumer
 //     does: thirteen filters covering every device it will ever see. One
-//     SUBSCRIBE each, no per-entity bookkeeping, and the cost is that the
-//     filters can overlap each other and the state plane — the two defect
-//     classes this type exists to close.
+//     SUBSCRIBE each and no per-entity bookkeeping, at the price this type
+//     charges loudly: the shapes must be pairwise disjoint. `ccu/+/+/set`
+//     together with `ccu/+/PRESS_SHORT/set` is refused with
+//     [ErrAmbiguousRoutes], because that exact pair ran one message's
+//     handler twice against Mosquitto 2.1.2. A consumer that wants a
+//     special case for one parameter name registers the general shape only
+//     and branches inside the handler on [Command.Wildcards] — the
+//     discrimination moves from the router to the handler, which is the
+//     whole cost, and it is a cost the previous specificity-based scheme
+//     only appeared to spare it.
 //   - A single `<base>/#`. Never correct here: it subscribes the consumer
 //     to its own state plane, so every state publish comes back as a
 //     command.
@@ -348,8 +413,11 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 // time a state topic is run past it.
 //
 // Registration is rejected when filter is malformed, already registered, or
-// overlaps an existing route without being orderable against it — see
-// [ErrAmbiguousRoutes].
+// overlaps an existing route at all — see [ErrAmbiguousRoutes]. The overlap
+// test is structural rather than a comparison of the topics seen so far,
+// because the measured collision (a seven-level all-wildcard filter against
+// a seven-level filter with one literal) is invisible to any check that
+// waits for traffic to demonstrate it.
 func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if handler == nil {
 		return fmt.Errorf("%w: nil handler for %q", ErrInvalidFilter, filter)
@@ -357,7 +425,7 @@ func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if err := ValidateFilter(filter); err != nil {
 		return err
 	}
-	parts := strings.Split(filter, "/")
+	parts := filterParts(filter)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -369,11 +437,9 @@ func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 		if existing.filter == filter {
 			return fmt.Errorf("%w: %q", ErrDuplicateRoute, filter)
 		}
-		if !filtersOverlap(existing.parts, parts) {
-			continue
-		}
-		if _, ordered := compareSpecificity(existing.parts, parts); !ordered {
-			return fmt.Errorf("%w: %q and %q both match some topic and neither is more specific",
+		if filtersOverlap(existing.parts, parts) {
+			return fmt.Errorf("%w: %q and %q both match some topic, so one message would run a handler twice; "+
+				"register the general shape only and branch inside the handler",
 				ErrAmbiguousRoutes, existing.filter, filter)
 		}
 	}
@@ -407,6 +473,21 @@ func (r *CommandRouter) Filters() []string {
 // the partial set live; rolling it back is the one place this type does not
 // simply copy it.
 //
+// The rollback itself can fail — a broker may refuse an UNSUBSCRIBE, and a
+// broker that just refused a SUBSCRIBE is in exactly the state where it
+// might. A subscription that could not be taken down stays live, so Start
+// then closes the router for good rather than leaving its gate open: the
+// live filter would otherwise deliver commands into a consumer that has
+// been told its start failed and has not finished wiring itself, which is
+// the hazard [CommandRouter.Stop] promises cannot happen. The returned
+// error names each filter still on the broker, because that is the only
+// thing an operator can act on; [CommandRouter.Start] cannot be retried
+// afterwards and [CommandRouter.Stop] has nothing left to do.
+//
+// When every rollback succeeded the router is merely un-started and Start
+// can be retried once the broker recovers — a partial start that could
+// never be retried would be the worse of the two failure modes.
+//
 // Starting a router with no routes is not an error — a consumer whose
 // entities are all read-only has nothing to subscribe, and making that the
 // caller's special case buys nothing.
@@ -424,29 +505,51 @@ func (r *CommandRouter) Start(ctx context.Context) error {
 		return ErrRouterStarted
 	}
 	r.started = true
+	// The pool must exist before the first subscribe: a broker may
+	// deliver on a subscription the moment it acknowledges it.
+	r.pool = newCommandPool(r.cfg.Workers, r.cfg.QueueDepth, r.log)
 	filters := r.routeFiltersLocked()
 	r.mu.Unlock()
 
 	done := make([]string, 0, len(filters))
 	for _, f := range filters {
 		if err := r.subscribe(ctx, f); err != nil {
-			for _, prev := range done {
-				// Best effort: the start has already failed, and a
-				// broker that refuses the rollback leaves a live
-				// subscription whose handler the stopped flag gates.
-				if uerr := r.tr.Unsubscribe(ctx, prev); uerr != nil {
-					r.log.Warn("publisher.command.rollback",
-						slog.String("filter", prev), slog.String("err", uerr.Error()))
-				}
-			}
+			live := r.rollback(ctx, done)
 			r.mu.Lock()
 			r.started = false
+			// A subscription still on the broker is a live route into
+			// a consumer whose start just failed, so the gate closes
+			// permanently rather than pretending the rollback worked.
+			r.stopped = len(live) > 0
+			pool := r.pool
+			r.pool = nil
 			r.mu.Unlock()
+			// Nothing will be enqueued now, so the workers this Start
+			// spun up are reclaimed here rather than waiting for a
+			// Stop the consumer has no reason to call.
+			pool.close()
+			if len(live) > 0 {
+				return fmt.Errorf("publisher: subscribe %s: %w (rollback failed, still subscribed: %s; router closed)",
+					f, err, strings.Join(live, ", "))
+			}
 			return fmt.Errorf("publisher: subscribe %s: %w", f, err)
 		}
 		done = append(done, f)
 	}
 	return nil
+}
+
+// rollback unsubscribes what a failed Start had already registered and
+// reports the filters the broker would not let go of.
+func (r *CommandRouter) rollback(ctx context.Context, done []string) (live []string) {
+	for _, prev := range done {
+		if err := r.tr.Unsubscribe(ctx, prev); err != nil {
+			r.log.Warn("publisher.command.rollback",
+				slog.String("filter", prev), slog.String("err", err.Error()))
+			live = append(live, prev)
+		}
+	}
+	return live
 }
 
 // Resubscribe re-registers every route on the current connection.
@@ -495,7 +598,12 @@ func (r *CommandRouter) Resubscribe(ctx context.Context) error {
 // handler starts after Stop is entered — the gate is set before the first
 // unsubscribe, because a broker delivers whatever was already in flight and
 // a command arriving during shutdown would run against half-torn-down
-// dependencies. But a command already accepted does run to completion:
+// dependencies. And the boundary is exact in both directions: a delivery
+// whose gate check passed before Stop entered is accepted and drained
+// rather than discarded, because the check and the enqueue happen under one
+// lock Stop must take. Without that, roughly one in four thousand
+// deliveries racing a Stop was dropped with a `dropped_after_close`
+// warning. But a command already accepted does run to completion:
 // abandoning a queued write is how a consumer loses the last command of a
 // session with nothing anywhere to say so. Stop therefore blocks on whatever
 // a handler is currently doing, which is the shutdown cost
@@ -518,6 +626,8 @@ func (r *CommandRouter) Stop(ctx context.Context) error {
 	r.stopped = true
 	started := r.started
 	filters := r.routeFiltersLocked()
+	pool := r.pool
+	r.pool = nil
 	r.mu.Unlock()
 
 	var errs []error
@@ -528,7 +638,9 @@ func (r *CommandRouter) Stop(ctx context.Context) error {
 			}
 		}
 	}
-	r.pool.close()
+	// Outside r.mu: close drains, so it blocks on whatever a handler is
+	// doing, and a handler is free to call back into the router.
+	pool.close()
 	return errors.Join(errs...)
 }
 
@@ -540,7 +652,15 @@ func (r *CommandRouter) Stop(ctx context.Context) error {
 // asserts on its fake sink is racing the router. Production code does not
 // need it — commands are fire-and-forget by design, and shutdown is
 // [CommandRouter.Stop]'s job.
-func (r *CommandRouter) WaitIdle() { r.pool.flush() }
+//
+// A no-op on a router that has not started or has stopped: there is
+// nothing accepted to wait for.
+func (r *CommandRouter) WaitIdle() {
+	r.mu.Lock()
+	pool := r.pool
+	r.mu.Unlock()
+	pool.flush()
+}
 
 // Route reports which registered filter claims topic, and what its wildcards
 // matched.
@@ -630,17 +750,22 @@ func (r *CommandRouter) subscribe(ctx context.Context, filter string) error {
 // deliver is the transport-facing handler for one subscription. It runs on
 // the transport's read loop and must return promptly; everything it does
 // beyond resolving the route is an enqueue.
+//
+// The locking is hand-rolled rather than deferred because the shutdown gate
+// and the enqueue must be one atomic step against Stop — see the lock-order
+// note on [CommandRouter] — while the two calls that can reach consumer
+// code, the logger and [CommandConfig.OnUnroutable], must not run under the
+// route lock at all.
 func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained bool) {
 	r.mu.Lock()
-	stopped := r.stopped
-	cmd, handler, ok := r.resolveLocked(topic)
-	r.mu.Unlock()
-
-	if stopped {
+	if r.stopped || r.pool == nil {
+		r.mu.Unlock()
 		r.log.Debug("publisher.command.after_stop", slog.String("topic", topic))
 		return
 	}
+	cmd, handler, ok := r.resolveLocked(topic)
 	if !ok {
+		r.mu.Unlock()
 		// Nothing claims it. A shared broker carries traffic that is not
 		// this consumer's, and a route removed while its subscription
 		// lingers lands here too, so this is a diagnostic rather than a
@@ -652,19 +777,8 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 			slog.String("topic", topic), slog.String("filter", filter))
 		return
 	}
-	if cmd.Filter != filter {
-		// The same message arrived through a less specific subscription
-		// as well. Exactly one delivery dispatches — the one whose own
-		// filter won — which is what makes "one handler per message" hold
-		// without the router having to remember anything about the
-		// message it just saw.
-		r.log.Debug("publisher.command.superseded_route",
-			slog.String("topic", topic),
-			slog.String("filter", filter),
-			slog.String("winner", cmd.Filter))
-		return
-	}
 	if retained && !r.cfg.DeliverRetained {
+		r.mu.Unlock()
 		r.log.Debug("publisher.command.retained_drop", slog.String("topic", topic))
 		return
 	}
@@ -678,37 +792,31 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 		defer cancel()
 		handler(ctx, cmd)
 	})
+	r.mu.Unlock()
 }
 
-// resolveLocked picks the most specific route matching topic. Callers hold
-// r.mu.
+// resolveLocked finds the route matching topic. Callers hold r.mu.
+//
+// At most one can match: registration refuses any overlapping pair, which
+// is what makes this a search rather than the specificity tournament an
+// earlier version ran. The tournament was not merely redundant — it picked
+// a winner per delivered COPY of a message rather than per message, so it
+// was the mechanism by which one command ran its handler N times. See
+// [ErrAmbiguousRoutes].
 func (r *CommandRouter) resolveLocked(topic string) (cmd Command, handler CommandHandler, ok bool) {
-	best := -1
-	var bestWild []string
-	var bestRest string
 	for i := range r.routes {
 		wild, rest, matched := captureFilter(r.routes[i].parts, topic)
 		if !matched {
 			continue
 		}
-		if best >= 0 {
-			// Registration rejected every unorderable overlap, so a
-			// second match is always comparable to the first.
-			if c, ordered := compareSpecificity(r.routes[i].parts, r.routes[best].parts); !ordered || c <= 0 {
-				continue
-			}
-		}
-		best, bestWild, bestRest = i, wild, rest
+		return Command{
+			Topic:     topic,
+			Filter:    r.routes[i].filter,
+			Wildcards: wild,
+			Remainder: rest,
+		}, r.routes[i].handler, true
 	}
-	if best < 0 {
-		return Command{}, nil, false
-	}
-	return Command{
-		Topic:     topic,
-		Filter:    r.routes[best].filter,
-		Wildcards: bestWild,
-		Remainder: bestRest,
-	}, r.routes[best].handler, true
+	return Command{}, nil, false
 }
 
 func (r *CommandRouter) routeFiltersLocked() []string {
@@ -719,13 +827,74 @@ func (r *CommandRouter) routeFiltersLocked() []string {
 	return out
 }
 
+// sharedPrefix introduces a shared subscription, MQTT 5.0 §4.8.2.
+const sharedPrefix = "$share/"
+
+// splitShared decides whether filter is a well-formed shared subscription
+// and, if so, returns the filter that actually takes part in matching.
+//
+// Well-formed means the three levels §4.8.2 requires: the literal
+// `$share`, a non-empty ShareName carrying neither `+` nor `#` (a `/`
+// cannot occur in one — it terminates it), and a non-empty topic filter
+// after it. Anything else is not a shared subscription and is the ordinary
+// literal filter it looks like on the wire, which is what keeps the literal
+// filter `$share` matching the literal topic `$share`.
+func splitShared(filter string) (wrapped string, ok bool) {
+	rest, found := strings.CutPrefix(filter, sharedPrefix)
+	if !found {
+		return "", false
+	}
+	shareName, wrapped, found := strings.Cut(rest, "/")
+	if !found || shareName == "" || wrapped == "" || strings.ContainsAny(shareName, "+#") {
+		return "", false
+	}
+	return wrapped, true
+}
+
+// filterParts splits filter into the levels that take part in matching.
+//
+// For a shared subscription that is the wrapped filter alone: a PUBLISH
+// carries the real topic and never the `$share/{ShareName}/` prefix
+// (§4.8.2), so the prefix is structural and matching it would match
+// nothing. Registration, matching and the overlap check all go through
+// this, which is what keeps a shared route's overlap with a plain one
+// visible.
+func filterParts(filter string) []string {
+	if wrapped, ok := splitShared(filter); ok {
+		filter = wrapped
+	}
+	return strings.Split(filter, "/")
+}
+
 // ValidateFilter reports whether filter is a topic filter MQTT permits.
 //
 // Checked at registration rather than left to the broker, because a broker
 // answers a malformed filter with a SUBACK failure code that the transport
 // interface deliberately drops — so the only symptom would be a route that
-// never fires. The rules are §4.7: a filter is non-empty, `+` occupies a
-// whole level, and `#` occupies a whole level and is the last one.
+// never fires. The rules are §4.7: a filter is non-empty, no longer than
+// 65535 bytes, valid UTF-8 without U+0000 (§1.5.4), `+` occupies a whole
+// level, and `#` occupies a whole level and is the last one.
+//
+// A filter starting with `$share/` is additionally held to §4.8.2's
+// structure — `$share/{ShareName}/{filter}` with a non-empty ShareName
+// carrying no wildcard — and its wrapped filter is then validated exactly
+// like a standalone one.
+//
+// The rule set is deliberately the same one go-mqtt's
+// protocol.ValidateTopicFilter enforces, because a filter this module
+// accepts and go-mqtt routes differently is a silent routing failure. A
+// differential enumeration found the two disagreeing on 109 filter shapes,
+// every one of them `$share`-prefixed: they were accepted here as ordinary
+// literal levels, so a multi-instance consumer registering a shared
+// subscription got a route that could never fire — with nothing to show for
+// it but a `publisher.command.unroutable` warning per command. The UTF-8
+// and U+0000 checks were missing outright.
+//
+// One deliberate difference remains, in the matcher rather than here: a
+// filter with `#` before its last level matches nothing instead of being
+// read as if the `#` ended it. Both reject it, so it cannot be registered;
+// [MatchFilter] is reachable with any string and failing closed is the
+// safer answer there. See [captureFilter].
 func ValidateFilter(filter string) error {
 	if filter == "" {
 		return fmt.Errorf("%w: empty", ErrInvalidFilter)
@@ -733,7 +902,34 @@ func ValidateFilter(filter string) error {
 	if len(filter) > 65535 {
 		return fmt.Errorf("%w: longer than an MQTT topic may be", ErrInvalidFilter)
 	}
-	parts := strings.Split(filter, "/")
+	if !utf8.ValidString(filter) {
+		return fmt.Errorf("%w: %q is not valid UTF-8", ErrInvalidFilter, filter)
+	}
+	if strings.ContainsRune(filter, 0) {
+		return fmt.Errorf("%w: %q contains U+0000", ErrInvalidFilter, filter)
+	}
+	if rest, found := strings.CutPrefix(filter, sharedPrefix); found {
+		shareName, wrapped, split := strings.Cut(rest, "/")
+		switch {
+		case !split:
+			return fmt.Errorf("%w: %q must be $share/{ShareName}/{filter}", ErrInvalidFilter, filter)
+		case shareName == "":
+			return fmt.Errorf("%w: %q has an empty ShareName", ErrInvalidFilter, filter)
+		case strings.ContainsAny(shareName, "+#"):
+			return fmt.Errorf("%w: %q has a wildcard in its ShareName", ErrInvalidFilter, filter)
+		case wrapped == "":
+			return fmt.Errorf("%w: %q wraps an empty topic filter", ErrInvalidFilter, filter)
+		}
+		return validateFilterLevels(filter, wrapped)
+	}
+	return validateFilterLevels(filter, filter)
+}
+
+// validateFilterLevels enforces MQTT's wildcard placement on the matchable
+// part of a filter, naming the whole filter in the error so an operator
+// reading a log sees what they registered.
+func validateFilterLevels(filter, matchable string) error {
+	parts := strings.Split(matchable, "/")
 	for i, p := range parts {
 		switch {
 		case p == "+" || p == "#":
@@ -757,8 +953,17 @@ func ValidateFilter(filter string) error {
 // `+` matches exactly one level, `#` matches the remainder including zero
 // levels, so `a/#` matches `a`. Neither wildcard matches a topic beginning
 // with `$`, per §4.7.2, which is what keeps a broad filter off `$SYS`.
+//
+// A shared-subscription filter (`$share/{ShareName}/{filter}`, §4.8.2)
+// matches against the topic a PUBLISH actually carries, which is the real
+// topic and never carries the prefix: the `$share/{ShareName}/` levels are
+// stripped and only the wrapped filter matches, so
+// MatchFilter("$share/grp/sensors/+", "sensors/temp") is true. Treating
+// them as literal levels — which this did — meant every shared
+// subscription a consumer registered routed nothing at all while go-mqtt
+// delivered on it. See [ValidateFilter].
 func MatchFilter(filter, topic string) bool {
-	return matchFilter(strings.Split(filter, "/"), topic)
+	return matchFilter(filterParts(filter), topic)
 }
 
 func matchFilter(parts []string, topic string) bool {
@@ -829,88 +1034,6 @@ func filtersOverlap(a, b []string) bool {
 			return false
 		}
 		a, b = a[1:], b[1:]
-	}
-}
-
-// compareSpecificity orders two overlapping filters. It returns +1 when a is
-// strictly more specific, -1 when b is, 0 when they are equally specific,
-// and ordered=false when neither dominates.
-//
-// Specificity is per level — a literal beats `+`, `+` beats `#` — and a
-// filter only wins if it is at least as specific at every level and better
-// at one. `a/+/c` against `a/b/+` is the unorderable case: each is more
-// specific than the other somewhere, both match `a/b/c`, and no rule short
-// of registration order could pick one. Registration order is exactly the
-// wrong tiebreaker, because it makes routing depend on the order a
-// composition root happened to wire its optional sinks in.
-func compareSpecificity(a, b []string) (cmp int, ordered bool) {
-	sign := 0
-	for i := 0; ; i++ {
-		aDone, bDone := i >= len(a), i >= len(b)
-		switch {
-		case aDone && bDone:
-			return sign, true
-		case aDone:
-			// Only reachable for filters of different level counts,
-			// which can overlap only through a `#` the loop has not
-			// reached yet. The longer filter constrains more.
-			return combineSpecificity(sign, -1)
-		case bDone:
-			return combineSpecificity(sign, +1)
-		}
-		if a[i] == "#" && b[i] == "#" {
-			return sign, true
-		}
-		if a[i] == "#" {
-			return combineSpecificity(sign, -1)
-		}
-		if b[i] == "#" {
-			return combineSpecificity(sign, +1)
-		}
-		ra, rb := levelRank(a[i]), levelRank(b[i])
-		if ra == rb {
-			continue
-		}
-		next := -1
-		if ra > rb {
-			next = +1
-		}
-		var ok bool
-		if sign, ok = mergeSign(sign, next); !ok {
-			return 0, false
-		}
-	}
-}
-
-// combineSpecificity folds a final verdict into the running sign.
-func combineSpecificity(sign, final int) (cmp int, ordered bool) {
-	s, ok := mergeSign(sign, final)
-	if !ok {
-		return 0, false
-	}
-	return s, true
-}
-
-// mergeSign keeps a running comparison, refusing a contradiction.
-func mergeSign(sign, next int) (merged int, ok bool) {
-	if sign != 0 && next != 0 && sign != next {
-		return 0, false
-	}
-	if next != 0 {
-		return next, true
-	}
-	return sign, true
-}
-
-// levelRank scores one filter level: a literal constrains most, `#` least.
-func levelRank(level string) int {
-	switch level {
-	case "#":
-		return 0
-	case "+":
-		return 1
-	default:
-		return 2
 	}
 }
 

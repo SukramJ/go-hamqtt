@@ -10,10 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	hacatalog "github.com/SukramJ/go-ha-catalog"
+	"github.com/SukramJ/go-mqtt/protocol"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
 )
@@ -37,6 +39,13 @@ type cmdBroker struct {
 	noLoc  bool // record SubscribeNoLocal use; see cmdBrokerNoLocal
 
 	failSubscribe func(filter string) error
+	// failUnsubscribe exists because without it the rollback path in
+	// Start and the teardown path in Stop are unreachable by
+	// construction: every other fixture in this package returns nil from
+	// Unsubscribe unconditionally, and a broker that refuses an
+	// UNSUBSCRIBE is exactly the case that used to leave a live,
+	// ungated subscription behind a failed Start.
+	failUnsubscribe func(filter string) error
 }
 
 func newCmdBroker() *cmdBroker {
@@ -44,17 +53,7 @@ func newCmdBroker() *cmdBroker {
 }
 
 func (b *cmdBroker) Publish(_ context.Context, topic string, payload []byte, _ byte, _ bool) error {
-	b.mu.Lock()
-	targets := make([]Handler, 0, len(b.subs))
-	for filter, h := range b.subs {
-		if MatchFilter(filter, topic) {
-			targets = append(targets, h)
-		}
-	}
-	b.mu.Unlock()
-	for _, h := range targets {
-		h(topic, payload, false)
-	}
+	b.fanout(topic, payload, false)
 	return nil
 }
 
@@ -74,15 +73,43 @@ func (b *cmdBroker) Subscribe(_ context.Context, filter string, _ byte, h Handle
 func (b *cmdBroker) Unsubscribe(_ context.Context, filter string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.subs, filter)
 	b.unsub = append(b.unsub, filter)
+	if b.failUnsubscribe != nil {
+		if err := b.failUnsubscribe(filter); err != nil {
+			// The subscription stays live, which is what a broker
+			// refusing an UNSUBSCRIBE leaves behind.
+			return err
+		}
+	}
+	delete(b.subs, filter)
 	return nil
 }
 
-// deliver drives one inbound message through every matching subscription,
-// exactly as a broker fans out. Returns how many subscriptions saw it, which
-// is what proves the one-handler-per-message rule is doing work.
+// deliver drives one inbound message through the two fan-outs a command
+// actually survives, and returns the number of copies the broker produced.
+//
+// Both multiplications are real and they compose, which is the thing the
+// previous version of this fake got wrong by modelling only the first:
+//
+//   - The BROKER sends one copy of the message per matching subscription.
+//     MQTT 3.1.1 §4.7.3 and 5.0 §3.3.4 permit it and both Mosquitto and
+//     EMQX do it; it was measured against Mosquitto 2.1.2 on v3.1.1 and
+//     v5 alike, with two separate clients so No-Local is not in play.
+//   - The CLIENT then re-matches every arriving copy against its whole
+//     local filter list and calls EVERY matching handler, without
+//     correlating a copy with the subscription it arrived on
+//     (go-mqtt's TCPClient.dispatch).
+//
+// So N overlapping routes cost N copies x N handler invocations, of which N
+// reach a handler — which is why the router refuses overlapping routes
+// outright instead of resolving them by specificity. See
+// [CommandRouter.Handle].
 func (b *cmdBroker) deliver(topic string, payload []byte, retained bool) int {
+	return b.fanout(topic, payload, retained)
+}
+
+// fanout is the two-stage delivery both Publish and deliver go through.
+func (b *cmdBroker) fanout(topic string, payload []byte, retained bool) (copies int) {
 	b.mu.Lock()
 	targets := make([]Handler, 0, len(b.subs))
 	for filter, h := range b.subs {
@@ -91,8 +118,12 @@ func (b *cmdBroker) deliver(topic string, payload []byte, retained bool) int {
 		}
 	}
 	b.mu.Unlock()
-	for _, h := range targets {
-		h(topic, payload, retained)
+	// One copy per matching subscription; each copy visits every matching
+	// local handler.
+	for range targets {
+		for _, h := range targets {
+			h(topic, payload, retained)
+		}
 	}
 	return len(targets)
 }
@@ -202,6 +233,22 @@ func TestValidateFilter(t *testing.T) {
 		{"a/#/b", false},
 		{"a/b+/c", false},
 		{"a/#b", false},
+		// §4.8.2: the shared-subscription structure, and the wrapped
+		// filter validated exactly like a standalone one. These are the
+		// shapes that used to be accepted as ordinary literal levels
+		// and then routed nothing — see TestFilterRulesAgreeWithGoMQTT.
+		{"$share/grp/a/+/set", true},
+		{"$share/grp/#", true},
+		{"$share", true}, // no separator: the literal filter it looks like
+		{"$share/", false},
+		{"$share/grp", false},
+		{"$share/grp/", false},
+		{"$share//set", false},
+		{"$share/gr+p/set", false},
+		{"$share/grp/a/#/b", false},
+		// §1.5.4 applies to a filter as much as to a topic name.
+		{"a/\x00/b", false},
+		{"a/\xff/b", false},
 	} {
 		err := ValidateFilter(tc.filter)
 		if tc.ok != (err == nil) {
@@ -232,6 +279,12 @@ func TestMatchFilter(t *testing.T) {
 		{"#", "$SYS/broker/uptime", false},
 		{"+/broker", "$SYS/broker", false},
 		{"$SYS/#", "$SYS/broker", true},
+		// §4.8.2: the prefix is structural — a PUBLISH carries the real
+		// topic — so only the wrapped filter matches.
+		{"$share/grp/sensors/+", "sensors/temp", true},
+		{"$share/grp/sensors/+", "$share/grp/sensors/temp", false},
+		{"$share/grp/#", "$SYS/x", false},
+		{"$share", "$share", true},
 	} {
 		if got := MatchFilter(tc.filter, tc.topic); got != tc.want {
 			t.Errorf("MatchFilter(%q, %q) = %v, want %v", tc.filter, tc.topic, got, tc.want)
@@ -260,15 +313,18 @@ func TestCommandRouterHandleRejectsBadRegistrations(t *testing.T) {
 	if err := r.Handle("+/b/set", rc.handle); !errors.Is(err, ErrAmbiguousRoutes) {
 		t.Errorf("unorderable overlap: %v, want ErrAmbiguousRoutes", err)
 	}
-	// An orderable overlap is fine — that is the measured topology.
-	if err := r.Handle("a/week_profile/set", rc.handle); err != nil {
-		t.Errorf("orderable overlap rejected: %v", err)
+	// An ORDERABLE overlap is refused too, and that is the S1 fix: a
+	// specificity winner is picked per delivered copy of a message, not
+	// per message, so `a/week_profile/set` alongside `a/+/set` ran one
+	// message's handler twice against Mosquitto 2.1.2.
+	if err := r.Handle("a/week_profile/set", rc.handle); !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Errorf("orderable overlap: %v, want ErrAmbiguousRoutes", err)
 	}
 	// Non-overlapping is always fine.
 	if err := r.Handle("b/+/+/set", rc.handle); err != nil {
 		t.Errorf("disjoint filter rejected: %v", err)
 	}
-	if got, want := len(r.Filters()), 3; got != want {
+	if got, want := len(r.Filters()), 2; got != want {
 		t.Errorf("Filters() has %d entries, want %d", got, want)
 	}
 }
@@ -278,7 +334,7 @@ func TestCommandRouterSubscribesExactlyTheRegisteredFilters(t *testing.T) {
 	b := newCmdBroker()
 	r := quietRouter(t, b, CommandConfig{})
 	rc := &recorder{}
-	for _, f := range []string{"gh/+/+/set", "gh/alarm/+/set"} {
+	for _, f := range []string{"gh/+/+/set", "gh/alarm/+/arm"} {
 		if err := r.Handle(f, rc.handle); err != nil {
 			t.Fatalf("handle %s: %v", f, err)
 		}
@@ -287,7 +343,7 @@ func TestCommandRouterSubscribesExactlyTheRegisteredFilters(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	got := strings.Join(sorted(b.subscribed()), ",")
-	if want := "gh/+/+/set,gh/alarm/+/set"; got != want {
+	if want := "gh/+/+/set,gh/alarm/+/arm"; got != want {
 		t.Fatalf("subscribed %q, want %q — the router must subscribe its routes and nothing broader", got, want)
 	}
 	if err := r.Handle("gh/x/set", rc.handle); !errors.Is(err, ErrRouterStarted) {
@@ -403,10 +459,15 @@ func TestCommandRouterPayloadIsClonedForTheHandler(t *testing.T) {
 }
 
 // TestCommandRouterOneHandlerPerMessage is the regression for the measured
-// double-dispatch: a broker fans a message out to EVERY matching
-// subscription, so two overlapping filters mean two deliveries. The
-// reference implementation patched that with a hand-maintained list of
-// reserved topic segments; the router resolves by specificity instead.
+// double-dispatch, and it is the pair that reproduced it against Mosquitto
+// 2.1.2: `gh/+/+/+/+/set` and `gh/+/+/+/week_profile/set` overlap, the
+// broker sends one copy per matching subscription, and go-mqtt calls every
+// locally matching handler for each copy — so the specificity winner was
+// chosen once per COPY and the profile selection ran twice.
+//
+// The router now refuses the pair, and what a consumer keeps instead is one
+// route per shape with the discrimination inside the handler. Both halves
+// are asserted here, against a fake that models both fan-outs.
 func TestCommandRouterOneHandlerPerMessage(t *testing.T) {
 	t.Parallel()
 	b := newCmdBroker()
@@ -415,31 +476,72 @@ func TestCommandRouterOneHandlerPerMessage(t *testing.T) {
 	if err := r.Handle("gh/+/+/+/+/set", generic.handle); err != nil {
 		t.Fatalf("handle generic: %v", err)
 	}
-	if err := r.Handle("gh/+/+/+/week_profile/set", specific.handle); err != nil {
-		t.Fatalf("handle specific: %v", err)
+	err := r.Handle("gh/+/+/+/week_profile/set", specific.handle)
+	if !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Fatalf("overlapping route accepted (%v); one message would run a handler twice", err)
+	}
+	if !strings.Contains(err.Error(), "gh/+/+/+/+/set") ||
+		!strings.Contains(err.Error(), "gh/+/+/+/week_profile/set") {
+		t.Errorf("the refusal must name both filters, got %v", err)
 	}
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
 
-	if n := b.deliver("gh/ccu/HmIP/0001:1/week_profile/set", []byte("P2"), false); n != 2 {
-		t.Fatalf("broker fanned out to %d subscriptions, want 2 — the collision the test is about is not reproduced", n)
+	// One subscription matches, so the broker makes one copy and the
+	// client's local fan-out has one handler to offer it to.
+	if n := b.deliver("gh/ccu/HmIP/0001:1/week_profile/set", []byte("P2"), false); n != 1 {
+		t.Fatalf("broker fanned out to %d subscriptions, want 1", n)
 	}
 	if n := b.deliver("gh/ccu/HmIP/0001:1/LEVEL/set", []byte("1"), false); n != 1 {
 		t.Fatalf("plain data-point topic hit %d subscriptions, want 1", n)
 	}
 	r.WaitIdle()
 
-	if got := specific.count(); got != 1 {
-		t.Errorf("week-profile handler ran %d times, want 1", got)
+	if got := specific.count(); got != 0 {
+		t.Errorf("the refused route ran %d times, want 0", got)
 	}
-	if got := generic.count(); got != 1 {
-		t.Errorf("generic handler ran %d times, want 1 (the LEVEL write only) — "+
-			"a profile selection must not also be dispatched as a write to a parameter named week_profile", got)
+	got := generic.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("the surviving route ran %d times, want exactly one per message", len(got))
 	}
-	if got := generic.snapshot()[0].Wildcards; got[3] != "LEVEL" {
-		t.Errorf("generic handler saw %v", got)
+	// The discrimination the refused route used to buy is the handler's
+	// now, and the wildcard capture is what it reads. Asserted as a set:
+	// the two commands are on different topics, so they run on different
+	// workers and order between them is deliberately not promised.
+	params := sorted([]string{got[0].Wildcards[3], got[1].Wildcards[3]})
+	if strings.Join(params, ",") != "LEVEL,week_profile" {
+		t.Errorf("handler saw %v, want the parameter name in the fourth `+` of each", params)
+	}
+}
+
+// TestCommandRouterRefusesEveryOverlapShape pins the disjointness rule
+// across the shapes a consumer actually writes, including the measured pair
+// (`ccu/+/+/set` with `ccu/+/PRESS_SHORT/set`) whose two handler runs held
+// the release.
+func TestCommandRouterRefusesEveryOverlapShape(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b    string
+		refused bool
+	}{
+		{"ccu/+/+/set", "ccu/+/PRESS_SHORT/set", true},
+		{"base/dev/set", "base/dev/set/#", true},
+		{"base/#", "base/dev/set", true},
+		{"a/+/c", "a/b/+", true},
+		{"a/b/set", "a/c/set", false},
+		{"a/+/set", "a/+/get", false},
+		{"a/b/#", "a/c/#", false},
+	} {
+		r := quietRouter(t, newCmdBroker(), CommandConfig{})
+		if err := r.Handle(tc.a, (&recorder{}).handle); err != nil {
+			t.Fatalf("handle %q: %v", tc.a, err)
+		}
+		err := r.Handle(tc.b, (&recorder{}).handle)
+		if refused := errors.Is(err, ErrAmbiguousRoutes); refused != tc.refused {
+			t.Errorf("Handle(%q) after %q = %v, want refused=%v", tc.b, tc.a, err, tc.refused)
+		}
 	}
 }
 
@@ -636,10 +738,20 @@ func TestCommandRouterHandlerRunsOffTheReadLoop(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	start := time.Now()
-	b.deliver("gh/lamp/set", []byte("on"), false)
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("delivery took %v while the handler was still blocked; it must not run on the read loop", elapsed)
+	// The delivery itself has to be watched from another goroutine: the
+	// handler blocks until this test releases it, so a delivery that DID
+	// run the handler inline would never reach a `time.Since` after it.
+	// Measuring elapsed time on this goroutine could only ever pass.
+	returned := make(chan struct{})
+	go func() {
+		b.deliver("gh/lamp/set", []byte("on"), false)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the delivery had not returned while the handler was still blocked; " +
+			"a handler must not run on the transport's read loop")
 	}
 	select {
 	case <-entered:
@@ -667,22 +779,60 @@ func TestCommandRouterHandlerRunsOffTheReadLoop(t *testing.T) {
 	}
 }
 
-// TestCommandRouterPreservesOrderPerTopic proves a burst on ONE topic is
-// never reordered even though several workers run, which is the property
-// that lets a consumer treat a topic as an ordered command channel.
+// TestCommandRouterPreservesOrderPerTopic proves both halves of the
+// dispatch promise: a burst on one topic is never reordered, and unrelated
+// topics do not wait for each other.
+//
+// The second half is what the earlier version of this test was missing. It
+// sent all 200 messages to ONE topic, which one worker delivers serially,
+// so the multi-worker premise was never exercised and hardcoding poolIndex
+// to 0 still passed it. Here each topic's first command parks until every
+// topic has one in flight, which only completes if the topics really landed
+// on different workers, and the barrier has a deadline so a serial pool
+// fails with a message rather than as a whole-binary timeout.
 func TestCommandRouterPreservesOrderPerTopic(t *testing.T) {
 	t.Parallel()
-	const n = 200
-	b := newCmdBroker()
-	var (
-		mu   sync.Mutex
-		seen []string
+	const (
+		lanes = 4
+		burst = 50
 	)
+	// Topics that hash to distinct workers. Asserting the premise beats
+	// assuming it: a poolIndex that collapses every key onto one worker
+	// is caught here, by name.
+	topics := make([]string, 0, lanes)
+	used := map[int]bool{}
+	for i := 0; i < 200 && len(topics) < lanes; i++ {
+		topic := "gh/lamp" + strconv.Itoa(i) + "/set"
+		slot := poolIndex(topic, DefaultCommandWorkers)
+		if used[slot] {
+			continue
+		}
+		used[slot] = true
+		topics = append(topics, topic)
+	}
+	if len(topics) != lanes {
+		t.Fatalf("only found %d topics on distinct workers; the pool is not spreading keys", len(topics))
+	}
+
+	var (
+		mu      sync.Mutex
+		seen    = map[string][]string{}
+		release = make(chan struct{})
+		entered = make(chan string, lanes)
+	)
+	b := newCmdBroker()
 	r := quietRouter(t, b, CommandConfig{})
 	if err := r.Handle("gh/+/set", func(_ context.Context, cmd Command) {
 		mu.Lock()
-		seen = append(seen, string(cmd.Payload))
+		first := len(seen[cmd.Topic]) == 0
+		seen[cmd.Topic] = append(seen[cmd.Topic], string(cmd.Payload))
 		mu.Unlock()
+		if first {
+			// Park the lane: if the four topics shared a worker, the
+			// other three could never arrive.
+			entered <- cmd.Topic
+			<-release
+		}
 	}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -691,19 +841,34 @@ func TestCommandRouterPreservesOrderPerTopic(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
 
-	for i := range n {
-		b.deliver("gh/lamp/set", []byte(strconv.Itoa(i)), false)
+	for i := range burst {
+		for _, topic := range topics {
+			b.deliver(topic, []byte(strconv.Itoa(i)), false)
+		}
 	}
+	for range lanes {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("not every topic had a command in flight; commands on different topics " +
+				"must not wait for each other, which is what several workers are for")
+		}
+	}
+	close(release)
 	r.WaitIdle()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(seen) != n {
-		t.Fatalf("saw %d commands, want %d", len(seen), n)
-	}
-	for i, v := range seen {
-		if v != strconv.Itoa(i) {
-			t.Fatalf("command %d was %q — same-topic commands reordered", i, v)
+	for _, topic := range topics {
+		got := seen[topic]
+		if len(got) != burst {
+			t.Fatalf("%s saw %d commands, want %d", topic, len(got), burst)
+		}
+		for i, v := range got {
+			if v != strconv.Itoa(i) {
+				t.Fatalf("%s command %d was %q — same-topic commands reordered", topic, i, v)
+			}
 		}
 	}
 }
@@ -928,28 +1093,6 @@ func TestBundleTopicExtraction(t *testing.T) {
 	}
 }
 
-func TestCompareSpecificity(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		a, b    string
-		cmp     int
-		ordered bool
-	}{
-		{"a/b", "a/+", +1, true},
-		{"a/+", "a/b", -1, true},
-		{"a/+", "a/+", 0, true},
-		{"a/b/c", "a/#", +1, true},
-		{"a/#", "#", +1, true},
-		{"a/+/c", "a/b/+", 0, false},
-		{"a/b/c/d", "a/b/#", +1, true},
-	} {
-		cmp, ordered := compareSpecificity(strings.Split(tc.a, "/"), strings.Split(tc.b, "/"))
-		if cmp != tc.cmp || ordered != tc.ordered {
-			t.Errorf("compareSpecificity(%q, %q) = %d/%v, want %d/%v", tc.a, tc.b, cmp, ordered, tc.cmp, tc.ordered)
-		}
-	}
-}
-
 func TestFiltersOverlap(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
@@ -970,17 +1113,54 @@ func TestFiltersOverlap(t *testing.T) {
 	}
 }
 
+// TestCommandPoolEnqueueAfterCloseDoesNotRun pins that a job arriving after
+// close is refused and SAID SO.
+//
+// "Did not run" alone is not assertable after close: no worker remains, so
+// a queue that silently accepted the job would satisfy it too — the old
+// version of this test could not fail. What distinguishes the two is the
+// warning, which is also the only evidence an operator would ever get. The
+// flush is watched from another goroutine for the same reason: a flush that
+// parked would otherwise surface as a whole-binary timeout, taking every
+// parallel test in the package down with it.
 func TestCommandPoolEnqueueAfterCloseDoesNotRun(t *testing.T) {
 	t.Parallel()
-	p := newCommandPool(2, 1, slog.New(slog.DiscardHandler))
+	var (
+		mu      sync.Mutex
+		dropped []string
+	)
+	log := slog.New(countingHandler{fn: func(msg string) {
+		mu.Lock()
+		if msg == "publisher.command.dropped_after_close" {
+			dropped = append(dropped, msg)
+		}
+		mu.Unlock()
+	}})
+	p := newCommandPool(2, 1, log)
 	p.close()
+
 	ran := make(chan struct{})
 	p.enqueue("k", func() { close(ran) })
-	p.flush()
+
+	flushed := make(chan struct{})
+	go func() {
+		p.flush()
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush parked on a closed pool")
+	}
 	select {
 	case <-ran:
 		t.Fatal("a job enqueued after close ran; no worker remains to run it")
 	default:
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dropped) != 1 {
+		t.Errorf("logged %d drops, want 1 — a discarded command an operator cannot see is a lost command", len(dropped))
 	}
 }
 
@@ -1103,3 +1283,330 @@ func (h countingHandler) Handle(_ context.Context, rec slog.Record) error {
 func (h countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 
 func (h countingHandler) WithGroup(string) slog.Handler { return h }
+
+// TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails is the
+// regression for the second half of the S3 finding. Rollback is best effort
+// — a broker may refuse the UNSUBSCRIBE — so a failed Start can leave a
+// live subscription. What must not survive it is an OPEN gate: the failure
+// path used to clear `started` without setting `stopped`, so the live
+// subscription still reached handlers and commands ran against
+// half-initialised dependencies, the exact hazard Stop's doc forbids.
+func TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	boom := errors.New("broker said no")
+	b.failSubscribe = func(filter string) error {
+		if filter == "gh/b/set" {
+			return boom
+		}
+		return nil
+	}
+	b.failUnsubscribe = func(string) error { return errors.New("broker refused the rollback") }
+
+	rc := &recorder{}
+	r := quietRouter(t, b, CommandConfig{})
+	for _, f := range []string{"gh/a/set", "gh/b/set"} {
+		if err := r.Handle(f, rc.handle); err != nil {
+			t.Fatalf("handle: %v", err)
+		}
+	}
+	err := r.Start(context.Background())
+	if !errors.Is(err, boom) {
+		t.Fatalf("start: %v, want the broker's error", err)
+	}
+	// The consumer cannot act on what it is not told: the error names the
+	// filter the rollback could not take down.
+	if !strings.Contains(err.Error(), "gh/a/set") {
+		t.Errorf("the error must name the subscription still live, got %v", err)
+	}
+	if live := b.filters(); len(live) != 1 {
+		t.Fatalf("fixture broke: want exactly the un-rolled-back subscription live, got %v", live)
+	}
+
+	b.deliver("gh/a/set", []byte("on"), false)
+	r.WaitIdle()
+	if got := rc.count(); got != 0 {
+		t.Fatalf("a handler ran %d times after Start failed; the gate must be closed, "+
+			"because a command now runs against half-initialised dependencies", got)
+	}
+}
+
+// TestCommandRouterOwnsNoGoroutinesUntilStarted is the regression for the
+// leak: the pool used to be started in NewCommandRouter, so a router that
+// never reached Start left its workers parked on a condition variable with
+// nothing to reclaim them — eight goroutines per router, measured at 2 -> 82
+// over ten routers built and discarded. Three ordinary paths get there: a
+// Handle that errors at a composition root, a config reload replacing the
+// router, and a failed Start the consumer gives up on.
+//
+// Asserted on the pool field rather than by counting goroutines, because a
+// count is not attributable in a package whose tests run in parallel.
+func TestCommandRouterOwnsNoGoroutinesUntilStarted(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	r := quietRouter(t, b, CommandConfig{})
+
+	// Built and abandoned: the composition root's Handle failed.
+	if err := r.Handle("a/#/b", (&recorder{}).handle); err == nil {
+		t.Fatal("fixture broke: that filter is malformed")
+	}
+	r.mu.Lock()
+	pool := r.pool
+	r.mu.Unlock()
+	if pool != nil {
+		t.Fatal("construction started the worker pool; a router that never starts must own no goroutines")
+	}
+
+	if err := r.Handle("gh/+/set", (&recorder{}).handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	r.mu.Lock()
+	pool = r.pool
+	r.mu.Unlock()
+	if pool == nil {
+		t.Fatal("Start left no pool; the workers are what take handlers off the read loop")
+	}
+	if err := r.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	r.mu.Lock()
+	after := r.pool
+	r.mu.Unlock()
+	if after != nil {
+		t.Error("Stop left the pool in place")
+	}
+	// close() returns only once every worker has exited, so a closed
+	// queue set proves the goroutines are gone, not merely unreferenced.
+	for i, q := range pool.queues {
+		q.mu.Lock()
+		closed := q.closed
+		q.mu.Unlock()
+		if !closed {
+			t.Errorf("worker queue %d survived Stop", i)
+		}
+	}
+}
+
+// TestCommandRouterFailedStartReclaimsItsWorkers pins the third path into
+// the leak: a Start that fails spins up the pool before its first subscribe
+// (a broker may deliver the moment it acknowledges one) and must hand it
+// back, because the consumer has been told the start failed and has no
+// reason to call Stop.
+func TestCommandRouterFailedStartReclaimsItsWorkers(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	b.failSubscribe = func(string) error { return errors.New("broker said no") }
+	r := quietRouter(t, b, CommandConfig{})
+	if err := r.Handle("gh/+/set", (&recorder{}).handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if err := r.Start(context.Background()); err == nil {
+		t.Fatal("fixture broke: the subscribe must fail")
+	}
+	r.mu.Lock()
+	pool := r.pool
+	r.mu.Unlock()
+	if pool != nil {
+		t.Error("a failed Start kept its worker pool alive")
+	}
+}
+
+// TestCommandRouterStopDropsNothingItAccepted closes the window S10
+// suspected and this fixture confirmed: deliver used to read the stopped
+// flag under the route lock, release it, and only then enqueue, so a Stop
+// completing in between discarded the command with a
+// `dropped_after_close` warning — contradicting Stop's promise that
+// anything already accepted runs to completion. It is rare (about one in
+// four thousand deliveries racing a Stop, with both goroutines released
+// from one barrier) and it is logged rather than silent, which is why it
+// took a stress fixture to see; the gate check and the enqueue are one
+// locked step now, so it cannot happen rather than seldom happening.
+//
+// The stronger property is asserted alongside it, because the fix must not
+// buy one at the other's expense: no handler ever runs after Stop returns.
+func TestCommandRouterStopDropsNothingItAccepted(t *testing.T) {
+	t.Parallel()
+	const (
+		iterations = 400
+		deliveries = 50
+	)
+	var drops atomic.Int64
+	log := slog.New(countingHandler{fn: func(msg string) {
+		if msg == "publisher.command.dropped_after_close" {
+			drops.Add(1)
+		}
+	}})
+	for range iterations {
+		b := newCmdBroker()
+		var (
+			stopReturned atomic.Bool
+			lateRun      atomic.Bool
+		)
+		r := NewCommandRouter(b, CommandConfig{Workers: 2, Logger: log})
+		if err := r.Handle("gh/+/set", func(context.Context, Command) {
+			if stopReturned.Load() {
+				lateRun.Store(true)
+			}
+		}); err != nil {
+			t.Fatalf("handle: %v", err)
+		}
+		if err := r.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		// Hold the subscription handler directly: a broker delivers
+		// what was already in flight while Stop is running.
+		b.mu.Lock()
+		h := b.subs["gh/+/set"]
+		b.mu.Unlock()
+
+		barrier := make(chan struct{})
+		var wg sync.WaitGroup
+		// Many concurrent deliveries per Stop: the window is a handful
+		// of instructions wide, so the fixture needs enough of them in
+		// flight for one to be descheduled inside it.
+		wg.Add(deliveries + 1)
+		for i := range deliveries {
+			go func() {
+				defer wg.Done()
+				<-barrier
+				h("gh/lamp"+strconv.Itoa(i)+"/set", []byte("on"), false)
+			}()
+		}
+		go func() {
+			defer wg.Done()
+			<-barrier
+			_ = r.Stop(context.Background())
+			stopReturned.Store(true)
+		}()
+		close(barrier)
+		wg.Wait()
+
+		if lateRun.Load() {
+			t.Fatal("a handler ran after Stop returned")
+		}
+	}
+	if got := drops.Load(); got != 0 {
+		t.Errorf("%d of %d deliveries racing Stop were dropped after accepting the gate; "+
+			"Stop must drain what it accepted, not discard it", got, iterations*deliveries)
+	}
+}
+
+// filterCorpus enumerates the filter and topic shapes the two matchers can
+// disagree on: the wildcards, the empty level a leading/trailing/doubled
+// slash produces, the `$`-prefixed trees §4.7.2 protects, and the `$share`
+// levels §4.8.2 makes structural.
+func filterCorpus() []string {
+	levels := []string{"a", "b", "+", "#", "", "$SYS", "$share", "grp"}
+	shapes := []string{
+		"$share", "$share/", "$share//f", "$share/g", "$share/g/",
+		"$share/g+/f", "$share/g#/f", "$share/g/a/#", "$share/g/a/#/b", "$share/g/$SYS/x",
+		"$share/g/$share/g/a", "a\x00b", "a/\xff/b",
+	}
+	n := len(levels)
+	out := make([]string, 0, len(shapes)+n+n*n+n*n*n)
+	out = append(out, shapes...)
+	for _, one := range levels {
+		out = append(out, one)
+		for _, two := range levels {
+			out = append(out, one+"/"+two)
+			for _, three := range levels {
+				out = append(out, one+"/"+two+"/"+three)
+			}
+		}
+	}
+	return out
+}
+
+// TestFilterRulesAgreeWithGoMQTT is the regression for the $share class.
+//
+// The router's filters are handed to go-mqtt, which routes by its own
+// fuzzed matcher; any shape the two decide differently is a silent routing
+// failure whose only evidence is a `publisher.command.unroutable` warning
+// per command. A differential enumeration over 7.84M (filter, topic) pairs
+// found exactly one disagreement class, for filters BOTH validators accept:
+// `$share`, which go-mqtt strips per §4.8.2 while this module matched it as
+// ordinary literal levels. ValidateFilter is what let those through — 109
+// shapes it accepted that protocol.ValidateTopicFilter rejects, all
+// $share-prefixed — and it checked neither valid UTF-8 nor U+0000.
+//
+// This is the enumeration in test form, narrow enough to run every time.
+// Only filters both validators accept take part in the matching half: a
+// filter with `#` before its last level is rejected by both, so the one
+// deliberate difference in [captureFilter] is excluded by construction
+// rather than by a special case here.
+func TestFilterRulesAgreeWithGoMQTT(t *testing.T) {
+	t.Parallel()
+	corpus := filterCorpus()
+	mismatches := 0
+	for _, filter := range corpus {
+		ours := ValidateFilter(filter)
+		theirs := protocol.ValidateTopicFilter(filter)
+		if (ours == nil) != (theirs == nil) {
+			mismatches++
+			if mismatches <= 10 {
+				t.Errorf("ValidateFilter(%q) = %v but protocol.ValidateTopicFilter = %v", filter, ours, theirs)
+			}
+			continue
+		}
+		if ours != nil {
+			continue
+		}
+		for _, topic := range corpus {
+			if protocol.ValidateTopicName(topic) != nil {
+				continue
+			}
+			if got, want := MatchFilter(filter, topic), protocol.MatchTopic(filter, topic); got != want {
+				mismatches++
+				if mismatches <= 10 {
+					t.Errorf("MatchFilter(%q, %q) = %v but protocol.MatchTopic = %v", filter, topic, got, want)
+				}
+			}
+		}
+	}
+	if mismatches > 10 {
+		t.Errorf("%d disagreements in total", mismatches)
+	}
+}
+
+// TestCommandRouterRoutesASharedSubscription is the consumer-visible half:
+// a multi-instance consumer registers `$share/...` so the broker load
+// balances commands across its instances, and the router must claim the
+// real topic the PUBLISH carries — which never contains the prefix.
+func TestCommandRouterRoutesASharedSubscription(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	rc := &recorder{}
+	r := quietRouter(t, b, CommandConfig{})
+	if err := r.Handle("$share/bridges/gh/+/set", rc.handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	// The overlap check runs on the wrapped filter too, or a shared route
+	// and its plain twin would both be registered and one message would
+	// run two handlers.
+	if err := r.Handle("gh/+/set", rc.handle); !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Errorf("a shared route and its plain twin: %v, want ErrAmbiguousRoutes", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	cmd, ok := r.Route("gh/lamp/set")
+	if !ok {
+		t.Fatal("a shared subscription claimed nothing; the broker delivers the real topic, never the $share prefix")
+	}
+	if cmd.Filter != "$share/bridges/gh/+/set" {
+		t.Errorf("Command.Filter = %q, want the route as registered", cmd.Filter)
+	}
+	if strings.Join(cmd.Wildcards, "|") != "lamp" {
+		t.Errorf("Wildcards = %v, want the wrapped filter's `+`", cmd.Wildcards)
+	}
+	// CheckDisjoint reads the same parts, so the state plane is checked
+	// against what a shared route really matches.
+	if err := r.CheckDisjoint("gh/lamp/set"); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("CheckDisjoint over a shared route: %v, want ErrStateCommandCollision", err)
+	}
+}

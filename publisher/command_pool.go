@@ -139,8 +139,12 @@ func (p *commandPool) enqueue(key string, job func()) {
 }
 
 // close stops accepting jobs and blocks until every worker has drained its
-// queue and exited. Idempotent.
+// queue and exited. Idempotent, and a no-op on a nil pool — a router that
+// never started has none.
 func (p *commandPool) close() {
+	if p == nil {
+		return
+	}
 	for _, q := range p.queues {
 		q.close()
 	}
@@ -148,8 +152,12 @@ func (p *commandPool) close() {
 }
 
 // flush blocks until every job enqueued before this call has run, by driving
-// a sentinel through each queue. A no-op once close has run.
+// a sentinel through each queue. A no-op once close has run, and on a nil
+// pool.
 func (p *commandPool) flush() {
+	if p == nil {
+		return
+	}
 	dones := make([]chan struct{}, 0, len(p.queues))
 	for _, q := range p.queues {
 		done := make(chan struct{})
