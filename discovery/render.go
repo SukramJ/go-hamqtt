@@ -258,6 +258,17 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 		return Component{}, err
 	}
 
+	// `name: null` is a statement; an empty name is the absence of one — see
+	// [model.Description.NameNull]. It wins over whatever the name resolved
+	// to and clears it, so the payload carries the null alone instead of a
+	// null beside a literal nobody can see. Only the 30 platforms that
+	// declare `name` get it; on device_automation and tag it would be dropped
+	// in silence.
+	if desc.NameNull && accepts["name"] {
+		comp.Name = ""
+		comp.NameNull = true
+	}
+
 	// Bounds go to the plain keys only where the platform declares them:
 	// `min` and `max` exist on number and text, `step` on number alone.
 	// Climate spells them min_temp/max_temp/temp_step and water_heater
@@ -281,6 +292,16 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	// this projection.
 	if accepts["optimistic"] {
 		comp.Optimistic = desc.Optimistic
+	}
+
+	// `command_template` is declared by 16 of the 32 platforms — notify,
+	// select, number, text, switch and siren among them, but not climate,
+	// cover, light or water_heater, which spell a template per role. So it is
+	// description vocabulary with a platform gate, like `optimistic`, rather
+	// than a Builder's job: two measured planes opened a builder for this one
+	// key alone.
+	if accepts["command_template"] {
+		comp.CommandTemplate = desc.CommandTemplate
 	}
 
 	// The json-attributes pair is accepted by 30 of the 32 platforms (all

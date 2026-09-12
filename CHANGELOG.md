@@ -3,6 +3,115 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+The escape hatches the twelve migrated discovery planes still had to
+work *around* the model instead of *through* it, measured one plane at
+a time and closed together. Additive throughout except where noted.
+
+### Added
+
+- **`model.Description.NameNull`** — `name: null` as a statement a
+  description can make.
+
+  Home Assistant's `entity.py` reads
+  `config.get(CONF_NAME, UNDEFINED)`: an explicit null comes back as
+  None and becomes the entity's name, an absent key comes back
+  UNDEFINED and makes it derive one from the platform. An empty
+  `model.Localized` is the absence of an opinion, so the pipeline
+  dropped the key and only the second was reachable — three planes
+  (notify, channel aggregate, per-datapoint) set
+  `discovery.Component.NameNull` after rendering to get the first,
+  two of them by re-deriving it from the component they had just been
+  handed.
+
+  It wins over `Name` and `NameKey`, the same precedence
+  `Component.NameNull` already has over `Fields` and `Extra`, so an
+  enricher can state it after a catalogue default filled in a name.
+  The zero value goes on meaning "no opinion", and the null is
+  projected only onto the 30 platforms whose schema declares `name` —
+  not device_automation, not tag.
+
+- **`model.Description.CommandTemplate`** — projected onto the 16
+  platforms that declare the key.
+
+  It existed on `discovery.Component` only, so the per-datapoint plane
+  and the notify plane each opened a `discovery.Builder` for this one
+  key, on entities that need nothing else platform-specific. climate,
+  cover, light and water_heater declare no such key — they spell a
+  template per role — and get none. The projection is deliberately not
+  gated on a command topic beside it: a `Builder` runs afterwards and
+  is often what names that topic, so gating would drop the template
+  for exactly the entities that set both.
+
+- **`topic.PulseKind`, `topic.PulseLayout`, `topic.PulseTopic`,
+  `topic.Default.Pulse`** — the topics an occurrence is published on:
+  a per-datapoint event, a channel event aggregate, an impulse and a
+  channel device error.
+
+  `topic.Layout` named state, command, availability and bridge. A
+  consumer reaching `publisher.StatePublisher.Pulse` — which takes a
+  plain topic string — formatted the other four itself, outside the
+  one package that knows its topic tree.
+
+  **A capability interface, not a fifth `Layout` method.** Both forms
+  work and the breaking one was on the table; this is the module's own
+  extension mechanism, and the only form under which the five
+  consumers that publish no pulses need no change at all. A fifth
+  method breaks all six layouts at once, including those with nothing
+  to return, and an embedded default answers for them with a
+  deterministic topic nobody subscribes to — worse than a compile
+  error, because it looks like an answer. `PulseTopic` gives the
+  declining case one spelling and invents nothing: an empty string
+  means this layout names no such topic and must not be published to.
+  `topic.Default` implements it, so a consumer with no opinion
+  inherits the shapes.
+
+- **`discovery.PresetModeTemplates`, `discovery.EnumTemplates`,
+  `discovery.JinjaQuote`** — the `preset_mode` Jinja pair, emitted
+  from a `model.Enum`.
+
+  `Enum` already pairs a code the device speaks with the label a
+  person reads, `Enum.Options` already emits the `preset_modes` list
+  and `Enum.Code` is already the reverse lookup — but the climate
+  plane hand-rolls both round-trip dictionaries as string formatting
+  beside them. Both are now built from one enum in one pass, so they
+  cannot disagree about which label belongs to which code; the
+  reference implementation's index-aligned slices could, and a reorder
+  of one renamed a preset in one direction only.
+
+  The emitted bytes match that plane's pinned payload exactly — key
+  order, quoting, the `is not none` guard, both `m.get` fallbacks —
+  verified against the `climate/thermostat` fixture of its byte-pinned
+  aggregate golden. That payload is already retained on brokers, so a
+  divergence would move a published payload.
+
+- **`discovery.RenderFrame`** — `RenderComponent` merged *under* a
+  component whose own keys are authoritative.
+
+  The combined-projection plane receives a finished `Component` built
+  outside the model, where every display key is the projection's, and
+  needs only the frame: device, origin, state topic, availability,
+  unique id. It rendered that frame and gap-filled by hand — six
+  `if comp.X == ""` lines, with nothing to catch the seventh when a
+  key is added here.
+
+  The precedence is stated once on the function: the given component
+  always wins, and only a key it leaves at its zero value is taken
+  from the frame. That is the mirror image of `Description.Extra`,
+  which is applied last and overrides everything. A nil slice is "no
+  opinion", an empty one is a statement and is kept. `Extra` merges
+  key by key into a new map, so one key set by the projection loses
+  neither the frame's other keys nor the caller's own map. The fill is
+  reflective, so a key added to `Component` is carried on the day it
+  is added.
+
+### Notes
+
+- Nothing under `publisher/` changed.
+- No exported signature moved, and no default changed: every addition
+  is reachable only by setting a field or calling a new function.
+
 ## [0.25.0] - 2026-09-12
 
 The publisher runtime ADR 0070 scoped from the start and phase 2
