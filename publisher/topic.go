@@ -194,6 +194,14 @@ func LegacyTopicWithNodeID(e LegacyEntity) string {
 // evidence. A component with no `unique_id` yields "" and is skipped, because
 // there is nothing to key on and a topic built from a blank segment belongs to
 // nobody.
+//
+// A tombstone is the case to watch, and it is the one that reaches a
+// consumer: the entry [discovery.Bundle.Remove] writes carries a platform and
+// nothing else, so this form has nothing to key on unless the removed
+// component's identity was remembered outside the payload. It is remembered,
+// by [discovery.Bundle.RemoveComponents] and by [discovery.Bundle.Remove] on
+// a key that was still declared — see [SupersededTopics] for what a tombstone
+// with neither costs.
 func LegacyTopicByUniqueID(e LegacyEntity) string {
 	if e.Platform == "" || e.UniqueID == "" {
 		return ""

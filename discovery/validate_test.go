@@ -4,6 +4,8 @@
 package discovery_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -255,6 +257,79 @@ func TestValidateAllowsARemovalMarker(t *testing.T) {
 	if err := discovery.Validate(b); err != nil {
 		t.Fatalf("Validate rejected a removal marker: %v", err)
 	}
+}
+
+// TestRemovalRemembersTheEntityItDeletes pins the half of a removal that is
+// not in the payload and must not be: the deleted entity's `unique_id`.
+//
+// A tombstone carries a platform and nothing else, so a consumer retracting
+// the removed entity's old per-entity config by `unique_id` — the
+// node-id-less legacy form measured across go-zendure2mqtt's fleet on
+// 2026-09-12 — had nothing to key on and left the stale config retained,
+// which re-creates the deleted entity as a permanently unavailable phantom on
+// every MQTT-integration restart. The identity is remembered in
+// Bundle.Tombstones instead, where it cannot un-remove anything.
+func TestRemovalRemembersTheEntityItDeletes(t *testing.T) {
+	t.Parallel()
+
+	was := map[string]discovery.Component{
+		"old_sensor": {Platform: hacatalog.PlatformSensor, UniqueID: "daikin_old_sensor"},
+	}
+
+	t.Run("RemoveComponents, for a key the new document no longer renders", func(t *testing.T) {
+		t.Parallel()
+		b := validBundle()
+		b.RemoveComponents(was, "old_sensor")
+
+		if got := b.Components["old_sensor"]; got.Platform != hacatalog.PlatformSensor || got.UniqueID != "" {
+			t.Fatalf("payload entry = %+v, want a platform and nothing else", got)
+		}
+		if got := b.Tombstones["old_sensor"].UniqueID; got != "daikin_old_sensor" {
+			t.Fatalf("remembered unique id = %q, want the removed entity's", got)
+		}
+		if err := discovery.Validate(b); err != nil {
+			t.Fatalf("Validate rejected a removal marker: %v", err)
+		}
+	})
+
+	t.Run("Remove, for a key that was still declared", func(t *testing.T) {
+		t.Parallel()
+		b := validBundle()
+		b.Components["old_sensor"] = was["old_sensor"]
+		b.Remove(map[string]hacatalog.Platform{"old_sensor": hacatalog.PlatformSensor}, "old_sensor")
+
+		if got := b.Components["old_sensor"].UniqueID; got != "" {
+			t.Fatalf("payload entry kept unique_id %q — that un-removes the entity", got)
+		}
+		if got := b.Tombstones["old_sensor"].UniqueID; got != "daikin_old_sensor" {
+			t.Fatalf("remembered unique id = %q, want the overwritten entry's", got)
+		}
+	})
+
+	t.Run("a component with no platform is skipped", func(t *testing.T) {
+		t.Parallel()
+		b := validBundle()
+		b.RemoveComponents(map[string]discovery.Component{"ghost": {UniqueID: "u"}}, "ghost", "absent")
+		if _, ok := b.Components["ghost"]; ok {
+			t.Fatal("wrote a component with no platform; it marshals to {} and Home Assistant ignores it")
+		}
+		if _, ok := b.Tombstones["absent"]; ok {
+			t.Fatal("remembered a key that was never handed over")
+		}
+	})
+
+	t.Run("the remembered identity stays out of the payload", func(t *testing.T) {
+		t.Parallel()
+		b := validBundle()
+		b.RemoveComponents(was, "old_sensor")
+		raw, err := json.Marshal(b)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(raw, []byte("daikin_old_sensor")) {
+			t.Fatalf("payload %s carries the removed unique_id — the entity is not removed", raw)
+		}
+	})
 }
 
 // TestBundleTopicUsesTheConfiguredPrefix covers the option that exists because

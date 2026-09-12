@@ -27,6 +27,10 @@ func TestSupersededTopicsHonoursAStatedLegacyForm(t *testing.T) {
 
 	t.Run("by unique id", func(t *testing.T) {
 		t.Parallel()
+		// `gone` was never declared on this document, so Remove had no
+		// entry to remember and the unique-id form has nothing to key on.
+		// TestSupersededTopicsRetractsATombstonedEntityByUniqueID is the
+		// call that closes that.
 		want := []string{
 			"homeassistant/number/u2/config",
 			"homeassistant/sensor/u1/config",
@@ -76,6 +80,103 @@ func TestSupersededTopicsHonoursAStatedLegacyForm(t *testing.T) {
 			t.Fatalf("default %v differs from the stated five-segment form %v", got, want)
 		}
 	})
+}
+
+// TestSupersededTopicsRetractsATombstonedEntityByUniqueID is the measured
+// gap of the v0.27.0–v0.29.0 review: a tombstone carries a platform and
+// nothing else, so a consumer wiring [LegacyTopicByUniqueID] —
+// go-zendure2mqtt's exact wiring — retracted nothing at all for a removed
+// entity, and its stale retained per-entity config went on re-creating it as
+// a permanently unavailable phantom on every MQTT-integration restart. The
+// sweep cannot reach it either: the node-id-less form parses with an empty
+// NodeID and a node-id-scoped Owns declines it.
+func TestSupersededTopicsRetractsATombstonedEntityByUniqueID(t *testing.T) {
+	t.Parallel()
+
+	was := map[string]discovery.Component{
+		"gone": {Platform: hacatalog.Platform("switch"), UniqueID: "u3"},
+	}
+	want := []string{
+		"homeassistant/number/u2/config",
+		"homeassistant/sensor/u1/config",
+		"homeassistant/switch/u3/config",
+	}
+
+	t.Run("remembered by RemoveComponents", func(t *testing.T) {
+		t.Parallel()
+		b := testBundle()
+		b.RemoveComponents(was, "gone")
+		if got := SupersededTopics("", b, LegacyTopicByUniqueID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v want %v — the removed entity's retained config is never retracted", got, want)
+		}
+		// And the payload still removes the entity: a tombstone that
+		// carried a unique_id would un-remove it.
+		if got := b.Components["gone"]; got.UniqueID != "" {
+			t.Fatalf("tombstone payload entry = %+v, want a platform and nothing else", got)
+		}
+	})
+
+	t.Run("remembered by Remove on a still-declared key", func(t *testing.T) {
+		t.Parallel()
+		b := testBundle()
+		b.Components["gone"] = was["gone"]
+		b.Remove(map[string]hacatalog.Platform{"gone": hacatalog.Platform("switch")}, "gone")
+		if got := SupersededTopics("", b, LegacyTopicByUniqueID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v want %v", got, want)
+		}
+		if got := b.Components["gone"]; got.UniqueID != "" {
+			t.Fatalf("tombstone payload entry = %+v, want a platform and nothing else", got)
+		}
+	})
+
+	t.Run("a second removal does not forget the identity", func(t *testing.T) {
+		t.Parallel()
+		b := testBundle()
+		b.RemoveComponents(was, "gone")
+		b.Remove(map[string]hacatalog.Platform{"gone": hacatalog.Platform("switch")}, "gone")
+		if got := SupersededTopics("", b, LegacyTopicByUniqueID); !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %v want %v — the repeat removal threw the remembered unique id away", got, want)
+		}
+	})
+
+	t.Run("the other forms are unchanged", func(t *testing.T) {
+		t.Parallel()
+		b := testBundle()
+		b.RemoveComponents(was, "gone")
+		byObject := []string{
+			"homeassistant/number/valve/config",
+			"homeassistant/sensor/temperature/config",
+			"homeassistant/switch/gone/config",
+		}
+		if got := SupersededTopics("", b, LegacyTopicByObjectID); !reflect.DeepEqual(got, byObject) {
+			t.Fatalf("got %v want %v", got, byObject)
+		}
+	})
+}
+
+// TestPublishBundleRetractsATombstonedEntitysLegacyConfig is the same fix
+// reaching the broker: the removed entity's retained per-entity config must
+// be gone, and gone before the document that supersedes it.
+func TestPublishBundleRetractsATombstonedEntitysLegacyConfig(t *testing.T) {
+	t.Parallel()
+
+	f := newFake()
+	r := New(f, Config{
+		StatusTopic:        "b/bridge/status",
+		LegacyEntityTopics: []LegacyTopicFunc{LegacyTopicByUniqueID},
+	})
+	f.seed("homeassistant/switch/u3/config", []byte(`{"unique_id":"u3"}`))
+
+	b := testBundle()
+	b.RemoveComponents(map[string]discovery.Component{
+		"gone": {Platform: hacatalog.Platform("switch"), UniqueID: "u3"},
+	}, "gone")
+	if _, err := r.PublishBundle(context.Background(), b); err != nil {
+		t.Fatalf("publish bundle: %v", err)
+	}
+	if f.holds("homeassistant/switch/u3/config") {
+		t.Fatal("the deleted entity keeps its retained config — it returns on every MQTT-integration restart")
+	}
 }
 
 // TestLegacyFormsSkipWhatTheyCannotKey pins that a component with nothing to

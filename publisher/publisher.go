@@ -590,6 +590,23 @@ func (r *Runtime) Republish(ctx context.Context) (int, error) {
 // [discovery.Bundle.Remove] writes — are included, because their retained
 // per-entity config is exactly what has to go.
 //
+// A tombstone contributes only what its entry can be keyed on, and its entry
+// is a platform and nothing else by Home Assistant's rule. That is enough for
+// [LegacyTopicWithNodeID] and [LegacyTopicByObjectID], which key on the
+// document's node id and the component key; it is NOT enough for
+// [LegacyTopicByUniqueID], whose key was in the payload that was just
+// emptied. The identity therefore has to be remembered outside the payload:
+// [discovery.Bundle.RemoveComponents] does it, and [discovery.Bundle.Remove]
+// does it for a key that was still declared when it was removed. A tombstone
+// with neither is skipped by that form, exactly as an undeclared `unique_id`
+// always was — and the consequence is measured rather than theoretical: the
+// deleted entity's retained per-entity config stays on the broker and
+// re-creates it as a permanently unavailable phantom on every
+// MQTT-integration restart. [Runtime.Sweep] does not catch it either when the
+// fleet is on the node-id-less form, because such a topic parses with an
+// empty [ConfigTopic.NodeID] and a node-id-scoped [SweepRequest.Owns]
+// declines it by design.
+//
 // forms states which per-entity topic shape the consumer's fleet is on.
 // Passing none means [LegacyTopicWithNodeID] alone, which is what this
 // function did before v0.27.0 — and which retracted nothing at all for the
@@ -616,6 +633,17 @@ func SupersededTopics(prefix string, b *discovery.Bundle, forms ...LegacyTopicFu
 		comp := b.Components[key]
 		if comp.Platform == "" {
 			continue
+		}
+		// A tombstone's payload entry is a platform and nothing else, so the
+		// identity a form may need is not in it. It is in
+		// [discovery.Bundle.Tombstones], which is where the removing call
+		// put it — see [discovery.Bundle.RemoveComponents]. Only the missing
+		// fields are filled, and only from a record that has them, so a
+		// declared component is never overwritten by a stale removal.
+		if was, ok := b.Tombstones[key]; ok {
+			if comp.UniqueID == "" {
+				comp.UniqueID = was.UniqueID
+			}
 		}
 		e := LegacyEntity{
 			Prefix:    prefix,
