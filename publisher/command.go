@@ -49,9 +49,20 @@ var (
 	// empty, or with a wildcard that is not a whole level.
 	ErrInvalidFilter = errors.New("publisher: invalid topic filter")
 
-	// ErrStateCommandCollision is returned by [CommandRouter.CheckDisjoint]
-	// when a topic the consumer publishes is matched by one of its own
-	// command filters. See the doc comment there for what that costs.
+	// ErrStateCommandCollision is returned by [CommandRouter.CheckDisjoint],
+	// and by [StatePublisher.Publish] for a topic matching one of
+	// [StateConfig.CommandFilters].
+	//
+	// The measured invariant behind it: a broker delivers a client's own
+	// publishes back to it — the consumers subscribe without MQTT 5's
+	// No-Local — so a state topic that matches a command filter is a write
+	// the process performs on itself. The reference implementation shipped
+	// exactly that, mirroring a program's state onto its own trigger topic:
+	// the echo ran the program on the CCU on every boot, on every republish
+	// and once per freshly discovered program, with nothing in the logs
+	// saying so. It is an error on both sides rather than a lint because the
+	// two planes are declared in different places and only their
+	// intersection is wrong.
 	ErrStateCommandCollision = errors.New("publisher: state topic matches a command filter")
 )
 
@@ -767,6 +778,15 @@ func captureFilter(parts []string, topic string) (wildcards []string, remainder 
 	}
 	for i, f := range parts {
 		if f == "#" {
+			// §4.7.1.2: `#` must be the last level of the filter. An
+			// exported matcher is reachable with any string, including one
+			// no [ValidateFilter] ever saw, and "matches nothing" is the
+			// only safe answer for a filter a broker would reject outright
+			// -- treating `a/#/b` as `a/#` would silently widen a
+			// subscription the consumer believes is narrow.
+			if i != len(parts)-1 {
+				return nil, "", false
+			}
 			return wildcards, strings.Join(tp[i:], "/"), true
 		}
 		if i >= len(tp) {

@@ -677,7 +677,7 @@ func TestStateTopicsAreRefusedInsideACommandSubscription(t *testing.T) {
 	}
 }
 
-func TestMatchTopicFilter(t *testing.T) {
+func TestStatePlaneUsesTheSharedFilterMatcher(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -707,8 +707,8 @@ func TestMatchTopicFilter(t *testing.T) {
 		{"a/b", "", false},
 	}
 	for _, c := range cases {
-		if got := MatchTopicFilter(c.filter, c.topic); got != c.want {
-			t.Errorf("MatchTopicFilter(%q, %q) = %v, want %v", c.filter, c.topic, got, c.want)
+		if got := MatchFilter(c.filter, c.topic); got != c.want {
+			t.Errorf("MatchFilter(%q, %q) = %v, want %v", c.filter, c.topic, got, c.want)
 		}
 	}
 }

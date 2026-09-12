@@ -91,19 +91,6 @@ var (
 	// nil is zero bytes, which retracts. Under [discovery.EnvelopeEncoding]
 	// a nil value is normal and renders as `{"value":null,…}`.
 	ErrRawNilValue = errors.New("publisher: nil value has no raw rendering, use Evict or the envelope encoding")
-
-	// ErrStateCommandCollision is returned when a state topic matches one of
-	// [StateConfig.CommandFilters].
-	//
-	// The measured invariant behind it: a broker delivers a client's own
-	// publishes back to it — the consumers subscribe without MQTT 5's
-	// No-Local — so a state topic that matches a command filter is a write
-	// the process performs on itself. The reference implementation shipped
-	// exactly that, mirroring a program's state onto its own trigger topic:
-	// the echo ran the program on the CCU on every boot, on every republish
-	// and once per freshly discovered program, with nothing in the logs
-	// saying so.
-	ErrStateCommandCollision = errors.New("publisher: state topic matches a command subscription")
 )
 
 // StateConfig parameterises a [StatePublisher]. The zero value is usable and
@@ -640,7 +627,7 @@ func (p *StatePublisher) record(d time.Duration) {
 // subscriptions. See [ErrStateCommandCollision].
 func (p *StatePublisher) guard(topic string) error {
 	for _, f := range p.cfg.CommandFilters {
-		if MatchTopicFilter(f, topic) {
+		if MatchFilter(f, topic) {
 			return fmt.Errorf("%w: %s matches %s", ErrStateCommandCollision, topic, f)
 		}
 	}
@@ -705,44 +692,4 @@ func RenderRawValue(v any) ([]byte, error) {
 		return nil, fmt.Errorf("publisher: render raw value: %w", err)
 	}
 	return b, nil
-}
-
-// MatchTopicFilter reports whether an MQTT topic filter matches a topic.
-//
-// Hand-rolled rather than imported: this package deliberately declares its
-// own [Transport] instead of depending on an MQTT client, and reaching into
-// one for twenty lines of string matching would undo that for every consumer
-// that wraps its client differently. It is exported because the check a
-// consumer needs at its composition root — do any of my state topics land
-// inside my own command subscriptions — is the same one
-// [ErrStateCommandCollision] performs per publish, and doing it once at boot
-// is better than discovering it per message.
-//
-// `+` matches exactly one level, `#` matches the remainder including zero
-// levels. A filter is never allowed to match a topic starting with `$`
-// through a leading wildcard, per MQTT 5 §4.7.2: the broker's own `$SYS` tree
-// is not a consumer's to publish into or sweep.
-func MatchTopicFilter(filter, topic string) bool {
-	if filter == "" || topic == "" {
-		return false
-	}
-	fp := strings.Split(filter, "/")
-	tp := strings.Split(topic, "/")
-	if strings.HasPrefix(topic, "$") && (fp[0] == "+" || fp[0] == "#") {
-		return false
-	}
-	for i, f := range fp {
-		if f == "#" {
-			// A trailing `#` matches the rest, and also the parent level
-			// itself — `a/#` matches `a`.
-			return i == len(fp)-1
-		}
-		if i >= len(tp) {
-			return false
-		}
-		if f != "+" && f != tp[i] {
-			return false
-		}
-	}
-	return len(fp) == len(tp)
 }
