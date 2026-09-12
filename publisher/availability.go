@@ -285,14 +285,26 @@ func (a *AvailabilityPublisher) write(ctx context.Context, t string, payload []b
 	}
 
 	if err := a.tr.Publish(ctx, t, payload, a.qos, true); err != nil {
-		// Forget the topic on failure. Recording what was merely attempted
-		// is how a consumer publishing through a circuit breaker loses a
-		// flip for good: the retry carries the same payload, the gate calls
-		// it a no-op, and the device stays at whatever the broker last
-		// accepted for the life of the process.
-		a.mu.Lock()
-		delete(a.last, t)
-		a.mu.Unlock()
+		// Record nothing, and remove nothing either. That is the same rule
+		// the package's other two dedup gates follow — [StatePublisher.Publish]
+		// and [Runtime.Publish] both leave the previously accepted value
+		// standing and merely decline to record — and all three say so,
+		// because two planes answering one question differently is the
+		// defect class itself.
+		//
+		// Declining to record is already enough to keep the retry alive: the
+		// cached payload is still the one the broker accepted, so the failed
+		// payload differs from it and the gate lets it through. Deleting the
+		// entry instead buys nothing on top of that and costs index
+		// membership — this map is not only the gate, it is
+		// [AvailabilityPublisher.Topics], the worklist of
+		// [AvailabilityPublisher.Republish] and the ownership set of
+		// [AvailabilityPublisher.Sweep]. An `offline` that fails during a
+		// broker outage, which is exactly when it fails, would drop the
+		// topic out of all three while the broker still retains `online`: no
+		// sweep clears it, no republish re-sends it, and the device becomes
+		// the permanently available ghost [AvailabilityPublisher.Retract]
+		// exists to prevent.
 		return false, fmt.Errorf("publisher: availability %s: %w", t, err)
 	}
 

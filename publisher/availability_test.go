@@ -714,3 +714,72 @@ func TestConcurrentFlipsDoNotRace(t *testing.T) {
 		t.Errorf("gate holds %v", a.Topics())
 	}
 }
+
+// TestAFailedFlipKeepsTheTopicInTheIndex is the regression for the ghost the
+// old failure path stranded.
+//
+// The gate's map is not only the gate: it is [AvailabilityPublisher.Topics],
+// the worklist of [AvailabilityPublisher.Republish] and the ownership set of
+// [AvailabilityPublisher.Sweep]. Deleting the entry when a publish failed
+// dropped the topic out of all three at the one moment it matters — an
+// `offline` refused by a breaker open during a broker outage — while the
+// broker still retained the `online` that publish was trying to replace. The
+// device then had no route back: nothing listed it, nothing re-sent it and
+// nothing swept it.
+func TestAFailedFlipKeepsTheTopicInTheIndex(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("breaker open")
+	var open bool
+	b := &availBroker{fail: func(string) error {
+		if open {
+			return boom
+		}
+		return nil
+	}}
+	a := newAvail(t, b)
+	ctx := context.Background()
+	const name = "loom/ghost/availability"
+
+	if changed, err := a.Publish(ctx, name, true); err != nil || !changed {
+		t.Fatalf("the accepted online flip = %v, %v", changed, err)
+	}
+
+	open = true
+	if _, err := a.Publish(ctx, name, false); !errors.Is(err, boom) {
+		t.Fatalf("want the transport error, got %v", err)
+	}
+
+	if got := a.Topics(); len(got) != 1 || got[0] != name {
+		t.Fatalf("Topics() = %v, want the topic the broker still retains", got)
+	}
+	if online, known := a.Online(name); !known || !online {
+		t.Errorf("Online() = %v, %v; want the value the broker accepted", online, known)
+	}
+
+	// Declining to record is already what keeps the retry alive: the refused
+	// payload still differs from the cached one.
+	open = false
+	if changed, err := a.Publish(ctx, name, false); err != nil || !changed {
+		t.Fatalf("the retry was suppressed: %v, %v", changed, err)
+	}
+
+	if sent, err := a.Republish(ctx); err != nil || sent != 1 {
+		t.Errorf("Republish() = %d, %v; want the topic back on the worklist", sent, err)
+	}
+
+	cleared, err := a.Sweep(ctx, func(string) bool { return false })
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if len(cleared) != 1 || cleared[0] != name {
+		t.Fatalf("Sweep cleared %v, want the ghost", cleared)
+	}
+	last := b.all()[len(b.all())-1]
+	if last.topic != name || last.payload != "" || !last.retain {
+		t.Errorf("the sweep's last write = %+v, want a retained retraction", last)
+	}
+	if got := a.Topics(); len(got) != 0 {
+		t.Errorf("the retraction left %v in the index", got)
+	}
+}

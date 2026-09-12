@@ -304,6 +304,15 @@ func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []by
 	// value of an outage; caching them anyway would make the next identical
 	// one hit the gate and publish nothing, leaving the entity blank until
 	// the value changes again.
+	//
+	// The failure path above removes nothing either, and that is a rule all
+	// three dedup gates in this package follow: this one,
+	// [AvailabilityPublisher.Publish] and [Runtime.Publish] each keep the
+	// last payload the broker accepted and only decline to record the one it
+	// refused. Declining is already what lets the retry through, because the
+	// refused payload still differs from the cached one; deleting the entry
+	// on top of that costs index membership, and each of these maps is also
+	// its plane's topic list, republish worklist and ownership set.
 	p.mu.Lock()
 	p.published[topic] = bytes.Clone(payload)
 	p.mu.Unlock()
