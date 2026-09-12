@@ -40,8 +40,9 @@ type SweepRequest struct {
 
 	// ReportOnly runs the pass without retracting anything: the window
 	// opens, every owned config is parsed and handed to [Inspect], the
-	// result lists what was seen in [SweepResult.Owned], and not one
-	// message goes out.
+	// result lists what was seen in [SweepResult.Owned] and what a
+	// retracting pass would have cleared in [SweepResult.Unclaimed], and
+	// not one message goes out.
 	//
 	// It exists because looking and clearing were one act, and that
 	// coupling blocked a migration outright. openccu-loom PR #797 tried
@@ -103,12 +104,34 @@ type SweepResult struct {
 	// Owned lists those same topics, in arrival order.
 	//
 	// A caller doing its own judging needs the list it judged, not just its
-	// size — and under [SweepRequest.ReportOnly] it is the entire output of
-	// the pass, since [Retracted] is then empty by construction. It is
-	// filled on both kinds of pass: a retracting pass's Owned minus its
-	// Retracted is what this process still claims, which is the number an
-	// operator reads a sweep log line for.
+	// size. It is EVERY owned topic, the ones this process claims included,
+	// so it is not the list to retract — [Unclaimed] is. Retracting this
+	// one clears the live fleet: `Retract(res.Owned...)` is the composition
+	// that cleared 29 live configs in a sibling repo, and it is harmless
+	// only in the documented pre-publish case where the claim set is still
+	// empty and the two lists are therefore the same.
+	//
+	// It is filled on both kinds of pass. On a retracting pass, Owned minus
+	// Retracted is NOT what this process still claims: a retraction that
+	// fails warns and the pass continues, so the difference is the claimed
+	// topics plus whatever the broker refused.
 	Owned []string
+	// Unclaimed lists the owned topics this process does not claim — what a
+	// retracting pass would clear — in arrival order.
+	//
+	// It exists because [SweepRequest.ReportOnly] could not report. The
+	// pass computed exactly this list, logged its length at Debug and threw
+	// it away, so the one mode whose entire output IS the result had
+	// nothing to hand back and the only list on offer was [Owned], which
+	// includes the entities the consumer is publishing right now. A caller
+	// that means to act on a report-only pass retracts these, after the
+	// pass returns, with [Runtime.Retract].
+	//
+	// On a retracting pass it is the verdict the window reached and
+	// [Retracted] is what the retraction loop then managed: a topic claimed
+	// in between, or refused by the broker, is in this list and not in that
+	// one.
+	Unclaimed []string
 	// Retracted lists the topics actually cleared, sorted by arrival.
 	// Always empty under [SweepRequest.ReportOnly].
 	Retracted []string
@@ -214,7 +237,11 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 	// can still be inside the append while this goroutine reads.
 	mu.Lock()
 	topics := append([]string(nil), candidate...)
-	result := SweepResult{Inspected: inspected, Owned: append([]string(nil), owned...)}
+	result := SweepResult{
+		Inspected: inspected,
+		Owned:     append([]string(nil), owned...),
+		Unclaimed: append([]string(nil), candidate...),
+	}
 	mu.Unlock()
 
 	if req.ReportOnly {

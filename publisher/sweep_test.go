@@ -332,12 +332,53 @@ func TestSweepReportOnlyLooksWithoutTouching(t *testing.T) {
 	if res.Inspected != 2 {
 		t.Fatalf("inspected %d want 2", res.Inspected)
 	}
+	unclaimed := append([]string(nil), res.Unclaimed...)
+	slices.Sort(unclaimed)
+	if !reflect.DeepEqual(unclaimed, want) {
+		t.Fatalf("unclaimed %v want %v — with an empty claim set every owned topic is a candidate",
+			unclaimed, want)
+	}
+}
+
+// TestSweepReportOnlyNamesWhatItWouldRetract is the gap the v0.27.0–v0.29.0
+// review measured: the pass computed the owned-and-unclaimed list, logged its
+// length at Debug and threw it away, so the only list a caller could act on
+// was Owned — which includes the configs this process is publishing right
+// now. `Retract(res.Owned...)` is the composition that cleared 29 live
+// configs in a sibling repo, and the missing list is what invited it.
+func TestSweepReportOnlyNamesWhatItWouldRetract(t *testing.T) {
+	t.Parallel()
+	f := newFake()
+	f.seed("homeassistant/sensor/ccu_old/temperature/config", []byte(`{"old":1}`))
+
+	r := New(f, Config{})
+	// One of the two owned topics is this process's own live entity.
+	if _, err := r.Publish(context.Background(),
+		"homeassistant/sensor/ccu_live/power/config", []byte(`{"live":2}`)); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	res, err := r.Sweep(context.Background(), SweepRequest{
+		Owns:       ownsNode("ccu_"),
+		Window:     testWindow,
+		ReportOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(res.Owned) != 2 {
+		t.Fatalf("owned %v, want both topics — Owned is the judged set, claims included", res.Owned)
+	}
+	want := []string{"homeassistant/sensor/ccu_old/temperature/config"}
+	if !reflect.DeepEqual(res.Unclaimed, want) {
+		t.Fatalf("unclaimed %v want %v — the live config must not be on the list a caller retracts",
+			res.Unclaimed, want)
+	}
 }
 
 // TestSweepReportsOwnedOnARetractingPassToo pins that Owned is not a
-// report-only field: on an ordinary pass, Owned minus Retracted is what this
-// process still claims, and a result that reported only the retractions could
-// not tell a window that saw nothing from one that found nothing to do.
+// report-only field: a result that reported only the retractions could not
+// tell a window that saw nothing from one that found nothing to do.
 func TestSweepReportsOwnedOnARetractingPassToo(t *testing.T) {
 	t.Parallel()
 	f := newFake()
