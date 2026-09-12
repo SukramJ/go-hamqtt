@@ -3,6 +3,63 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.22.0] - 2026-09-12
+
+Everything a measured 147-rule reference table needs that `catalog`
+could not state. Measured by resolving 1,860 witness inputs through
+both machines and diffing every wire-relevant field.
+
+### Added
+
+- **`Match.Categories`** and the **`Categorised`** interface — a rule
+  keyed on the consumer's own classification of a datapoint rather
+  than on the platform it renders as. 20 of the 147 rules are keyed
+  on `hub_sensor`, `hub_button`, `hub_binary_sensor` or
+  `schedule_switch`; `Match.Platforms` is typed to a
+  `hacatalog.Platform` and cannot say any of them. Collapsing them to
+  the platform first is not a simplification — a rule meant for a
+  button-shaped action would then reach every entity that happens to
+  render as a button.
+
+- **`Match.Postfix`** — the trailing underscore segment of the leaf.
+  A vendor that numbers repeated parameters gives a rule no other way
+  to say "the second one": `Leaves` cannot enumerate them and
+  `KeyContains("_2")` also matches `_20`.
+
+- **`Match.NameContains`** — a substring test on the display name,
+  distinct from `KeyContains`. The two are different strings and the
+  table uses both; 20 rules key on the name.
+
+- **`Overlay.Multiplier`** and **`Description.Multiplier`** — the
+  scale applied to a datapoint's value before publishing. It belongs
+  to the entity rather than to the datapoint (the same raw level is a
+  fraction to one entity and a percentage to another) and the rule
+  table is where that is written. The model carries it and never
+  applies it: only the consumer's value layer knows whether a given
+  publish is a value at all.
+
+### Documented
+
+- **How to port a first-match-wins table**, on `Rules`. This is the
+  most important part of the release and it is prose rather than
+  code, because the hazard is silent: `Rules` applies every matching
+  rule and a table that stops at the first is a different machine.
+  933 of 1,860 measured inputs match more than one rule, and a
+  literal transcription diverges on 18 to 21 per cent of them.
+
+  A faithful port reaches zero divergence under three conditions:
+  every ported `Overlay` states every field it has an opinion about
+  (including the empty ones, which is what turns stacking into
+  whole-record replacement); per-category defaults become
+  fully-specified rules below every other priority rather than a
+  fallback; and equal-priority rules are reversed, because the last
+  one applied wins here and the first one found wins there.
+
+  One difference has no mechanical fix and is called out: `Match.Unit`
+  tests the description's unit as it stands when the rule runs, which
+  a lower-priority rule may already have set. A table whose unit
+  criterion tests the *wire* unit is asking a different question.
+
 ## [0.21.0] - 2026-09-11
 
 ### Added

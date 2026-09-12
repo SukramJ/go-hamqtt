@@ -182,6 +182,18 @@ type Description struct {
 	// `model` depend on `topic` — the rule the package layout enforces.
 	ValueTemplate string
 
+	// Multiplier scales the datapoint's value before it is published, and
+	// the bounds along with it. Nil means no scaling, which is not the same
+	// as 1.0 — a rule that says nothing about scale and one that pins it to
+	// unity are different statements in a table where a later rule can
+	// refine an earlier one.
+	//
+	// The model carries it and never applies it. Only the consumer's value
+	// layer knows whether a given publish is a value at all, what its wire
+	// type is, and whether a template or a plain number is what Home
+	// Assistant should receive.
+	Multiplier *float64
+
 	// Extra carries platform keys the model does not model. Applied last in
 	// the discovery pipeline, so it wins over everything — which makes it
 	// both the escape hatch and the footgun.
