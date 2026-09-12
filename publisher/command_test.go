@@ -37,6 +37,13 @@ type cmdBroker struct {
 	noLoc  bool // record SubscribeNoLocal use; see cmdBrokerNoLocal
 
 	failSubscribe func(filter string) error
+	// failUnsubscribe exists because without it the rollback path in
+	// Start and the teardown path in Stop are unreachable by
+	// construction: every other fixture in this package returns nil from
+	// Unsubscribe unconditionally, and a broker that refuses an
+	// UNSUBSCRIBE is exactly the case that used to leave a live,
+	// ungated subscription behind a failed Start.
+	failUnsubscribe func(filter string) error
 }
 
 func newCmdBroker() *cmdBroker {
@@ -64,8 +71,15 @@ func (b *cmdBroker) Subscribe(_ context.Context, filter string, _ byte, h Handle
 func (b *cmdBroker) Unsubscribe(_ context.Context, filter string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.subs, filter)
 	b.unsub = append(b.unsub, filter)
+	if b.failUnsubscribe != nil {
+		if err := b.failUnsubscribe(filter); err != nil {
+			// The subscription stays live, which is what a broker
+			// refusing an UNSUBSCRIBE leaves behind.
+			return err
+		}
+	}
+	delete(b.subs, filter)
 	return nil
 }
 
@@ -1143,3 +1157,50 @@ func (h countingHandler) Handle(_ context.Context, rec slog.Record) error {
 func (h countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 
 func (h countingHandler) WithGroup(string) slog.Handler { return h }
+
+// TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails is the
+// regression for the second half of the S3 finding. Rollback is best effort
+// — a broker may refuse the UNSUBSCRIBE — so a failed Start can leave a
+// live subscription. What must not survive it is an OPEN gate: the failure
+// path used to clear `started` without setting `stopped`, so the live
+// subscription still reached handlers and commands ran against
+// half-initialised dependencies, the exact hazard Stop's doc forbids.
+func TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	boom := errors.New("broker said no")
+	b.failSubscribe = func(filter string) error {
+		if filter == "gh/b/set" {
+			return boom
+		}
+		return nil
+	}
+	b.failUnsubscribe = func(string) error { return errors.New("broker refused the rollback") }
+
+	rc := &recorder{}
+	r := quietRouter(t, b, CommandConfig{})
+	for _, f := range []string{"gh/a/set", "gh/b/set"} {
+		if err := r.Handle(f, rc.handle); err != nil {
+			t.Fatalf("handle: %v", err)
+		}
+	}
+	err := r.Start(context.Background())
+	if !errors.Is(err, boom) {
+		t.Fatalf("start: %v, want the broker's error", err)
+	}
+	// The consumer cannot act on what it is not told: the error names the
+	// filter the rollback could not take down.
+	if !strings.Contains(err.Error(), "gh/a/set") {
+		t.Errorf("the error must name the subscription still live, got %v", err)
+	}
+	if live := b.filters(); len(live) != 1 {
+		t.Fatalf("fixture broke: want exactly the un-rolled-back subscription live, got %v", live)
+	}
+
+	b.deliver("gh/a/set", []byte("on"), false)
+	r.WaitIdle()
+	if got := rc.count(); got != 0 {
+		t.Fatalf("a handler ran %d times after Start failed; the gate must be closed, "+
+			"because a command now runs against half-initialised dependencies", got)
+	}
+}

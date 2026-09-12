@@ -450,6 +450,21 @@ func (r *CommandRouter) Filters() []string {
 // the partial set live; rolling it back is the one place this type does not
 // simply copy it.
 //
+// The rollback itself can fail — a broker may refuse an UNSUBSCRIBE, and a
+// broker that just refused a SUBSCRIBE is in exactly the state where it
+// might. A subscription that could not be taken down stays live, so Start
+// then closes the router for good rather than leaving its gate open: the
+// live filter would otherwise deliver commands into a consumer that has
+// been told its start failed and has not finished wiring itself, which is
+// the hazard [CommandRouter.Stop] promises cannot happen. The returned
+// error names each filter still on the broker, because that is the only
+// thing an operator can act on; [CommandRouter.Start] cannot be retried
+// afterwards and [CommandRouter.Stop] has nothing left to do.
+//
+// When every rollback succeeded the router is merely un-started and Start
+// can be retried once the broker recovers — a partial start that could
+// never be retried would be the worse of the two failure modes.
+//
 // Starting a router with no routes is not an error — a consumer whose
 // entities are all read-only has nothing to subscribe, and making that the
 // caller's special case buys nothing.
@@ -473,23 +488,36 @@ func (r *CommandRouter) Start(ctx context.Context) error {
 	done := make([]string, 0, len(filters))
 	for _, f := range filters {
 		if err := r.subscribe(ctx, f); err != nil {
-			for _, prev := range done {
-				// Best effort: the start has already failed, and a
-				// broker that refuses the rollback leaves a live
-				// subscription whose handler the stopped flag gates.
-				if uerr := r.tr.Unsubscribe(ctx, prev); uerr != nil {
-					r.log.Warn("publisher.command.rollback",
-						slog.String("filter", prev), slog.String("err", uerr.Error()))
-				}
-			}
+			live := r.rollback(ctx, done)
 			r.mu.Lock()
 			r.started = false
+			// A subscription still on the broker is a live route into
+			// a consumer whose start just failed, so the gate closes
+			// permanently rather than pretending the rollback worked.
+			r.stopped = len(live) > 0
 			r.mu.Unlock()
+			if len(live) > 0 {
+				return fmt.Errorf("publisher: subscribe %s: %w (rollback failed, still subscribed: %s; router closed)",
+					f, err, strings.Join(live, ", "))
+			}
 			return fmt.Errorf("publisher: subscribe %s: %w", f, err)
 		}
 		done = append(done, f)
 	}
 	return nil
+}
+
+// rollback unsubscribes what a failed Start had already registered and
+// reports the filters the broker would not let go of.
+func (r *CommandRouter) rollback(ctx context.Context, done []string) (live []string) {
+	for _, prev := range done {
+		if err := r.tr.Unsubscribe(ctx, prev); err != nil {
+			r.log.Warn("publisher.command.rollback",
+				slog.String("filter", prev), slog.String("err", err.Error()))
+			live = append(live, prev)
+		}
+	}
+	return live
 }
 
 // Resubscribe re-registers every route on the current connection.
