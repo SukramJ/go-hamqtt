@@ -102,6 +102,24 @@ func Example_runtime() {
 		// that has to be identical on both sides of a discovery config.
 		Layout: layout,
 	})
+	router := publisher.NewCommandRouter(gomqtt.Transport(client), publisher.CommandConfig{
+		// Process-lifetime, NOT Start's ctx. In the measured consumer Start
+		// is reachable from a config reload, whose context ends when the
+		// reload returns; handlers derived from it had their downstream
+		// writes cancelled the moment the reload finished.
+		Lifecycle: ctx,
+	})
+	// One wildcard, not one filter per writable datapoint. Handlers run on a
+	// router worker rather than the transport's read loop, because a command
+	// is by definition a write to something outside this process and a
+	// handler that answers by publishing would wait on an acknowledgement
+	// only the goroutine it is occupying could deliver.
+	if err := router.Handle(layout.Root+"/+/+/+/set",
+		func(_ context.Context, cmd publisher.Command) {
+			_ = cmd.Wildcards // the coordinate, rather than topic arithmetic
+		}); err != nil {
+		return
+	}
 
 	// ── one device ─────────────────────────────────────────────────────────
 	dev := &model.Device{
@@ -162,6 +180,25 @@ func Example_runtime() {
 		return
 	}
 
+	if err := router.Start(ctx); err != nil {
+		return
+	}
+	// Run every topic this process publishes past the router once, at boot,
+	// and fail the boot. A broker fans a client's own publishes back to it,
+	// so a topic this process writes that a command filter matches is the
+	// process commanding itself on every report — which in the measured case
+	// ran a program on every boot, every rediscovery and every program in the
+	// house, with the programs running as the only signal.
+	readable, err := publisher.BundleStateTopics(bundle)
+	if err != nil {
+		return
+	}
+	if err := router.CheckDisjoint(append(readable, layout.Bridge())...); err != nil {
+		slog.Error("a topic this process publishes is routed back into its own handlers",
+			slog.String("err", err.Error()))
+		return
+	}
+
 	// Replay every config when Home Assistant comes back. Home Assistant
 	// keeps the retained configs across its own restart but does not reliably
 	// re-read them across every addon reload, and the birth message is the one
@@ -201,6 +238,7 @@ func Example_runtime() {
 		avail.Reset()
 		_, _ = avail.Device(ctx, publisher.DeviceSlot(dev, power), true)
 		_, _ = state.Republish(ctx)
+		_ = router.Resubscribe(ctx)
 	})
 	_ = lc.Start(ctx)
 
@@ -214,4 +252,9 @@ func Example_runtime() {
 	_ = run.Retract(ctx, bundle.Topic(run.Prefix()))
 	_ = avail.RetractDevice(ctx, publisher.DeviceSlot(dev, power))
 	_, _ = state.EvictPrefix(ctx, layout.State(model.Slot{Address: dev.UID()}))
+
+	// Stop drains: no handler starts after it is entered, but one already
+	// accepted runs to completion, because abandoning a queued write is how a
+	// consumer loses the last command of a session with nothing to say so.
+	_ = router.Stop(ctx)
 }
