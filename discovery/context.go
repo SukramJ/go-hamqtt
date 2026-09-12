@@ -138,7 +138,30 @@ func Substitute(text string, args map[string]string) string {
 // entity with no bindings leaves it empty, which is right for a consumer
 // whose devices hang off the root.
 func deviceSlot(dev *model.Device, e model.Entity) model.Slot {
+	return DeviceSlot(dev, e)
+}
+
+// DeviceSlot is the coordinate [model.LevelDevice] resolves against: the
+// device's address, in the containers its entities sit in.
+//
+// Exported because the publishing side must not be able to address a
+// different topic than the config it answers. It is not a plain device
+// identity: the scope and the channel come from what the entity binds,
+// because [model.Device] deliberately carries no scope of its own. A
+// consumer that rebuilt the slot by hand would get the device root instead,
+// which renders a topic no config names — and an entity whose availability
+// topic nobody publishes to is one Home Assistant greys out forever.
+//
+// The parent topic of [model.LevelParent] is this same call on dev.Via: the
+// address changes, the containers do not.
+func DeviceSlot(dev *model.Device, e model.Entity) model.Slot {
+	if dev == nil {
+		return model.Slot{}
+	}
 	s := model.Slot{Address: dev.UID()}
+	if e == nil {
+		return s
+	}
 	if binds := e.Bindings(); len(binds) > 0 {
 		s.Scope = binds[0].Slot.Scope
 		// The channel travels with the scope. A consumer whose availability

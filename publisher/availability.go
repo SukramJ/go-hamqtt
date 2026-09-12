@@ -130,26 +130,12 @@ func NewAvailability(tr Transport, cfg AvailabilityConfig) *AvailabilityPublishe
 // DeviceSlot is the coordinate [model.LevelDevice] resolves against: the
 // device's address, in the containers its entities sit in.
 //
-// It exists so the publishing side cannot address a different topic than the
-// config it answers. `discovery` derives the same coordinate internally, and
-// it is not a plain device identity: the scope and the channel are taken from
-// what the entity binds, because [model.Device] deliberately carries no scope
-// of its own and one measured plane publishes availability per channel rather
-// than per device. A consumer that rebuilt the slot by hand would get the
-// device root instead, which renders a topic no config names.
-//
-// The parent topic of [model.LevelParent] is this same call on dev.Via: the
-// address changes, the containers do not.
+// It delegates to [discovery.DeviceSlot] rather than deriving the coordinate
+// a second time: the declaring and the publishing side addressing different
+// topics is precisely the defect this function exists to prevent, and two
+// copies of the derivation are how that happens.
 func DeviceSlot(dev *model.Device, e model.Entity) model.Slot {
-	s := model.Slot{Address: dev.UID()}
-	if e == nil {
-		return s
-	}
-	if binds := e.Bindings(); len(binds) > 0 {
-		s.Scope = binds[0].Slot.Scope
-		s.Channel = binds[0].Slot.Channel
-	}
-	return s
+	return discovery.DeviceSlot(dev, e)
 }
 
 // DeviceTopic renders the availability topic of one device coordinate.
