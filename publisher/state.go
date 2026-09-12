@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
+	"github.com/SukramJ/go-hamqtt/model"
 )
 
 // Envelope is the state payload [discovery.EnvelopeEncoding] points Home
@@ -85,6 +86,23 @@ var (
 	// arriving there has to be explicit. [StatePublisher.Evict] is the way
 	// to say it on purpose.
 	ErrEmptyStatePayload = errors.New("publisher: empty state payload is a retraction, use Evict")
+
+	// ErrNoComponentStateTopic is returned when a rendered component
+	// declares no `state_topic`, so there is no topic a plain state publish
+	// could go to.
+	//
+	// Ten of the catalog's 32 platforms are in that position — climate,
+	// water_heater, lawn_mower, camera, tag, button, device_automation,
+	// image, notify and scene — because Home Assistant names a topic per
+	// role there (`current_temperature_topic`, `temperature_state_topic`, …)
+	// or the platform is write-only. [topic.Layout.State] happily returns a
+	// topic for all 32, which is the trap: a climate entity published there
+	// writes into a topic no config references, the card shows nothing, the
+	// entity stays "unknown" forever and the publish succeeded, so nothing
+	// logs anything. Such an entity publishes to the topics in its
+	// platform's Fields struct — see [discovery.ClimateFields] — which are
+	// the only strings its own config named.
+	ErrNoComponentStateTopic = errors.New("publisher: component declares no state_topic")
 
 	// ErrRawNilValue is returned when a nil value is published under
 	// [discovery.RawEncoding], for the same reason: the bare rendering of
@@ -303,6 +321,16 @@ func StateFor(r *Runtime, cfg StateConfig) *StatePublisher {
 //
 // An empty payload is refused with [ErrEmptyStatePayload] rather than quietly
 // retracting.
+//
+// The topic is the caller's, and there is one wrong way to produce it that is
+// worth naming here because it looks right: `layout.State(slot)`. The
+// renderer projects `state_topic` into a config only on the 22 platforms that
+// accept the key, while a [topic.Layout] returns a topic for all 32 — so on
+// climate, water_heater, lawn_mower, camera, tag, button, device_automation,
+// image, notify and scene the derived topic is one no config references, and
+// the entity stays "unknown" with nothing logged anywhere.
+// [StatePublisher.PublishComponent] and [ComponentStateTopic] are the routes
+// that cannot disagree with the config.
 func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []byte) (bool, error) {
 	if topic == "" {
 		return false, errors.New("publisher: empty state topic")
@@ -343,6 +371,95 @@ func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []by
 	p.published[topic] = cachedWrite{payload: bytes.Clone(payload), gated: true}
 	p.mu.Unlock()
 	return true, nil
+}
+
+// ComponentStateTopic is the topic a rendered discovery component actually
+// told Home Assistant to read, and the only string provably equal to it.
+//
+// It exists because the obvious derivation is wrong on a third of the
+// catalog. [topic.Layout.State] returns a topic for every platform, but the
+// renderer projects `state_topic` only where the platform accepts the key —
+// 22 of 32 — so on the other ten the config carries no such key while the
+// layout still hands out a plausible-looking topic. Publishing there is
+// silent in every direction: the broker accepts it, no config references it,
+// and the entity stays "unknown" for the life of the fleet. Reading the field
+// off the component that was published is the route that cannot disagree with
+// the config, because it is the same value.
+//
+// A component with no `state_topic` reports [ErrNoComponentStateTopic] rather
+// than an empty string, so a consumer that wired a plain state publish to a
+// climate entity finds out at the first publish instead of never.
+func ComponentStateTopic(comp discovery.Component) (string, error) {
+	if comp.StateTopic == "" {
+		return "", fmt.Errorf("%w: platform %q", ErrNoComponentStateTopic, comp.Platform)
+	}
+	return comp.StateTopic, nil
+}
+
+// StateTopicFor is the entity-shaped form of [ComponentStateTopic], for a
+// consumer that has the device and the entity at hand rather than the
+// rendered component.
+//
+// It renders the component with the same [discovery.Context] the config was
+// rendered from and reads the topic off it, so the answer is equal to the
+// config's by construction rather than by a second derivation that has to be
+// kept in step. This is the call to reach for when a consumer is tempted to
+// write `layout.State(slot)` on the publishing side: that expression is the
+// measured defect, not a shortcut.
+//
+// The rendering is cheap — no broker, no allocation beyond the component —
+// but it is not free, so a consumer publishing at device speed should
+// resolve the topic once per entity and keep it, exactly as it keeps the
+// config it published.
+func StateTopicFor(ctx discovery.Context, dev *model.Device, e model.Entity) (string, error) {
+	comp, err := discovery.RenderComponent(ctx, dev, e, discovery.Origin{})
+	if err != nil {
+		return "", fmt.Errorf("publisher: resolve state topic: %w", err)
+	}
+	return ComponentStateTopic(comp)
+}
+
+// PublishComponent writes one retained state payload to the topic comp's own
+// config declared, and is the call a consumer should reach for instead of
+// deriving the topic from a [topic.Layout].
+//
+// [StatePublisher.Publish] takes a caller-supplied topic, which is what the
+// state plane needs — a consumer's own batching, a topic it renders itself —
+// but it left the module with no slot- or entity-shaped state call at all, in
+// pointed asymmetry with [AvailabilityPublisher], which ships
+// [DeviceSlot]/[AvailabilityPublisher.DeviceTopic]/[AvailabilityPublisher.Device].
+// The gap was filled by consumers with `layout.State(slot)`, which is right
+// on 22 platforms and silently wrong on ten. See [ComponentStateTopic].
+func (p *StatePublisher) PublishComponent(
+	ctx context.Context,
+	comp discovery.Component,
+	payload []byte,
+) (bool, error) {
+	t, err := ComponentStateTopic(comp)
+	if err != nil {
+		return false, err
+	}
+	return p.Publish(ctx, t, payload)
+}
+
+// PublishComponentValue renders value in the configured
+// [StateConfig.Encoding] and publishes it to the topic comp declared.
+//
+// The pairing of [StatePublisher.PublishValue] and
+// [StatePublisher.PublishComponent]: one call that cannot get either half
+// wrong, which is the shape a consumer holding a rendered component wants for
+// every ordinary sensor.
+func (p *StatePublisher) PublishComponentValue(
+	ctx context.Context,
+	comp discovery.Component,
+	value any,
+	available bool,
+) (bool, error) {
+	t, err := ComponentStateTopic(comp)
+	if err != nil {
+		return false, err
+	}
+	return p.PublishValue(ctx, t, value, available)
 }
 
 // PublishValue renders value in the configured [StateConfig.Encoding] and

@@ -11,7 +11,11 @@ import (
 	"testing"
 	"time"
 
+	hacatalog "github.com/SukramJ/go-ha-catalog"
+
 	"github.com/SukramJ/go-hamqtt/discovery"
+	"github.com/SukramJ/go-hamqtt/model"
+	"github.com/SukramJ/go-hamqtt/topic"
 )
 
 // slowTransport delays every publish by a fixed amount, which is the only way
@@ -882,5 +886,91 @@ func TestStateResetIsTheSameIdiomAsTheAvailabilityPlanes(t *testing.T) {
 	}
 	if sent, err = p.Publish(ctx, name, []byte("21.5")); err != nil || sent {
 		t.Errorf("the gate stayed open after the reset's one write: %v, %v", sent, err)
+	}
+}
+
+// TestComponentStateTopicIsTheOnlyProvablyEqualRoute measures the asymmetry
+// that made a derived state topic a silent defect.
+//
+// The renderer projects `state_topic` only on the platforms whose catalog
+// schema accepts the key. A [topic.Layout] has no such notion and returns a
+// topic for every platform, so on the ten that name a topic per role or are
+// write-only, the derived topic and the config's are different strings and
+// the publish succeeds into nothing. The entity stays "unknown" forever and
+// nothing logs anything, which is why this has to be caught by a type, not by
+// an operator.
+func TestComponentStateTopicIsTheOnlyProvablyEqualRoute(t *testing.T) {
+	t.Parallel()
+
+	layout := topic.Default{Root: "b"}
+	dctx := discovery.StdContext{Layout: layout, Namespace: "b", Lang: "en"}
+	dev := &model.Device{
+		Identity: model.Identity{IDs: []model.Identifier{{Namespace: "serial", Value: "VEQ0001"}}},
+		Name:     model.L("Thermostat"),
+	}
+	slot := model.S(dev.UID(), "1", model.BucketValues, "TEMPERATURE")
+	entity := func(p hacatalog.Platform) *model.Basic {
+		return &model.Basic{
+			EntityKey:      "temperature",
+			EntityPlatform: p,
+			Description:    model.Description{Name: model.L("Temperature")},
+			Binds:          []model.Binding{{Role: model.RoleState, Slot: slot, Mode: model.Read}},
+		}
+	}
+
+	// The platform that does carry the key: both routes agree, which is what
+	// makes the disagreement below meaningful rather than a rendering quirk.
+	got, err := StateTopicFor(dctx, dev, entity(hacatalog.PlatformSensor))
+	if err != nil {
+		t.Fatalf("StateTopicFor(sensor): %v", err)
+	}
+	if want := layout.State(slot); got != want {
+		t.Fatalf("sensor state topic = %q, want %q", got, want)
+	}
+
+	// The platform that does not. The layout still answers, which is the
+	// trap; the component-shaped route refuses.
+	if derived := layout.State(slot); derived == "" {
+		t.Fatal("the layout declined to derive a topic; this test no longer describes the trap")
+	}
+	climate := entity(hacatalog.PlatformClimate)
+	if _, err = StateTopicFor(dctx, dev, climate); !errors.Is(err, ErrNoComponentStateTopic) {
+		t.Errorf("StateTopicFor(climate) err = %v, want ErrNoComponentStateTopic", err)
+	}
+
+	comp, err := discovery.RenderComponent(dctx, dev, climate, discovery.Origin{})
+	if err != nil {
+		t.Fatalf("RenderComponent: %v", err)
+	}
+	if comp.StateTopic != "" {
+		t.Fatalf("climate rendered state_topic = %q; the catalog gate moved", comp.StateTopic)
+	}
+
+	f := newFake()
+	p := NewStatePublisher(f, StateConfig{})
+	ctx := context.Background()
+	if _, err = p.PublishComponent(ctx, comp, []byte("21.5")); !errors.Is(err, ErrNoComponentStateTopic) {
+		t.Errorf("PublishComponent err = %v, want ErrNoComponentStateTopic", err)
+	}
+	if _, err = p.PublishComponentValue(ctx, comp, 21.5, true); !errors.Is(err, ErrNoComponentStateTopic) {
+		t.Errorf("PublishComponentValue err = %v, want ErrNoComponentStateTopic", err)
+	}
+	if n := len(stateOps(f)); n != 0 {
+		t.Fatalf("a topic no config names reached the wire: %+v", stateOps(f))
+	}
+
+	// And the accepted shape publishes to exactly the string the config
+	// carries.
+	sensorComp, err := discovery.RenderComponent(dctx, dev, entity(hacatalog.PlatformSensor), discovery.Origin{})
+	if err != nil {
+		t.Fatalf("RenderComponent(sensor): %v", err)
+	}
+	sent, err := p.PublishComponentValue(ctx, sensorComp, 21.5, true)
+	if err != nil || !sent {
+		t.Fatalf("PublishComponentValue = %v, %v", sent, err)
+	}
+	ops := stateOps(f)
+	if len(ops) != 1 || ops[0].topic != sensorComp.StateTopic {
+		t.Errorf("published to %+v, want %q", ops, sensorComp.StateTopic)
 	}
 }
