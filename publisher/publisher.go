@@ -38,7 +38,7 @@ import (
 	"time"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/topic"
+	hatopic "github.com/SukramJ/go-hamqtt/topic"
 )
 
 // Handler receives one delivered message.
@@ -112,7 +112,7 @@ type Config struct {
 	// With Layout set, an empty StatusTopic is filled from it, and a
 	// StatusTopic that disagrees with it is a programming error [New]
 	// refuses rather than a fleet that comes up dark.
-	Layout topic.Layout
+	Layout hatopic.Layout
 
 	// QoS applies to every publish and subscribe the runtime performs.
 	// The zero value is QoS 1, which is what a retained config wants: at
