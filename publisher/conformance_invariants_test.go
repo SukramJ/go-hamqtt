@@ -5,6 +5,7 @@ package publisher
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -113,7 +114,7 @@ func TestConformanceCommandTopicIsCoveredByTheCommandSubscription(t *testing.T) 
 		if c.comp.CommandTopic == "" {
 			continue
 		}
-		if !MatchTopicFilter(filter, c.comp.CommandTopic) {
+		if !MatchFilter(filter, c.comp.CommandTopic) {
 			t.Errorf("%s: advertises command_topic %q, which subscription %q does not cover — "+
 				"Home Assistant would send commands nobody receives",
 				c.key, c.comp.CommandTopic, filter)
@@ -547,8 +548,8 @@ func TestConformanceRetractionLeavesNoGhost(t *testing.T) {
 	}
 }
 
-// TestConformanceSweptOrphanConfigLeavesItsAvailabilityTopicStanding records
-// a gap the two planes only have together.
+// TestConformanceSweepCanClearAnOrphansAvailabilityTopic closes a gap the two
+// planes only had together.
 //
 // [Runtime.Sweep] is the one thing in this layer that can find a leftover no
 // running process remembers: it reads the broker. The availability plane
@@ -556,18 +557,20 @@ func TestConformanceRetractionLeavesNoGhost(t *testing.T) {
 // wildcard pass there would judge another writer's topics — and it therefore
 // only ever clears what this process itself wrote.
 //
-// Between those two correct decisions sits the ghost. On the boot after a
-// device was removed while the daemon was down, the sweep finds the orphan
-// config and retracts it, the availability plane's memory is empty, and the
-// retained `online` beside the config survives. Worse, the sweep is the last
-// moment at which it could be found: the config body names the availability
-// topic, and the sweep discards the payload it read.
+// Between those two correct decisions sat a ghost. On the boot after a device
+// was removed while the daemon was down, the sweep found the orphan config
+// and retracted it, the availability plane's memory was empty, and the
+// retained `online` beside the config survived — so Home Assistant kept a
+// device that no longer exists permanently available, showing its last value.
+// The sweep was also the LAST moment it could be found: the config body names
+// the availability topic, and the sweep used to discard the payload it read.
 //
-// This test asserts the CURRENT behaviour, so the gap is documented rather
-// than discovered again on a broker. Closing it needs the sweep to hand the
-// payload it inspected to the caller, which is an additive change to
-// [SweepRequest] in a file this change may not touch.
-func TestConformanceSweptOrphanConfigLeavesItsAvailabilityTopicStanding(t *testing.T) {
+// [SweepRequest.Inspect] is what closes it. This test drives the composition
+// the doc comment prescribes: collect during the pass, retract after it
+// returns — which is also the order a removal needs, since the config
+// retraction is what removes the entity and clearing availability first only
+// greys it out in between.
+func TestConformanceSweepCanClearAnOrphansAvailabilityTopic(t *testing.T) {
 	f := newFleet(t)
 	ctx := context.Background()
 
@@ -584,9 +587,15 @@ func TestConformanceSweptOrphanConfigLeavesItsAvailabilityTopicStanding(t *testi
 
 	f.boot(ctx)
 
+	// What the consumer collects during the pass. Keyed by config topic, so
+	// only the configs the sweep actually retracts contribute.
+	bodies := map[string][]byte{}
 	res, err := f.run.Sweep(ctx, SweepRequest{
 		Owns:   func(ct ConfigTopic) bool { return strings.HasPrefix(ct.NodeID, "serial_") },
 		Window: time.Millisecond,
+		Inspect: func(ct ConfigTopic, body []byte) {
+			bodies[BundleConfigTopic(conformPrefix, ct.NodeID)] = append([]byte(nil), body...)
+		},
 	})
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -597,22 +606,57 @@ func TestConformanceSweptOrphanConfigLeavesItsAvailabilityTopicStanding(t *testi
 	if f.broker.holds(orphanCfg) {
 		t.Fatal("the orphan config is still retained")
 	}
-
-	// The gap. Not an assertion that this is right — an assertion that it is
-	// what happens, so the next reader finds it here rather than on a broker.
-	if !f.broker.holds(orphanAvail) {
-		t.Fatal("the orphan availability topic was cleared; the documented gap is closed and " +
-			"this test should become the positive assertion")
+	if len(bodies[orphanCfg]) == 0 {
+		t.Fatal("Inspect did not hand over the orphan's body, so nothing can name its other topics")
 	}
+
+	// The body is what still names the entity's availability topic. Retract
+	// after the pass, never inside it: Inspect runs on the read loop.
+	for _, topic := range res.Retracted {
+		for _, at := range availabilityTopicsOfBody(t, bodies[topic]) {
+			if err := f.avail.Retract(ctx, at); err != nil {
+				t.Fatalf("retract %s: %v", at, err)
+			}
+		}
+	}
+	if f.broker.holds(orphanAvail) {
+		t.Fatal("the orphan availability topic is still retained: the ghost device survives")
+	}
+
+	// The availability plane still judges only its own memory — the ghost is
+	// cleared because the sweep named it, not because the plane guessed.
 	if _, known := f.avail.Online(orphanAvail); known {
 		t.Fatal("the availability plane knows a topic it never wrote")
 	}
-	if _, err := f.avail.Sweep(ctx, func(string) bool { return false }); err != nil {
-		t.Fatalf("availability sweep: %v", err)
+}
+
+// availabilityTopicsOfBody reads the availability topics out of a retained
+// device bundle, which is the only place they survive once the process that
+// published them is gone.
+func availabilityTopicsOfBody(t *testing.T, body []byte) []string {
+	t.Helper()
+	if len(body) == 0 {
+		return nil
 	}
-	if !f.broker.holds(orphanAvail) {
-		t.Fatal("the availability sweep reached a topic outside its own memory")
+	var doc struct {
+		Components map[string]struct {
+			Availability []struct {
+				Topic string `json:"topic"`
+			} `json:"availability"`
+		} `json:"components"`
 	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		t.Fatalf("read swept body: %v", err)
+	}
+	var out []string
+	for _, c := range doc.Components {
+		for _, a := range c.Availability {
+			if a.Topic != "" && !slices.Contains(out, a.Topic) {
+				out = append(out, a.Topic)
+			}
+		}
+	}
+	return out
 }
 
 // TestConformanceSweepSparesEveryLiveTopic pins that a sweep run at the

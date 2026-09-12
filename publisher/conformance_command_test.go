@@ -382,26 +382,21 @@ func (cf *commandFleet) readingSurface() []string {
 // [StateTopics] documents its result as "every `*_topic` key that is not a
 // command topic, availability and JSON attributes included", and
 // [CommandRouter.CheckDisjoint] documents [BundleStateTopics] as the input to
-// pass it at boot. For a device-based document the availability half of that
-// promise does not hold: `StdContext` renders availability as a list of
-// objects under the `availability` key, and the extraction walks only the top
-// level of a component body, where `availability` is not a `*_topic` key and
-// is not a string. The legacy single-topic `availability_topic` form is
-// picked up; the list form — which is the only form this module's discovery
-// pipeline produces — is not.
+// pass it at boot. That promise used to break on exactly the availability
+// half: `StdContext` renders availability as a LIST of objects under the
+// `availability` key, and the extraction walked only the top level of a
+// component body, where `availability` is neither a `*_topic` key nor a
+// string. The legacy single-topic `availability_topic` form was picked up;
+// the list form -- the only form this module's discovery pipeline produces
+// -- was not.
 //
-// What that costs: a consumer that follows the doc comment verbatim runs
-// CheckDisjoint over every state topic and no availability topic, so a command
-// filter overlapping an availability topic passes the boot check. The echo is
-// then a command issued on every availability flip, which is the same defect
-// the guard exists to catch, at the one moment — a device dropping off the bus
-// — when nobody is reading the logs.
-//
-// Asserted as current behaviour so the gap is documented rather than
-// rediscovered on a broker. Closing it means descending into the availability
-// list inside topicsOfKind, which is a change to a file this one may not
-// touch.
-func TestConformanceBundleStateTopicsOmitsTheAvailabilityList(t *testing.T) {
+// What it cost, and why this test is worth its length: a consumer following
+// the doc comment verbatim ran CheckDisjoint over every state topic and no
+// availability topic, so a command filter overlapping an availability topic
+// passed the boot check. The echo was then a command issued on every
+// availability flip -- the same defect the guard exists to catch, at the one
+// moment, a device dropping off the bus, when nobody is reading the logs.
+func TestConformanceBundleStateTopicsReportsTheAvailabilityList(t *testing.T) {
 	cf := newCommandFleet(t)
 	ctx := context.Background()
 	cf.boot(ctx)
@@ -411,17 +406,20 @@ func TestConformanceBundleStateTopicsOmitsTheAvailabilityList(t *testing.T) {
 		t.Fatalf("state topics: %v", err)
 	}
 	var missing []string
+	var checked int
 	comps := cf.components()
 	for i := range comps {
 		for _, at := range availabilityTopicsOf(comps[i].comp) {
+			checked++
 			if !slices.Contains(documented, at) && !slices.Contains(missing, at) {
 				missing = append(missing, at)
 			}
 		}
 	}
-	if len(missing) == 0 {
-		t.Fatal("BundleStateTopics now reports the availability list; the documented gap is closed " +
-			"and this test should become the positive assertion, with readingSurface() deleted")
+	if checked == 0 {
+		t.Fatal("the fixture advertises no availability topic, so this proves nothing")
 	}
-	t.Logf("availability topics absent from BundleStateTopics: %v", missing)
+	if len(missing) != 0 {
+		t.Errorf("availability topics absent from BundleStateTopics: %v", missing)
+	}
 }

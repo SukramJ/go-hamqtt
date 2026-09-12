@@ -1028,19 +1028,46 @@ func componentBody(comp discovery.Component) (map[string]any, error) {
 func topicsOfKind(body map[string]any, command bool) []string {
 	out := make([]string, 0, 4)
 	seen := map[string]bool{}
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
 	for key, v := range body {
+		// `availability` is a LIST of objects, each with its own "topic",
+		// and it is the only form this module's discovery pipeline
+		// produces. A walk over the top level alone therefore finds every
+		// state topic and no availability topic -- so a consumer following
+		// [StateTopics]'s documented use, checking its writing surface for
+		// collisions, would miss exactly the echo that fires on every
+		// availability flip.
+		if !command && key == "availability" {
+			entries, isList := v.([]any)
+			if !isList {
+				continue
+			}
+			for _, e := range entries {
+				entry, isMap := e.(map[string]any)
+				if !isMap {
+					continue
+				}
+				if t, isString := entry["topic"].(string); isString {
+					add(t)
+				}
+			}
+			continue
+		}
 		if !isTopicKey(key) {
 			continue
 		}
 		if isCommandTopicKey(key) != command {
 			continue
 		}
-		s, isString := v.(string)
-		if !isString || s == "" || seen[s] {
-			continue
+		if s, isString := v.(string); isString {
+			add(s)
 		}
-		seen[s] = true
-		out = append(out, s)
 	}
 	sort.Strings(out)
 	return out
