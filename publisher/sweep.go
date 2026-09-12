@@ -228,9 +228,7 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 		mu.Unlock()
 	}
 
-	if err := r.snapshot(ctx, topicPrefix(r.cfg.Prefix)+"#", window, collect); err != nil {
-		return SweepResult{}, err
-	}
+	err := r.snapshot(ctx, topicPrefix(r.cfg.Prefix)+"#", window, collect)
 
 	// Read under the lock the deliveries write under: the window is closed
 	// by an atomic flag, so a delivery that passed the gate a moment earlier
@@ -243,6 +241,18 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 		Unclaimed: append([]string(nil), candidate...),
 	}
 	mu.Unlock()
+
+	// What the window saw is returned even when it ended badly, which is
+	// the whole value of a failed pass. The snapshot reports the caller's
+	// context ending as an error even after a full window has run, and a
+	// boot context that expires on the window boundary used to take the
+	// entire result with it — for a [SweepRequest.ReportOnly] pass, whose
+	// only output IS the result, that is everything the pass was for. The
+	// error is still returned and still governs: a caller that acts on a
+	// partial list is choosing to, with the error in hand to say so.
+	if err != nil {
+		return result, err
+	}
 
 	if req.ReportOnly {
 		// Returned before the retraction loop rather than skipped inside
