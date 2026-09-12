@@ -41,8 +41,30 @@ var (
 	ErrDuplicateRoute = errors.New("publisher: duplicate command route")
 
 	// ErrAmbiguousRoutes is returned when two registered filters can both
-	// match some topic and neither is strictly more specific than the
-	// other, so no rule could pick one.
+	// match some topic — any overlap, not only one no specificity rule
+	// could order.
+	//
+	// The router cannot resolve an overlap after the fact, because by the
+	// time a message reaches it the overlap has already multiplied it.
+	// Two fan-outs compose: the broker sends one copy per matching
+	// subscription (MQTT 3.1.1 §4.7.3 / 5.0 §3.3.4 permit it and both
+	// Mosquitto and EMQX do it), and go-mqtt then re-matches each arriving
+	// copy against its whole local filter list and calls every matching
+	// handler, never correlating a copy with the subscription it arrived
+	// on. N overlapping routes therefore turn one message into N
+	// indistinguishable dispatches, and nothing the router can see tells
+	// them apart from N genuine publishes on the same topic.
+	//
+	// Measured against Mosquitto 2.1.2, on 3.1.1 and 5.0 alike and with
+	// two separate clients so No-Local is not in play: the routes
+	// `ccu/+/+/set` and `ccu/+/PRESS_SHORT/set` — exactly the "one
+	// wildcard per command shape" granularity — turned one published
+	// message into two handler runs. A toggle toggles twice, a relay pulse
+	// fires twice, a dimmer step doubles, and nothing logs anything.
+	//
+	// Refusing the pair at registration is the only resolution that holds
+	// on both protocol versions; [CommandRouter.Handle] documents what it
+	// costs and what to do instead.
 	ErrAmbiguousRoutes = errors.New("publisher: ambiguous command routes")
 
 	// ErrInvalidFilter is returned for a filter MQTT does not permit —
@@ -246,15 +268,28 @@ type route struct {
 // Three properties are worth stating before the lock order, because they are
 // what the type is for:
 //
-//   - Exactly one handler runs per message. A broker fans a message out to
-//     every matching subscription, not the most specific one, so two
-//     overlapping filters mean two deliveries — the measured consumer
-//     dispatched a profile selection both to the profile handler and, as a
-//     parameter write named `week_profile`, to the data-point handler, and
-//     patched it with a hand-maintained list of reserved segments. The
-//     router resolves overlap by specificity instead, once, at registration
-//     time, and refuses a pair no rule can order.
+//   - Exactly one handler runs per message, and the router buys that by
+//     refusing overlapping routes outright — see [ErrAmbiguousRoutes] for
+//     why nothing weaker works. A broker fans a message out to every
+//     matching subscription and go-mqtt then calls every locally matching
+//     handler per copy, so the measured consumer dispatched a profile
+//     selection both to the profile handler and, as a parameter write named
+//     `week_profile`, to the data-point handler. It patched that with a
+//     hand-maintained list of reserved segments; this type makes the route
+//     pair that causes it unregisterable.
+//
+//     One overlap remains outside the router's reach and is worth naming:
+//     the local fan-out is the whole go-mqtt client's, so a SECOND
+//     subscription on the same client whose filter also matches a command
+//     topic reintroduces the multiplication. This module's own other
+//     subscriptions (the discovery-tree snapshot and the birth topic) live
+//     under the discovery prefix, not in the consumer's command tree, so
+//     they do not; a consumer that adds a broad subscription of its own
+//     must keep it off the command tree, which is the subscription-side
+//     twin of [CommandRouter.CheckDisjoint].
+//
 //   - Handlers run off the read loop. See [CommandHandler].
+//
 //   - Unroutable is a diagnostic, never a failure. A shared broker delivers
 //     things that are none of this consumer's business.
 //
@@ -335,9 +370,16 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 //     entities is a real but survivable boot cost.
 //   - One wildcard per command shape, which is what the measured consumer
 //     does: thirteen filters covering every device it will ever see. One
-//     SUBSCRIBE each, no per-entity bookkeeping, and the cost is that the
-//     filters can overlap each other and the state plane — the two defect
-//     classes this type exists to close.
+//     SUBSCRIBE each and no per-entity bookkeeping, at the price this type
+//     charges loudly: the shapes must be pairwise disjoint. `ccu/+/+/set`
+//     together with `ccu/+/PRESS_SHORT/set` is refused with
+//     [ErrAmbiguousRoutes], because that exact pair ran one message's
+//     handler twice against Mosquitto 2.1.2. A consumer that wants a
+//     special case for one parameter name registers the general shape only
+//     and branches inside the handler on [Command.Wildcards] — the
+//     discrimination moves from the router to the handler, which is the
+//     whole cost, and it is a cost the previous specificity-based scheme
+//     only appeared to spare it.
 //   - A single `<base>/#`. Never correct here: it subscribes the consumer
 //     to its own state plane, so every state publish comes back as a
 //     command.
@@ -348,8 +390,11 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 // time a state topic is run past it.
 //
 // Registration is rejected when filter is malformed, already registered, or
-// overlaps an existing route without being orderable against it — see
-// [ErrAmbiguousRoutes].
+// overlaps an existing route at all — see [ErrAmbiguousRoutes]. The overlap
+// test is structural rather than a comparison of the topics seen so far,
+// because the measured collision (a seven-level all-wildcard filter against
+// a seven-level filter with one literal) is invisible to any check that
+// waits for traffic to demonstrate it.
 func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if handler == nil {
 		return fmt.Errorf("%w: nil handler for %q", ErrInvalidFilter, filter)
@@ -369,11 +414,9 @@ func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 		if existing.filter == filter {
 			return fmt.Errorf("%w: %q", ErrDuplicateRoute, filter)
 		}
-		if !filtersOverlap(existing.parts, parts) {
-			continue
-		}
-		if _, ordered := compareSpecificity(existing.parts, parts); !ordered {
-			return fmt.Errorf("%w: %q and %q both match some topic and neither is more specific",
+		if filtersOverlap(existing.parts, parts) {
+			return fmt.Errorf("%w: %q and %q both match some topic, so one message would run a handler twice; "+
+				"register the general shape only and branch inside the handler",
 				ErrAmbiguousRoutes, existing.filter, filter)
 		}
 	}
@@ -652,18 +695,6 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 			slog.String("topic", topic), slog.String("filter", filter))
 		return
 	}
-	if cmd.Filter != filter {
-		// The same message arrived through a less specific subscription
-		// as well. Exactly one delivery dispatches — the one whose own
-		// filter won — which is what makes "one handler per message" hold
-		// without the router having to remember anything about the
-		// message it just saw.
-		r.log.Debug("publisher.command.superseded_route",
-			slog.String("topic", topic),
-			slog.String("filter", filter),
-			slog.String("winner", cmd.Filter))
-		return
-	}
 	if retained && !r.cfg.DeliverRetained {
 		r.log.Debug("publisher.command.retained_drop", slog.String("topic", topic))
 		return
@@ -680,35 +711,28 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 	})
 }
 
-// resolveLocked picks the most specific route matching topic. Callers hold
-// r.mu.
+// resolveLocked finds the route matching topic. Callers hold r.mu.
+//
+// At most one can match: registration refuses any overlapping pair, which
+// is what makes this a search rather than the specificity tournament an
+// earlier version ran. The tournament was not merely redundant — it picked
+// a winner per delivered COPY of a message rather than per message, so it
+// was the mechanism by which one command ran its handler N times. See
+// [ErrAmbiguousRoutes].
 func (r *CommandRouter) resolveLocked(topic string) (cmd Command, handler CommandHandler, ok bool) {
-	best := -1
-	var bestWild []string
-	var bestRest string
 	for i := range r.routes {
 		wild, rest, matched := captureFilter(r.routes[i].parts, topic)
 		if !matched {
 			continue
 		}
-		if best >= 0 {
-			// Registration rejected every unorderable overlap, so a
-			// second match is always comparable to the first.
-			if c, ordered := compareSpecificity(r.routes[i].parts, r.routes[best].parts); !ordered || c <= 0 {
-				continue
-			}
-		}
-		best, bestWild, bestRest = i, wild, rest
+		return Command{
+			Topic:     topic,
+			Filter:    r.routes[i].filter,
+			Wildcards: wild,
+			Remainder: rest,
+		}, r.routes[i].handler, true
 	}
-	if best < 0 {
-		return Command{}, nil, false
-	}
-	return Command{
-		Topic:     topic,
-		Filter:    r.routes[best].filter,
-		Wildcards: bestWild,
-		Remainder: bestRest,
-	}, r.routes[best].handler, true
+	return Command{}, nil, false
 }
 
 func (r *CommandRouter) routeFiltersLocked() []string {
@@ -829,88 +853,6 @@ func filtersOverlap(a, b []string) bool {
 			return false
 		}
 		a, b = a[1:], b[1:]
-	}
-}
-
-// compareSpecificity orders two overlapping filters. It returns +1 when a is
-// strictly more specific, -1 when b is, 0 when they are equally specific,
-// and ordered=false when neither dominates.
-//
-// Specificity is per level — a literal beats `+`, `+` beats `#` — and a
-// filter only wins if it is at least as specific at every level and better
-// at one. `a/+/c` against `a/b/+` is the unorderable case: each is more
-// specific than the other somewhere, both match `a/b/c`, and no rule short
-// of registration order could pick one. Registration order is exactly the
-// wrong tiebreaker, because it makes routing depend on the order a
-// composition root happened to wire its optional sinks in.
-func compareSpecificity(a, b []string) (cmp int, ordered bool) {
-	sign := 0
-	for i := 0; ; i++ {
-		aDone, bDone := i >= len(a), i >= len(b)
-		switch {
-		case aDone && bDone:
-			return sign, true
-		case aDone:
-			// Only reachable for filters of different level counts,
-			// which can overlap only through a `#` the loop has not
-			// reached yet. The longer filter constrains more.
-			return combineSpecificity(sign, -1)
-		case bDone:
-			return combineSpecificity(sign, +1)
-		}
-		if a[i] == "#" && b[i] == "#" {
-			return sign, true
-		}
-		if a[i] == "#" {
-			return combineSpecificity(sign, -1)
-		}
-		if b[i] == "#" {
-			return combineSpecificity(sign, +1)
-		}
-		ra, rb := levelRank(a[i]), levelRank(b[i])
-		if ra == rb {
-			continue
-		}
-		next := -1
-		if ra > rb {
-			next = +1
-		}
-		var ok bool
-		if sign, ok = mergeSign(sign, next); !ok {
-			return 0, false
-		}
-	}
-}
-
-// combineSpecificity folds a final verdict into the running sign.
-func combineSpecificity(sign, final int) (cmp int, ordered bool) {
-	s, ok := mergeSign(sign, final)
-	if !ok {
-		return 0, false
-	}
-	return s, true
-}
-
-// mergeSign keeps a running comparison, refusing a contradiction.
-func mergeSign(sign, next int) (merged int, ok bool) {
-	if sign != 0 && next != 0 && sign != next {
-		return 0, false
-	}
-	if next != 0 {
-		return next, true
-	}
-	return sign, true
-}
-
-// levelRank scores one filter level: a literal constrains most, `#` least.
-func levelRank(level string) int {
-	switch level {
-	case "#":
-		return 0
-	case "+":
-		return 1
-	default:
-		return 2
 	}
 }
 

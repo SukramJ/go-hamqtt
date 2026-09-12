@@ -44,17 +44,7 @@ func newCmdBroker() *cmdBroker {
 }
 
 func (b *cmdBroker) Publish(_ context.Context, topic string, payload []byte, _ byte, _ bool) error {
-	b.mu.Lock()
-	targets := make([]Handler, 0, len(b.subs))
-	for filter, h := range b.subs {
-		if MatchFilter(filter, topic) {
-			targets = append(targets, h)
-		}
-	}
-	b.mu.Unlock()
-	for _, h := range targets {
-		h(topic, payload, false)
-	}
+	b.fanout(topic, payload, false)
 	return nil
 }
 
@@ -79,10 +69,31 @@ func (b *cmdBroker) Unsubscribe(_ context.Context, filter string) error {
 	return nil
 }
 
-// deliver drives one inbound message through every matching subscription,
-// exactly as a broker fans out. Returns how many subscriptions saw it, which
-// is what proves the one-handler-per-message rule is doing work.
+// deliver drives one inbound message through the two fan-outs a command
+// actually survives, and returns the number of copies the broker produced.
+//
+// Both multiplications are real and they compose, which is the thing the
+// previous version of this fake got wrong by modelling only the first:
+//
+//   - The BROKER sends one copy of the message per matching subscription.
+//     MQTT 3.1.1 §4.7.3 and 5.0 §3.3.4 permit it and both Mosquitto and
+//     EMQX do it; it was measured against Mosquitto 2.1.2 on v3.1.1 and
+//     v5 alike, with two separate clients so No-Local is not in play.
+//   - The CLIENT then re-matches every arriving copy against its whole
+//     local filter list and calls EVERY matching handler, without
+//     correlating a copy with the subscription it arrived on
+//     (go-mqtt's TCPClient.dispatch).
+//
+// So N overlapping routes cost N copies x N handler invocations, of which N
+// reach a handler — which is why the router refuses overlapping routes
+// outright instead of resolving them by specificity. See
+// [CommandRouter.Handle].
 func (b *cmdBroker) deliver(topic string, payload []byte, retained bool) int {
+	return b.fanout(topic, payload, retained)
+}
+
+// fanout is the two-stage delivery both Publish and deliver go through.
+func (b *cmdBroker) fanout(topic string, payload []byte, retained bool) (copies int) {
 	b.mu.Lock()
 	targets := make([]Handler, 0, len(b.subs))
 	for filter, h := range b.subs {
@@ -91,8 +102,12 @@ func (b *cmdBroker) deliver(topic string, payload []byte, retained bool) int {
 		}
 	}
 	b.mu.Unlock()
-	for _, h := range targets {
-		h(topic, payload, retained)
+	// One copy per matching subscription; each copy visits every matching
+	// local handler.
+	for range targets {
+		for _, h := range targets {
+			h(topic, payload, retained)
+		}
 	}
 	return len(targets)
 }
@@ -260,15 +275,18 @@ func TestCommandRouterHandleRejectsBadRegistrations(t *testing.T) {
 	if err := r.Handle("+/b/set", rc.handle); !errors.Is(err, ErrAmbiguousRoutes) {
 		t.Errorf("unorderable overlap: %v, want ErrAmbiguousRoutes", err)
 	}
-	// An orderable overlap is fine — that is the measured topology.
-	if err := r.Handle("a/week_profile/set", rc.handle); err != nil {
-		t.Errorf("orderable overlap rejected: %v", err)
+	// An ORDERABLE overlap is refused too, and that is the S1 fix: a
+	// specificity winner is picked per delivered copy of a message, not
+	// per message, so `a/week_profile/set` alongside `a/+/set` ran one
+	// message's handler twice against Mosquitto 2.1.2.
+	if err := r.Handle("a/week_profile/set", rc.handle); !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Errorf("orderable overlap: %v, want ErrAmbiguousRoutes", err)
 	}
 	// Non-overlapping is always fine.
 	if err := r.Handle("b/+/+/set", rc.handle); err != nil {
 		t.Errorf("disjoint filter rejected: %v", err)
 	}
-	if got, want := len(r.Filters()), 3; got != want {
+	if got, want := len(r.Filters()), 2; got != want {
 		t.Errorf("Filters() has %d entries, want %d", got, want)
 	}
 }
@@ -278,7 +296,7 @@ func TestCommandRouterSubscribesExactlyTheRegisteredFilters(t *testing.T) {
 	b := newCmdBroker()
 	r := quietRouter(t, b, CommandConfig{})
 	rc := &recorder{}
-	for _, f := range []string{"gh/+/+/set", "gh/alarm/+/set"} {
+	for _, f := range []string{"gh/+/+/set", "gh/alarm/+/arm"} {
 		if err := r.Handle(f, rc.handle); err != nil {
 			t.Fatalf("handle %s: %v", f, err)
 		}
@@ -287,7 +305,7 @@ func TestCommandRouterSubscribesExactlyTheRegisteredFilters(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	got := strings.Join(sorted(b.subscribed()), ",")
-	if want := "gh/+/+/set,gh/alarm/+/set"; got != want {
+	if want := "gh/+/+/set,gh/alarm/+/arm"; got != want {
 		t.Fatalf("subscribed %q, want %q — the router must subscribe its routes and nothing broader", got, want)
 	}
 	if err := r.Handle("gh/x/set", rc.handle); !errors.Is(err, ErrRouterStarted) {
@@ -403,10 +421,15 @@ func TestCommandRouterPayloadIsClonedForTheHandler(t *testing.T) {
 }
 
 // TestCommandRouterOneHandlerPerMessage is the regression for the measured
-// double-dispatch: a broker fans a message out to EVERY matching
-// subscription, so two overlapping filters mean two deliveries. The
-// reference implementation patched that with a hand-maintained list of
-// reserved topic segments; the router resolves by specificity instead.
+// double-dispatch, and it is the pair that reproduced it against Mosquitto
+// 2.1.2: `gh/+/+/+/+/set` and `gh/+/+/+/week_profile/set` overlap, the
+// broker sends one copy per matching subscription, and go-mqtt calls every
+// locally matching handler for each copy — so the specificity winner was
+// chosen once per COPY and the profile selection ran twice.
+//
+// The router now refuses the pair, and what a consumer keeps instead is one
+// route per shape with the discrimination inside the handler. Both halves
+// are asserted here, against a fake that models both fan-outs.
 func TestCommandRouterOneHandlerPerMessage(t *testing.T) {
 	t.Parallel()
 	b := newCmdBroker()
@@ -415,31 +438,70 @@ func TestCommandRouterOneHandlerPerMessage(t *testing.T) {
 	if err := r.Handle("gh/+/+/+/+/set", generic.handle); err != nil {
 		t.Fatalf("handle generic: %v", err)
 	}
-	if err := r.Handle("gh/+/+/+/week_profile/set", specific.handle); err != nil {
-		t.Fatalf("handle specific: %v", err)
+	err := r.Handle("gh/+/+/+/week_profile/set", specific.handle)
+	if !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Fatalf("overlapping route accepted (%v); one message would run a handler twice", err)
+	}
+	if !strings.Contains(err.Error(), "gh/+/+/+/+/set") ||
+		!strings.Contains(err.Error(), "gh/+/+/+/week_profile/set") {
+		t.Errorf("the refusal must name both filters, got %v", err)
 	}
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
 
-	if n := b.deliver("gh/ccu/HmIP/0001:1/week_profile/set", []byte("P2"), false); n != 2 {
-		t.Fatalf("broker fanned out to %d subscriptions, want 2 — the collision the test is about is not reproduced", n)
+	// One subscription matches, so the broker makes one copy and the
+	// client's local fan-out has one handler to offer it to.
+	if n := b.deliver("gh/ccu/HmIP/0001:1/week_profile/set", []byte("P2"), false); n != 1 {
+		t.Fatalf("broker fanned out to %d subscriptions, want 1", n)
 	}
 	if n := b.deliver("gh/ccu/HmIP/0001:1/LEVEL/set", []byte("1"), false); n != 1 {
 		t.Fatalf("plain data-point topic hit %d subscriptions, want 1", n)
 	}
 	r.WaitIdle()
 
-	if got := specific.count(); got != 1 {
-		t.Errorf("week-profile handler ran %d times, want 1", got)
+	if got := specific.count(); got != 0 {
+		t.Errorf("the refused route ran %d times, want 0", got)
 	}
-	if got := generic.count(); got != 1 {
-		t.Errorf("generic handler ran %d times, want 1 (the LEVEL write only) — "+
-			"a profile selection must not also be dispatched as a write to a parameter named week_profile", got)
+	got := generic.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("the surviving route ran %d times, want exactly one per message", len(got))
 	}
-	if got := generic.snapshot()[0].Wildcards; got[3] != "LEVEL" {
-		t.Errorf("generic handler saw %v", got)
+	// The discrimination the refused route used to buy is the handler's
+	// now, and the wildcard capture is what it reads.
+	if got[0].Wildcards[3] != "week_profile" || got[1].Wildcards[3] != "LEVEL" {
+		t.Errorf("handler saw %v / %v, want the parameter name in the fourth `+`",
+			got[0].Wildcards, got[1].Wildcards)
+	}
+}
+
+// TestCommandRouterRefusesEveryOverlapShape pins the disjointness rule
+// across the shapes a consumer actually writes, including the measured pair
+// (`ccu/+/+/set` with `ccu/+/PRESS_SHORT/set`) whose two handler runs held
+// the release.
+func TestCommandRouterRefusesEveryOverlapShape(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b    string
+		refused bool
+	}{
+		{"ccu/+/+/set", "ccu/+/PRESS_SHORT/set", true},
+		{"base/dev/set", "base/dev/set/#", true},
+		{"base/#", "base/dev/set", true},
+		{"a/+/c", "a/b/+", true},
+		{"a/b/set", "a/c/set", false},
+		{"a/+/set", "a/+/get", false},
+		{"a/b/#", "a/c/#", false},
+	} {
+		r := quietRouter(t, newCmdBroker(), CommandConfig{})
+		if err := r.Handle(tc.a, (&recorder{}).handle); err != nil {
+			t.Fatalf("handle %q: %v", tc.a, err)
+		}
+		err := r.Handle(tc.b, (&recorder{}).handle)
+		if refused := errors.Is(err, ErrAmbiguousRoutes); refused != tc.refused {
+			t.Errorf("Handle(%q) after %q = %v, want refused=%v", tc.b, tc.a, err, tc.refused)
+		}
 	}
 }
 
@@ -925,28 +987,6 @@ func TestBundleTopicExtraction(t *testing.T) {
 	}
 	if err := r.CheckDisjoint(states...); err != nil {
 		t.Errorf("a bundle's own command and state topics collided: %v", err)
-	}
-}
-
-func TestCompareSpecificity(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		a, b    string
-		cmp     int
-		ordered bool
-	}{
-		{"a/b", "a/+", +1, true},
-		{"a/+", "a/b", -1, true},
-		{"a/+", "a/+", 0, true},
-		{"a/b/c", "a/#", +1, true},
-		{"a/#", "#", +1, true},
-		{"a/+/c", "a/b/+", 0, false},
-		{"a/b/c/d", "a/b/#", +1, true},
-	} {
-		cmp, ordered := compareSpecificity(strings.Split(tc.a, "/"), strings.Split(tc.b, "/"))
-		if cmp != tc.cmp || ordered != tc.ordered {
-			t.Errorf("compareSpecificity(%q, %q) = %d/%v, want %d/%v", tc.a, tc.b, cmp, ordered, tc.cmp, tc.ordered)
-		}
 	}
 }
 
