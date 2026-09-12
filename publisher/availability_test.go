@@ -657,6 +657,10 @@ func TestNoLayoutRefusesRatherThanGuessing(t *testing.T) {
 	if _, err := a.Publish(ctx, "loom/x/availability", true); err != nil {
 		t.Errorf("Publish err = %v", err)
 	}
+	dev.Via = &model.Identity{IDs: []model.Identifier{{Namespace: "serial", Value: "INV0001"}}}
+	if _, _, err := a.ParentTopic(dev, availEntity(dev.UID(), false)); !errors.Is(err, ErrNoAvailabilityLayout) {
+		t.Errorf("ParentTopic err = %v", err)
+	}
 	if _, err := a.Publish(ctx, "", true); err == nil {
 		t.Error("an empty topic was accepted")
 	}
@@ -915,6 +919,16 @@ func TestAvailabilityHonoursTheCollisionGuard(t *testing.T) {
 	// subscribes to, not availability as such.
 	if _, err := a.Publish(ctx, "loom/ccu-01/VEQ0001/availability", true); err != nil {
 		t.Errorf("a disjoint availability topic must pass: %v", err)
+	}
+
+	// The index walk is guarded too, for the consumer that widened its
+	// filters after the flip: a republish must not echo into its own
+	// handler either.
+	a.mu.Lock()
+	a.filters = append(a.filters, "loom/ccu-01/#")
+	a.mu.Unlock()
+	if sent, err := a.Republish(ctx); sent != 0 || !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Republish = %d, %v; want the collision reported", sent, err)
 	}
 }
 

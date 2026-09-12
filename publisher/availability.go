@@ -213,9 +213,12 @@ func (a *AvailabilityPublisher) Parent(
 // dump, a retraction list built before the devices are gone and the ownership
 // predicate of [AvailabilityPublisher.Sweep] all need the string and none of
 // them wants the message. The second return is false when there is no parent.
-func (a *AvailabilityPublisher) ParentTopic(dev *model.Device, e model.Entity) (string, bool, error) {
-	s, ok := ParentSlot(dev, e)
-	if !ok {
+func (a *AvailabilityPublisher) ParentTopic(
+	dev *model.Device,
+	e model.Entity,
+) (parent string, ok bool, err error) {
+	s, has := ParentSlot(dev, e)
+	if !has {
 		return "", false, nil
 	}
 	t, err := a.DeviceTopic(s)

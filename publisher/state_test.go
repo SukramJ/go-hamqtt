@@ -993,6 +993,17 @@ func TestComponentStateTopicIsTheOnlyProvablyEqualRoute(t *testing.T) {
 	if len(ops) != 1 || ops[0].topic != sensorComp.StateTopic {
 		t.Errorf("published to %+v, want %q", ops, sensorComp.StateTopic)
 	}
+	if sent, err = p.PublishComponent(ctx, sensorComp, []byte("22.0")); err != nil || !sent {
+		t.Errorf("PublishComponent = %v, %v", sent, err)
+	}
+
+	// A device the renderer refuses is reported as such rather than as a
+	// missing state topic: the two are different faults and a consumer
+	// wiring its fleet needs to know which it has.
+	if _, err = StateTopicFor(dctx, nil, climate); err == nil ||
+		errors.Is(err, ErrNoComponentStateTopic) {
+		t.Errorf("StateTopicFor(nil device) err = %v, want the render failure", err)
+	}
 }
 
 // TestLatencyIgnoresASlowFailure is the assertion the fixtures previously
