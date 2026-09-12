@@ -1636,6 +1636,11 @@ type attrBroker struct {
 	stamps bool
 
 	failSubscribe func(filter string) error
+	// onSubscribe runs after a subscription is installed and before the
+	// next one is asked for. It is the only place a test can stand inside
+	// the subscribe window — the ordinary state of the wire during Start
+	// and during a sequential resubscribe replay after a reconnect.
+	onSubscribe func(filter string)
 }
 
 type attrSub struct {
@@ -1668,6 +1673,19 @@ func (b *attrBroker) SubscribeAttributed(
 }
 
 func (b *attrBroker) add(filter string, id uint32, h Handler) error {
+	if err := b.install(filter, id, h); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	hook := b.onSubscribe
+	b.mu.Unlock()
+	if hook != nil {
+		hook(filter)
+	}
+	return nil
+}
+
+func (b *attrBroker) install(filter string, id uint32, h Handler) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.failSubscribe != nil {
@@ -1812,6 +1830,119 @@ func TestCommandRouterAcceptsAnOrderedOverlapWhenDeliveriesAreAttributable(t *te
 	if gen[0].Wildcards[3] != "LEVEL" {
 		t.Errorf("the general route was handed %q, want the topic the specific route does not claim",
 			gen[0].Topic)
+	}
+}
+
+// TestCommandRouterDeliversInsideTheSubscribeWindow is the measured loss of
+// the v0.27.0–v0.29.0 review: a command that arrives while the routes are
+// still going out one at a time.
+//
+// The router drops a copy that arrived for a route a more specific one
+// outranks, judged against the REGISTERED route set — which is not the set
+// the broker holds until the last SUBSCRIBE is acknowledged. With the general
+// shape subscribed first, the only subscription that existed inside that
+// window was the one whose copies get dropped: the command ran no handler at
+// all and left one Debug line. That window is the ordinary state of the wire
+// during Start, and during a sequential resubscribe replay after a reconnect
+// — a button pressed in the second after a reconnect did nothing.
+//
+// The routes are therefore registered most specific first, so a copy can only
+// arrive for an outranked route once the route that outranks it is already
+// subscribed on the same connection.
+func TestCommandRouterDeliversInsideTheSubscribeWindow(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/PRESS_SHORT/set", specific.handle); err != nil {
+		t.Fatalf("handle specific: %v", err)
+	}
+
+	// Deliver after the FIRST subscription is installed and before the
+	// second is asked for. A real broker does this without being asked.
+	var once sync.Once
+	inWindow := func() {
+		b.mu.Lock()
+		live := len(b.subs)
+		b.mu.Unlock()
+		if live != 1 {
+			t.Errorf("the fixture delivered with %d subscriptions live, want exactly 1", live)
+		}
+		b.deliver("gh/ccu/PRESS_SHORT/set", []byte("1"), false)
+	}
+	b.mu.Lock()
+	b.onSubscribe = func(string) { once.Do(inWindow) }
+	b.mu.Unlock()
+
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+	r.WaitIdle()
+
+	ran := len(generic.snapshot()) + len(specific.snapshot())
+	if ran != 1 {
+		t.Fatalf("a command delivered inside the subscribe window ran %d handlers, want exactly 1 "+
+			"(0 is the measured loss, 2 would be the doubling the drop exists to prevent)", ran)
+	}
+	if got := len(specific.snapshot()); got != 1 {
+		t.Errorf("the specific route ran %d times, want 1 — it is the route that owns the topic", got)
+	}
+
+	// The same window again, this time as a reconnect replay against a
+	// broker that did not keep the session.
+	b.drop()
+	var twice sync.Once
+	b.mu.Lock()
+	b.onSubscribe = func(string) { twice.Do(inWindow) }
+	b.mu.Unlock()
+	if err := r.Resubscribe(context.Background()); err != nil {
+		t.Fatalf("resubscribe: %v", err)
+	}
+	r.WaitIdle()
+
+	if ran := len(generic.snapshot()) + len(specific.snapshot()); ran != 2 {
+		t.Fatalf("after the replay %d handler runs, want 2 — the command in the reconnect window is lost", ran)
+	}
+}
+
+// TestSpecificityScoreAgreesWithDominance pins the one property that lets a
+// sort key stand in for the dominance test: whenever compareSpecificity says
+// one filter is strictly more specific, its score must be strictly greater.
+// The subscribe order is built from the score and the delivery verdict from
+// the dominance test, so a disagreement would put the outranked route on the
+// wire first again — the window TestCommandRouterDeliversInsideTheSubscribeWindow
+// measures.
+func TestSpecificityScoreAgreesWithDominance(t *testing.T) {
+	t.Parallel()
+	filters := []string{
+		"gh/+/+/set", "gh/+/PRESS_SHORT/set", "gh/ccu/PRESS_SHORT/set",
+		"base/dev/set", "base/dev/set/#", "base/#", "base/dev/#",
+		"a/+/c", "a/b/+", "a/b", "a/b/#", "$share/g/a/b/+",
+	}
+	width := 1
+	parts := make([][]string, len(filters))
+	for i, f := range filters {
+		parts[i] = filterParts(f)
+		if n := len(parts[i]); n >= width {
+			width = n + 1
+		}
+	}
+	for i := range filters {
+		for j := range filters {
+			cmp, ok := compareSpecificity(parts[i], parts[j])
+			if !ok || cmp <= 0 {
+				continue
+			}
+			si, sj := specificityScore(parts[i], width), specificityScore(parts[j], width)
+			if si <= sj {
+				t.Errorf("%q dominates %q but scores %d <= %d — the subscribe order would invert them",
+					filters[i], filters[j], si, sj)
+			}
+		}
 	}
 }
 
