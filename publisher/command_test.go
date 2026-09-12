@@ -6,6 +6,7 @@ package publisher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -1608,5 +1609,536 @@ func TestCommandRouterRoutesASharedSubscription(t *testing.T) {
 	// against what a shared route really matches.
 	if err := r.CheckDisjoint("gh/lamp/set"); !errors.Is(err, ErrStateCommandCollision) {
 		t.Errorf("CheckDisjoint over a shared route: %v, want ErrStateCommandCollision", err)
+	}
+}
+
+// attrBroker is a cmdBroker that can attribute: it records a Subscription
+// Identifier per subscription and delivers a stamped copy to that
+// subscription's handler alone, the way go-mqtt's TCPClient.dispatch does.
+//
+// It composes BOTH fan-outs, which is the only way a fixture can see the
+// defect this whole area is about (see [cmdBroker.deliver]): the broker
+// makes one copy per matching subscription, and the client then decides who
+// each copy reaches. Modelling only the first pins the wrong number. The
+// two stages are separate here on purpose — an UNSTAMPED copy still falls
+// back to re-matching the topic against every filter the client holds, so
+// the fixture reproduces the mixed case where one un-stamped subscription
+// re-multiplies every stamped one.
+type attrBroker struct {
+	mu     sync.Mutex
+	subs   []attrSub
+	subbed []string
+
+	// stamps is false for the case the design turns on: a transport that
+	// offers attribution but is talking MQTT 3.1.1, where there is no
+	// property block to carry an identifier. go-mqtt refuses the option
+	// rather than dropping it, and so does this.
+	stamps bool
+
+	failSubscribe func(filter string) error
+}
+
+type attrSub struct {
+	filter string
+	id     uint32
+	h      Handler
+}
+
+func newAttrBroker() *attrBroker { return &attrBroker{stamps: true} }
+
+func (b *attrBroker) Publish(_ context.Context, topic string, payload []byte, _ byte, _ bool) error {
+	b.fanout(topic, payload, false)
+	return nil
+}
+
+func (b *attrBroker) Subscribe(_ context.Context, filter string, _ byte, h Handler) error {
+	return b.add(filter, 0, h)
+}
+
+func (b *attrBroker) SubscribeAttributed(
+	_ context.Context, filter string, _ byte, id uint32, h Handler,
+) error {
+	if !b.stamps {
+		return errors.New("broker: subscription identifiers require MQTT 5.0")
+	}
+	if id == 0 || id > MaxSubscriptionID {
+		return fmt.Errorf("broker: identifier %d out of range 1..%d", id, MaxSubscriptionID)
+	}
+	return b.add(filter, id, h)
+}
+
+func (b *attrBroker) add(filter string, id uint32, h Handler) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.failSubscribe != nil {
+		if err := b.failSubscribe(filter); err != nil {
+			return err
+		}
+	}
+	for i := range b.subs {
+		if b.subs[i].filter == filter {
+			b.subs[i] = attrSub{filter: filter, id: id, h: h}
+			b.subbed = append(b.subbed, filter)
+			return nil
+		}
+	}
+	b.subs = append(b.subs, attrSub{filter: filter, id: id, h: h})
+	b.subbed = append(b.subbed, filter)
+	return nil
+}
+
+func (b *attrBroker) Unsubscribe(_ context.Context, filter string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	kept := b.subs[:0]
+	for _, s := range b.subs {
+		if s.filter != filter {
+			kept = append(kept, s)
+		}
+	}
+	b.subs = kept
+	return nil
+}
+
+// deliver drives one inbound message through both fan-outs and returns the
+// number of copies the broker produced.
+func (b *attrBroker) deliver(topic string, payload []byte, retained bool) int {
+	return b.fanout(topic, payload, retained)
+}
+
+func (b *attrBroker) fanout(topic string, payload []byte, retained bool) (copies int) {
+	b.mu.Lock()
+	match := make([]attrSub, 0, len(b.subs))
+	for _, s := range b.subs {
+		if MatchFilter(s.filter, topic) {
+			match = append(match, s)
+		}
+	}
+	b.mu.Unlock()
+	for _, m := range match {
+		// One copy per matching subscription. A stamped copy reaches the
+		// subscription its identifier names and no other; an unstamped one
+		// is re-matched against every filter, which is all a v3.1.1 link
+		// or an identifier-less subscription offers.
+		targets := match
+		if m.id != 0 {
+			targets = []attrSub{m}
+		}
+		for _, t := range targets {
+			t.h(topic, payload, retained)
+		}
+	}
+	return len(match)
+}
+
+// drop forgets every subscription without telling the router — a reconnect
+// against a broker that did not keep the session.
+func (b *attrBroker) drop() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.subs = nil
+}
+
+// idOf reports the identifier the broker holds for filter, or 0.
+func (b *attrBroker) idOf(filter string) uint32 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, s := range b.subs {
+		if s.filter == filter {
+			return s.id
+		}
+	}
+	return 0
+}
+
+func (b *attrBroker) liveFilters() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, 0, len(b.subs))
+	for _, s := range b.subs {
+		out = append(out, s.filter)
+	}
+	return sorted(out)
+}
+
+// TestCommandRouterAcceptsAnOrderedOverlapWhenDeliveriesAreAttributable is
+// the point of the whole feature: the pair that held v0.27.0's release —
+// a general command shape plus a special case for one parameter name — is
+// registerable again, and one published message still runs exactly one
+// handler.
+//
+// The broker really does make two copies (asserted, because a fixture that
+// made one would pass this test while modelling nothing), and the router
+// really does drop one of them.
+func TestCommandRouterAcceptsAnOrderedOverlapWhenDeliveriesAreAttributable(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/+/+/week_profile/set", specific.handle); err != nil {
+		t.Fatalf("an ordered overlap must be accepted on an attributing transport: %v", err)
+	}
+	if !r.Attributed() {
+		t.Fatal("the router accepted an overlap without switching to attributed delivery")
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	if n := b.deliver("gh/ccu/HmIP/0001:1/week_profile/set", []byte("P2"), false); n != 2 {
+		t.Fatalf("broker fanned out to %d subscriptions, want 2 — one copy per matching subscription", n)
+	}
+	if n := b.deliver("gh/ccu/HmIP/0001:1/LEVEL/set", []byte("1"), false); n != 1 {
+		t.Fatalf("plain data-point topic hit %d subscriptions, want 1", n)
+	}
+	r.WaitIdle()
+
+	got := specific.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("the specific route ran %d times, want exactly one per published message", len(got))
+	}
+	if got[0].Filter != "gh/+/+/+/week_profile/set" {
+		t.Errorf("specific handler saw Filter %q", got[0].Filter)
+	}
+	gen := generic.snapshot()
+	if len(gen) != 1 {
+		t.Fatalf("the general route ran %d times, want 1 — only the topic the specific route does not claim",
+			len(gen))
+	}
+	if gen[0].Wildcards[3] != "LEVEL" {
+		t.Errorf("the general route was handed %q, want the topic the specific route does not claim",
+			gen[0].Topic)
+	}
+}
+
+// TestCommandRouterRefusesAnOverlapWithoutAttribution pins that the v3.1.1
+// answer is unchanged and says why. A transport that cannot attribute a
+// delivery gets exactly v0.27.0's refusal — visible at the composition
+// root — rather than an acceptance that double-runs a handler where nothing
+// can see it.
+func TestCommandRouterRefusesAnOverlapWithoutAttribution(t *testing.T) {
+	t.Parallel()
+	r := quietRouter(t, newCmdBroker(), CommandConfig{})
+	if err := r.Handle("ccu/+/+/set", (&recorder{}).handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	err := r.Handle("ccu/+/PRESS_SHORT/set", (&recorder{}).handle)
+	if !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Fatalf("overlap accepted on a transport that cannot attribute (%v)", err)
+	}
+	if !errors.Is(err, ErrAttributionUnavailable) {
+		t.Errorf("the refusal must name the missing capability, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "ccu/+/+/set") ||
+		!strings.Contains(err.Error(), "ccu/+/PRESS_SHORT/set") {
+		t.Errorf("the refusal must name both filters, got %v", err)
+	}
+	if r.Attributed() {
+		t.Error("a refused overlap must not switch the router to attributed delivery")
+	}
+}
+
+// TestCommandRouterOverlapAcceptanceDependsOnSpecificity walks the shapes a
+// consumer writes against both kinds of transport. The two refusals have
+// different causes and only one of them is liftable: a pair with no
+// strictest claim (`a/+/c` against `a/b/+`, one literal each in different
+// levels) has no winner for `a/b/c` no matter who attributes the delivery.
+func TestCommandRouterOverlapAcceptanceDependsOnSpecificity(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b            string
+		attributedIsOK  bool
+		plainRefusesToo bool
+	}{
+		{"ccu/+/+/set", "ccu/+/PRESS_SHORT/set", true, true},
+		{"base/dev/set", "base/dev/set/#", true, true},
+		{"base/#", "base/dev/set", true, true},
+		{"base/#", "base/dev/#", true, true},
+		{"a/+/c", "a/b/+", false, true},
+		{"a/b/set", "a/c/set", true, false},
+		{"a/+/set", "a/+/get", true, false},
+	} {
+		attr := quietRouter(t, newAttrBroker(), CommandConfig{})
+		if err := attr.Handle(tc.a, (&recorder{}).handle); err != nil {
+			t.Fatalf("handle %q: %v", tc.a, err)
+		}
+		err := attr.Handle(tc.b, (&recorder{}).handle)
+		if ok := err == nil; ok != tc.attributedIsOK {
+			t.Errorf("attributing: Handle(%q) after %q = %v, want accepted=%v",
+				tc.b, tc.a, err, tc.attributedIsOK)
+		}
+		plain := quietRouter(t, newCmdBroker(), CommandConfig{})
+		if err := plain.Handle(tc.a, (&recorder{}).handle); err != nil {
+			t.Fatalf("handle %q: %v", tc.a, err)
+		}
+		err = plain.Handle(tc.b, (&recorder{}).handle)
+		if refused := errors.Is(err, ErrAmbiguousRoutes); refused != tc.plainRefusesToo {
+			t.Errorf("plain: Handle(%q) after %q = %v, want refused=%v",
+				tc.b, tc.a, err, tc.plainRefusesToo)
+		}
+	}
+}
+
+// TestCommandRouterStartFailsWhenAttributionIsClaimedButNotDelivered is the
+// case the design turns on: a v5-capable adapter that turns out to be
+// talking MQTT 3.1.1, where there is no property block to carry an
+// identifier.
+//
+// The capability is a claim, Start is the proof, and the proof failing must
+// fail the start — not fall back to an unattributed subscribe, which is the
+// accepted-overlap-plus-double-run combination that is strictly worse than
+// the refusal this feature lifts. Nothing may be left live and no handler
+// may run.
+func TestCommandRouterStartFailsWhenAttributionIsClaimedButNotDelivered(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	b.stamps = false // the link is v3.1.1
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/toggle/set", specific.handle); err != nil {
+		t.Fatalf("handle specific: %v", err)
+	}
+	err := r.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start succeeded on a transport that could not honour the identifier")
+	}
+	if !errors.Is(err, ErrAttributionUnavailable) {
+		t.Errorf("Start error must wrap ErrAttributionUnavailable, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "identifier") {
+		t.Errorf("Start error must name what was refused, got %v", err)
+	}
+	if live := b.liveFilters(); len(live) != 0 {
+		t.Errorf("a failed attributed start left subscriptions live: %v", live)
+	}
+	// And the fallback really is absent: nothing to deliver to, nothing run.
+	b.deliver("gh/dev/toggle/set", []byte("ON"), false)
+	r.WaitIdle()
+	if n := generic.count() + specific.count(); n != 0 {
+		t.Errorf("%d handlers ran after a failed start", n)
+	}
+}
+
+// TestCommandRouterSpecificityPrefersTheExactRoute is a regression test for
+// the inversion the deleted specificity code shipped: `a/b` lost to
+// `a/b/#`, so an exactly-registered route never fired. The shorter filter
+// is the stricter claim — it matches its own depth and nothing deeper.
+func TestCommandRouterSpecificityPrefersTheExactRoute(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	exact, deep := &recorder{}, &recorder{}
+	if err := r.Handle("base/dev/set/#", deep.handle); err != nil {
+		t.Fatalf("handle deep: %v", err)
+	}
+	if err := r.Handle("base/dev/set", exact.handle); err != nil {
+		t.Fatalf("handle exact: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	if n := b.deliver("base/dev/set", []byte("ON"), false); n != 2 {
+		t.Fatalf("broker fanned out to %d subscriptions, want 2", n)
+	}
+	r.WaitIdle()
+	if got := exact.count(); got != 1 {
+		t.Errorf("the exact route ran %d times, want 1 — it is the stricter claim on its own topic", got)
+	}
+	if got := deep.count(); got != 0 {
+		t.Errorf("the `#` route ran %d times on a topic the exact route claims, want 0", got)
+	}
+
+	if n := b.deliver("base/dev/set/extra", []byte("ON"), false); n != 1 {
+		t.Fatalf("deeper topic hit %d subscriptions, want 1", n)
+	}
+	r.WaitIdle()
+	if got := deep.count(); got != 1 {
+		t.Errorf("the `#` route ran %d times on the topic only it claims, want 1", got)
+	}
+}
+
+// TestCommandRouterStampsEveryRouteOnceAnOverlapIsAccepted pins the
+// all-or-nothing rule. An unstamped copy carries no identifier, so the
+// client re-matches it against every filter it holds and hands it to the
+// stamped overlapping routes as well — one un-stamped subscription
+// therefore restores the multiplication the identifiers were taken out for,
+// including through a route that overlaps nothing.
+func TestCommandRouterStampsEveryRouteOnceAnOverlapIsAccepted(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	for _, f := range []string{"gh/+/+/set", "gh/+/toggle/set", "other/#"} {
+		if err := r.Handle(f, (&recorder{}).handle); err != nil {
+			t.Fatalf("handle %q: %v", f, err)
+		}
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	seen := map[uint32]string{}
+	for _, f := range []string{"gh/+/+/set", "gh/+/toggle/set", "other/#"} {
+		id := r.SubscriptionID(f)
+		if id == 0 || id > MaxSubscriptionID {
+			t.Fatalf("route %q carries identifier %d, want one in 1..%d", f, id, MaxSubscriptionID)
+		}
+		if b.idOf(f) != id {
+			t.Errorf("route %q went out with identifier %d, the router believes %d", f, b.idOf(f), id)
+		}
+		if prev, dup := seen[id]; dup {
+			t.Fatalf("routes %q and %q share identifier %d", prev, f, id)
+		}
+		seen[id] = f
+	}
+}
+
+// TestCommandRouterIdentifiersDoNotCollideAcrossRouters pins the allocation
+// rule, which is process-wide and not per router.
+//
+// Per-router numbering would be the obvious choice and it is wrong: the
+// identifier space belongs to the session, so two routers over one client —
+// two consumers of this library in one binary, or a config reload building
+// a second router — would both number from 1 and each would receive the
+// other's commands.
+func TestCommandRouterIdentifiersDoNotCollideAcrossRouters(t *testing.T) {
+	t.Parallel()
+	seen := map[uint32]bool{}
+	for range 2 {
+		r := quietRouter(t, newAttrBroker(), CommandConfig{})
+		for _, f := range []string{"gh/+/+/set", "gh/+/toggle/set"} {
+			if err := r.Handle(f, (&recorder{}).handle); err != nil {
+				t.Fatalf("handle %q: %v", f, err)
+			}
+		}
+		if err := r.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		t.Cleanup(func() { _ = r.Stop(context.Background()) })
+		for _, f := range []string{"gh/+/+/set", "gh/+/toggle/set"} {
+			id := r.SubscriptionID(f)
+			if seen[id] {
+				t.Fatalf("identifier %d handed out twice; two routers in one process collide", id)
+			}
+			seen[id] = true
+		}
+	}
+}
+
+// TestCommandRouterDisjointRoutesCarryNoIdentifier is the additive half: a
+// consumer whose routes do not overlap gets exactly v0.27.0's wire, even on
+// a transport that could attribute. Stamping anyway would change every
+// existing consumer's SUBSCRIBE — including onto a broker that answers a
+// Subscription Identifier with a SUBACK failure, turning a Start that
+// worked into one that does not.
+func TestCommandRouterDisjointRoutesCarryNoIdentifier(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	for _, f := range []string{"gh/+/set", "gh/+/get"} {
+		if err := r.Handle(f, (&recorder{}).handle); err != nil {
+			t.Fatalf("handle %q: %v", f, err)
+		}
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+	if r.Attributed() {
+		t.Error("a router with disjoint routes reported attributed delivery")
+	}
+	for _, f := range []string{"gh/+/set", "gh/+/get"} {
+		if id := r.SubscriptionID(f); id != 0 {
+			t.Errorf("disjoint route %q was stamped with identifier %d", f, id)
+		}
+		if id := b.idOf(f); id != 0 {
+			t.Errorf("disjoint route %q went on the wire with identifier %d", f, id)
+		}
+	}
+}
+
+// TestCommandRouterResubscribeKeepsTheIdentifier pins that a replay carries
+// the identifier it was registered under. A broker holds the identifier as
+// part of the subscription and forgets it with the session, so a replay
+// under a fresh one would leave the router attributing to a subscription
+// that no longer exists — attribution silently working before a drop and
+// silently not after it.
+func TestCommandRouterResubscribeKeepsTheIdentifier(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/toggle/set", specific.handle); err != nil {
+		t.Fatalf("handle specific: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+	before := map[string]uint32{
+		"gh/+/+/set":      r.SubscriptionID("gh/+/+/set"),
+		"gh/+/toggle/set": r.SubscriptionID("gh/+/toggle/set"),
+	}
+
+	b.drop() // a reconnect against a broker that did not keep the session
+	if err := r.Resubscribe(context.Background()); err != nil {
+		t.Fatalf("resubscribe: %v", err)
+	}
+	for f, id := range before {
+		if got := b.idOf(f); got != id {
+			t.Errorf("route %q replayed under identifier %d, was %d", f, got, id)
+		}
+	}
+
+	// And attribution still holds after the replay.
+	if n := b.deliver("gh/dev/toggle/set", []byte("ON"), false); n != 2 {
+		t.Fatalf("broker fanned out to %d subscriptions after the replay, want 2", n)
+	}
+	r.WaitIdle()
+	if got := specific.count(); got != 1 {
+		t.Errorf("the specific route ran %d times after a reconnect, want 1", got)
+	}
+	if got := generic.count(); got != 0 {
+		t.Errorf("the general route ran %d times on a topic the specific route claims, want 0", got)
+	}
+}
+
+// TestCompareSpecificity is the ordering itself, including the inversion
+// the deleted version shipped (`a/b` losing to `a/b/#`) and the pairs that
+// have no winner at all.
+func TestCompareSpecificity(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		a, b string
+		cmp  int
+		ok   bool
+	}{
+		{"ccu/+/PRESS_SHORT/set", "ccu/+/+/set", 1, true},
+		{"a/b", "a/b/#", 1, true},
+		{"a/b/c", "a/#", 1, true},
+		{"a/b/#", "a/#", 1, true},
+		{"a/b/c", "a/+/c", 1, true},
+		{"a/+/c", "a/#", 1, true},
+		{"a/+/c", "a/b/+", 0, false},
+		{"a/+/c", "a/+/c", 0, true},
+		{"a/#", "a/b/c", -1, true},
+	} {
+		cmp, ok := compareSpecificity(strings.Split(tc.a, "/"), strings.Split(tc.b, "/"))
+		if cmp != tc.cmp || ok != tc.ok {
+			t.Errorf("compareSpecificity(%q, %q) = %d, %v; want %d, %v",
+				tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
+		}
 	}
 }

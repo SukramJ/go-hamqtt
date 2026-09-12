@@ -156,6 +156,27 @@ _ = router.Handle("daikin/+/+/+/set", func(ctx context.Context, cmd publisher.Co
 })
 ```
 
+Command filters must not overlap unless the transport can say which
+subscription a delivery arrived for. A broker sends one copy per matching
+subscription, so a client that re-matches each copy against its whole filter
+list runs a handler twice per published message — measured against Mosquitto
+2.1.2 on both dialects, with nothing in any log. `gomqtt.Transport`
+implements `publisher.AttributingSubscriber`, which subscribes with an MQTT
+5.0 Subscription Identifier and lets the router accept a general shape
+alongside a stricter special case:
+
+```go
+_ = router.Handle("daikin/+/+/+/set", generic)            // the shape
+_ = router.Handle("daikin/+/+/fan_mode/set", fanModeOnly) // wins its topics
+```
+
+Exactly one handler still runs per message. On MQTT 3.1.1 there is no
+property block to carry an identifier, so the pair is refused at
+registration with `ErrAmbiguousRoutes` — and if the link turns out to be
+v3.1.1 only after the routes were accepted, `Start` fails with
+`ErrAttributionUnavailable` rather than falling back to a delivery it cannot
+attribute.
+
 Boot, in this order — availability first so nothing is briefly claimed
 available on stale data, discovery before state, the sweep last:
 

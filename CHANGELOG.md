@@ -3,6 +3,142 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.28.0] - 2026-09-12
+
+Overlapping command routes are registerable again — on a transport that
+can prove a delivery belongs to one subscription, and only there. v0.27.0
+refused every overlap, which was the right fix and a real cost: a
+consumer wanting a special case for one parameter name could not state
+it, and the measured consumer's own workaround for that collision is a
+hand-maintained list of reserved segments inside its general handler.
+MQTT 5.0 Subscription Identifiers are the missing information, and
+go-mqtt v1.5.0 — cut for this — is the first release that lets a caller
+set one.
+
+The MQTT 3.1.1 refusal stands, unchanged and deliberately. That dialect
+has no property block, so there is nothing to carry an identifier; a
+router that accepted overlaps and then quietly double-ran handlers there
+would be strictly worse than the refusal, because the refusal is visible
+at the composition root and the doubled write is visible nowhere.
+
+### Added
+
+- **`publisher.AttributingSubscriber`** — the optional `Transport`
+  capability that subscribes with a Subscription Identifier
+  (§3.8.2.1.2), so the broker stamps every message it forwards for that
+  subscription and the client delivers it to that subscription's handler
+  alone. `SubscribeAttributed(ctx, filter, qos, id, handler) error`, the
+  same optional-interface shape as `NoLocalSubscriber`.
+
+  What it buys: `ccu/+/+/set` together with `ccu/+/PRESS_SHORT/set` is
+  accepted, and the more specific route wins the topics it claims. That
+  exact pair ran one message's handler twice against Mosquitto 2.1.2 on
+  both dialects — a toggle toggling twice, a relay pulse firing twice,
+  with nothing in any log — because two fan-outs compose: the broker
+  sends one copy per matching subscription (§3.3.4) and a client that
+  re-matches each copy against its whole filter list then runs every
+  matching handler per copy. Each copy is now attributable, so the
+  router drops the copies that arrived for a route a more specific one
+  outranks. **Exactly one handler still runs per published message**,
+  which is the invariant the type has always promised.
+
+  **A claimed capability is not a demonstrated one**, and the router
+  treats the two differently. Implementing the interface is permission
+  to *accept* an overlap; `Start` is where it is *proved*. Every route
+  goes out through `SubscribeAttributed`, and a transport that cannot
+  honour the identifier must return an error — which fails `Start` with
+  `ErrAttributionUnavailable` rather than retrying without it. That is
+  the case to think hardest about: a v5-capable adapter that turns out
+  to be talking MQTT 3.1.1. The shipped adapter behaves that way
+  because go-mqtt does, refusing `WithSubscriptionID` on a v3.1.1 link
+  instead of dropping it, and surfacing a broker's "Subscription
+  Identifiers not supported" as a SUBACK failure. One residual hazard
+  cannot be closed from here and is documented on the interface: a
+  transport that implements it, returns `nil`, and does not actually
+  stamp reproduces the multiplication.
+
+- **`publisher.ErrAttributionUnavailable`** — the sentinel for both
+  halves of that story. `Handle` wraps it alongside `ErrAmbiguousRoutes`
+  when the transport offers no attribution at all (a composition
+  mistake, and the v0.27.0 answer with a reason attached), and `Start`
+  returns it when a transport that offered attribution could not
+  deliver it.
+
+- **`publisher.MaxSubscriptionID`** (268435455),
+  **`CommandRouter.Attributed()`** and
+  **`CommandRouter.SubscriptionID(filter)`**.
+
+  Identifiers are **the router's to assign**, never the consumer's, and
+  the allocation rule is process-wide rather than per router: a counter
+  starting at 1, shared by every router in the binary. Per-router
+  numbering is the obvious choice and it is wrong — the identifier space
+  belongs to the MQTT session, so two routers over one client (two
+  consumers of this library in one process, or a config reload building
+  a second router) would both number from 1 and each would then receive
+  the other's commands. Exhaustion is an error, not a wrap. The
+  accessors exist for the one caveat that rule cannot cover: a consumer
+  stamping subscriptions of its own on the same client must stay out of
+  the way, which means allocating downward from `MaxSubscriptionID` and
+  being able to check its work. `Attributed()` is the boot-log and
+  conformance answer to "is this router relying on attribution", which
+  is the difference between a `Start` that can fail on dialect grounds
+  and one that cannot.
+
+- **`gomqtt.Transport` implements `publisher.AttributingSubscriber`**,
+  compile-asserted, passing `mqtt.WithSubscriptionID` together with
+  `mqtt.WithNoLocal` — both, because an identifier is v5-only, so a call
+  that reaches there is on a link where No Local is available too, and
+  the router calls the attributed form *instead of* `SubscribeNoLocal`
+  rather than as well as it. Dropping it would silently reopen the echo
+  class that option exists to close.
+
+### Changed
+
+- **`Handle` accepts an overlap only when one filter is strictly more
+  specific than the other.** `ccu/+/+/set` against
+  `ccu/+/PRESS_SHORT/set` qualifies; `a/+/c` against `a/b/+` does not —
+  one literal each, in different levels, and no principled winner for
+  `a/b/c` — and stays refused with `ErrAmbiguousRoutes` on every
+  transport. Attribution says which subscription a copy arrived for; it
+  does not say which of two equally-strong claims a consumer meant.
+
+  The ordering is a **dominance test over per-level ranks** (`#` and
+  everything after it loosest, then `+`, then a literal, then past the
+  last level of a filter that does not end in `#`), not a score: a score
+  has to price a literal in one level against a literal in another and
+  there is no defensible exchange rate. Dominance is transitive, so the
+  routes matching one topic form a chain with one maximum.
+
+  It is deliberately **not** the specificity machinery v0.27.0 deleted.
+  That one picked a winner per delivered *copy* and then ran the
+  winner's handler for each copy, which is how one command ran its
+  handler N times; this one answers "which route owns this topic", once
+  per topic, while the *copy* is decided by comparing that winner
+  against the subscription the copy actually arrived for. It also fixes
+  an inversion the deleted version shipped, which a review had found and
+  which is now a regression test: `a/b` lost to `a/b/#`, so an
+  exactly-registered route never fired.
+
+- **Accepting one overlap makes every route carry an identifier**,
+  including routes that overlap nothing. An unstamped copy carries no
+  identifier, so the client falls back to re-matching it against every
+  filter it holds — which hands it to the stamped overlapping routes as
+  well and restores the multiplication the identifiers were taken out
+  for. All-or-nothing per router, and a router that accepted no overlap
+  stamps nothing at all: a consumer with disjoint routes is on exactly
+  v0.27.0's wire, which also keeps a broker that answers an identifier
+  with a SUBACK failure from turning a working `Start` into a failing
+  one.
+
+- **`Route` and `Claims` report the route that would actually run** —
+  the most specific match, which with disjoint routes is the only match
+  and therefore unchanged. Identifiers are replayed with their filters
+  on `Resubscribe`, because a broker holds one as part of the
+  subscription and forgets it with the session.
+
+- **`go-mqtt` moves to v1.5.0**, which is where `WithSubscriptionID`
+  lives.
+
 ## [0.27.0] - 2026-09-12
 
 Three gaps the ADR 0070 phase-5 pilot measurement found, all of the
