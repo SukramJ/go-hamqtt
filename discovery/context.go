@@ -107,6 +107,14 @@ func deviceSlot(dev *model.Device, e model.Entity) model.Slot {
 	s := model.Slot{Address: dev.UID()}
 	if binds := e.Bindings(); len(binds) > 0 {
 		s.Scope = binds[0].Slot.Scope
+		// The channel travels with the scope. A consumer whose availability
+		// is per channel rather than per device — one measured plane
+		// publishes it per alarm zone — could otherwise not reach its own
+		// topic from LevelDevice however the slot was filled, short of
+		// smuggling the segment into Scope, which inverts what Scope means.
+		// A Layout that does not want it ignores it, exactly as it ignores
+		// Bucket and Path.
+		s.Channel = binds[0].Slot.Channel
 	}
 	return s
 }

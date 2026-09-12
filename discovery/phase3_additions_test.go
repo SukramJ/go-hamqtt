@@ -5,6 +5,7 @@ package discovery_test
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -110,11 +111,17 @@ func TestNodeIDAndIdentifierCanDiffer(t *testing.T) {
 	}
 }
 
-// TestRenderComponentCarriesTheFrameAndNoPlatform. Five of the six consuming
-// projects publish the per-entity form, and the first full consumer cannot
-// switch: its retained configs are on brokers and Home Assistant refuses a
-// bundle while a per-entity config for the same entity is still retained.
-func TestRenderComponentCarriesTheFrameAndNoPlatform(t *testing.T) {
+// TestRenderComponentCarriesTheFrame. Five of the six consuming projects
+// publish the per-entity form, and the first full consumer cannot switch:
+// its retained configs are on brokers and Home Assistant refuses a bundle
+// while a per-entity config for the same entity is still retained.
+//
+// The platform stays on the struct and leaves the bytes. Both are needed:
+// a per-entity consumer reads it to name the topic segment, and Home
+// Assistant declares the key on no platform. Clearing it here made three
+// measured consumers set it again immediately — a hatch whose only job was
+// to undo the pipeline.
+func TestRenderComponentCarriesTheFrame(t *testing.T) {
 	t.Parallel()
 
 	dev := phase3Device()
@@ -123,10 +130,20 @@ func TestRenderComponentCarriesTheFrameAndNoPlatform(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderComponent: %v", err)
 	}
-	body := phase3Body(t, comp)
+	if comp.Platform != hacatalog.PlatformSensor {
+		t.Errorf("platform = %q, want it kept for the caller's topic", comp.Platform)
+	}
 
+	raw, err := comp.EntityJSON()
+	if err != nil {
+		t.Fatalf("EntityJSON: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
 	if _, has := body["platform"]; has {
-		t.Error("the per-entity form carries a platform its topic already states")
+		t.Error("the per-entity bytes carry a platform the topic already states")
 	}
 	devBlock, _ := body["device"].(map[string]any)
 	if devBlock == nil || devBlock["name"] != "Thermostat" {
@@ -151,6 +168,30 @@ func TestRenderComponentRefusesADeviceWithNoIdentity(t *testing.T) {
 		t.Error("a device with no identity was rendered")
 	}
 }
+
+// TestAvailabilityCarriesTheChannelToo: a consumer whose availability is per
+// channel rather than per device — one measured plane publishes it per alarm
+// zone — could not otherwise reach its own topic from LevelDevice.
+func TestAvailabilityCarriesTheChannelToo(t *testing.T) {
+	t.Parallel()
+
+	e := phase3Entity()
+	e.Description.Availability = model.Availability{
+		Levels: []model.AvailabilityLevel{model.LevelDevice},
+	}
+	entries := discovery.StdContext{
+		Layout: channelLayout{}, Namespace: "",
+	}.Availability(phase3Device(), e)
+	if len(entries) != 1 || entries[0].Topic != "openccu-loom_0001abc/1" {
+		t.Errorf("entries = %+v, want the channel carried through", entries)
+	}
+}
+
+// channelLayout reports the segments a device-level availability call
+// received, so the test can see what reached it.
+type channelLayout struct{ topic.Default }
+
+func (channelLayout) Availability(s model.Slot) string { return s.Address + "/" + s.Channel }
 
 // TestAvailabilityCarriesTheEntitysScope. The measurement found this the only
 // item no workaround could reach: a device availability topic inside a
@@ -246,4 +287,32 @@ func phase3Body(t *testing.T, c discovery.Component) map[string]any {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	return body
+}
+
+// TestDeviceFromInfoRoundTrips. A consumer in the middle of a migration
+// harvests its device block the old way and renders the new way, so the pair
+// has to be lossless in both directions or the fleet's identifiers move --
+// and Home Assistant keys the device registry on exactly those.
+func TestDeviceFromInfoRoundTrips(t *testing.T) {
+	t.Parallel()
+
+	want := discovery.DeviceInfo{
+		Identifiers:      []string{"ccu1_0001abc"},
+		Connections:      [][2]string{{"mac", "00:11:22:33:44:55"}},
+		Name:             "Living room thermostat",
+		Manufacturer:     "eQ-3",
+		Model:            "HmIP-eTRV-2",
+		ModelID:          "HmIP-eTRV-2",
+		SWVersion:        "1.4.2",
+		HWVersion:        "A",
+		SerialNumber:     "0001ABC",
+		SuggestedArea:    "Living room",
+		ConfigurationURL: "http://ccu/addons/loom",
+		ViaDevice:        "ccu1",
+	}
+
+	got := discovery.NewDeviceInfo(discovery.DeviceFromInfo(want), "en")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("round trip\n got %+v\nwant %+v", got, want)
+	}
 }
