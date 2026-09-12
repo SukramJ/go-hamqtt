@@ -3,6 +3,43 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.23.0] - 2026-09-12
+
+The three measured causes of avoidable escape hatches in the
+per-entity form. Measured by migrating five openccu-loom planes onto
+`discovery` and counting the hatches each needed: 40 in total, 11 of
+them avoidable, clustering on exactly these three.
+
+### Added
+
+- **`Component.EntityJSON`** — the per-entity encoding of a component:
+  the same object `MarshalJSON` produces, without `platform`.
+
+- **`DeviceFromInfo`** — the inverse of `NewDeviceInfo`. A consumer
+  migrating one plane at a time still harvests its device blocks the
+  old way and needs a `model.Device` to render the new way. Two
+  measured planes wrote this converter themselves, under different
+  names, before it existed.
+
+### Changed
+
+- **`RenderComponent` no longer clears `Platform`** (behavioural
+  break). It is the per-entity form's topic segment, so three measured
+  consumers set the field again immediately after the call — a hatch
+  whose only job was to undo the pipeline. The key still leaves the
+  payload, now in `Component.EntityJSON`, where Home Assistant's
+  `extra=REMOVE_EXTRA` schemas would otherwise drop it silently.
+  A consumer relying on the old behaviour publishes
+  `comp.EntityJSON()` instead of marshalling `comp`.
+
+- **A device-level availability slot now carries the channel.** A
+  consumer whose availability is per channel rather than per device —
+  one measured plane publishes it per alarm zone — could not reach its
+  own topic from `LevelDevice` however the slot was filled, short of
+  smuggling the segment into `Scope`, which inverts what `Scope`
+  means. A `topic.Layout` that does not want it ignores it, as it
+  already ignores `Bucket` and `Path`.
+
 ## [0.22.0] - 2026-09-12
 
 Everything a measured 147-rule reference table needs that `catalog`

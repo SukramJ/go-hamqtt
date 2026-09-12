@@ -419,10 +419,15 @@ func platformAccepts(p hacatalog.Platform) (map[string]bool, error) {
 // consumer: one retained document per device, updated atomically, instead of
 // one per entity each repeating the whole device block.
 //
-// `platform` is omitted. It is the bundle's discriminator, carried because a
-// component inside a document has no topic to say what it is; a per-entity
-// config says so in its topic, and Home Assistant declares the key on no
-// platform.
+// The returned component KEEPS its platform, and [Component.EntityJSON] is
+// what drops it from the bytes.
+//
+// Both are needed and they are not the same need: a per-entity consumer
+// reads the platform to name the topic segment it publishes under, and Home
+// Assistant declares the key on no platform and would drop it from the
+// payload. An earlier version cleared the field here, which made three
+// measured consumers set it again immediately afterwards — a hatch whose
+// only job was to undo the pipeline.
 func RenderComponent(ctx Context, dev *model.Device, e model.Entity, origin Origin) (Component, error) {
 	if dev == nil || !dev.Identity.Valid() {
 		return Component{}, fmt.Errorf("discovery: device has no identity")
@@ -436,8 +441,43 @@ func RenderComponent(ctx Context, dev *model.Device, e model.Entity, origin Orig
 	if origin.Name != "" {
 		comp.Origin = &origin
 	}
-	comp.Platform = ""
 	return comp, nil
+}
+
+// DeviceFromInfo is the inverse of [NewDeviceInfo]: a [model.Device] built
+// from a device block a consumer already had.
+//
+// It exists for the middle of a migration. A consumer moving one plane at a
+// time still harvests its device blocks the old way, and needs a
+// [model.Device] to render the new way; without this, each plane writes the
+// same converter under a different name — two measured planes did exactly
+// that before this existed.
+//
+// The identifier is taken verbatim, with no namespace, because that is how
+// an existing fleet's identifiers survive — see [model.Identifier.String].
+func DeviceFromInfo(info DeviceInfo) *model.Device {
+	dev := &model.Device{
+		Name:          model.L(info.Name),
+		Manufacturer:  info.Manufacturer,
+		Model:         info.Model,
+		ModelID:       info.ModelID,
+		SWVersion:     info.SWVersion,
+		HWVersion:     info.HWVersion,
+		SerialNumber:  info.SerialNumber,
+		SuggestedArea: info.SuggestedArea,
+		ConfigURL:     info.ConfigurationURL,
+	}
+	for _, id := range info.Identifiers {
+		dev.Identity.IDs = append(dev.Identity.IDs, model.Identifier{Value: id})
+	}
+	for _, c := range info.Connections {
+		dev.Identity.Connections = append(dev.Identity.Connections,
+			model.Connection{Type: c[0], Value: c[1]})
+	}
+	if info.ViaDevice != "" {
+		dev.Via = &model.Identity{IDs: []model.Identifier{{Value: info.ViaDevice}}}
+	}
+	return dev
 }
 
 // NewDeviceInfo builds the `device` block for a device.

@@ -205,6 +205,27 @@ func (c Component) MarshalJSON() ([]byte, error) {
 	return json.Marshal(merged)
 }
 
+// EntityJSON encodes the component for the per-entity discovery form: the
+// same object [Component.MarshalJSON] produces, without `platform`.
+//
+// The platform is the bundle's discriminator, carried because a component
+// inside a document has no topic to say what it is. A per-entity config says
+// so in its topic, and Home Assistant declares the key on no platform — so a
+// consumer on that form needs the field on the struct to address the topic
+// and needs it gone from the bytes.
+func (c Component) EntityJSON() ([]byte, error) {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, fmt.Errorf("discovery: re-read component: %w", err)
+	}
+	delete(body, "platform")
+	return json.Marshal(body)
+}
+
 // Bundle is the retained document published for one device.
 type Bundle struct {
 	// NodeID is the topic segment the bundle is published under. Not part of
