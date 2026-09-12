@@ -808,3 +808,44 @@ func TestEveryWriteHonoursTheCollisionGuard(t *testing.T) {
 		t.Errorf("ops = %d, want only the original publish", got)
 	}
 }
+
+// TestEvictPrefixFoldsCase is the porting trap the segment-boundary fix left
+// open: the reference implementation lower-cases the address it searches for,
+// and dropping that along with its substring search turned a mis-cased device
+// address into a silent no-op. (0, nil) is indistinguishable from "nothing to
+// clear", so a removed device's whole retained state stayed standing.
+func TestEvictPrefixFoldsCase(t *testing.T) {
+	t.Parallel()
+
+	f := newFake()
+	p := NewStatePublisher(f, StateConfig{})
+	ctx := context.Background()
+
+	const live = "ccu/ABC0001/1/values/TEMP"
+	if _, err := p.Publish(ctx, live, []byte("21.5")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := p.Publish(ctx, "ccu/ABC0001", []byte("x")); err != nil {
+		t.Fatalf("publish the bare address: %v", err)
+	}
+
+	n, err := p.EvictPrefix(ctx, "ccu/abc0001")
+	if err != nil {
+		t.Fatalf("evict prefix: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("cleared = %d, want both topics of the mis-cased address", n)
+	}
+	if got := p.Published(); len(got) != 0 {
+		t.Fatalf("published = %v, want the device gone", got)
+	}
+
+	// Folding widens the match on case alone, never across the segment
+	// boundary: a sibling address that only shares a character prefix stays.
+	if _, err := p.Publish(ctx, "ccu/ABC00010/1/values/TEMP", []byte("9")); err != nil {
+		t.Fatalf("publish the sibling: %v", err)
+	}
+	if n, err = p.EvictPrefix(ctx, "ccu/abc0001"); err != nil || n != 0 {
+		t.Fatalf("EvictPrefix = %d, %v; want the sibling spared", n, err)
+	}
+}

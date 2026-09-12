@@ -436,6 +436,16 @@ func (p *StatePublisher) Evict(ctx context.Context, topics ...string) error {
 // whose address is a prefix of another's is not the failure, a device whose
 // address appears as some other device's channel name is.
 //
+// The comparison is case-insensitive, which is the half of that reference
+// behaviour worth keeping. MQTT topics are case-sensitive, so a literal
+// comparison is defensible in isolation — but the prefix a consumer passes is
+// a device address it read from a controller, and the addresses in this
+// family arrive in whichever case their source happened to use. A mis-cased
+// call returned (0, nil), which is indistinguishable from "nothing to clear",
+// and a removed device's whole retained state stayed standing with no error
+// anywhere. Over-matching is bounded by the segment boundary and by the
+// index: only topics this process itself published can be reached at all.
+//
 // Guarded like [StatePublisher.Evict]: a matched topic that falls inside the
 // consumer's own command subscriptions is reported as
 // [ErrStateCommandCollision] and left standing. The index cannot normally
@@ -454,7 +464,7 @@ func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, e
 	p.mu.Lock()
 	matched := make([]string, 0, len(p.published))
 	for t := range p.published {
-		if t == prefix || strings.HasPrefix(t, bounded) {
+		if strings.EqualFold(t, prefix) || hasFoldedPrefix(t, bounded) {
 			matched = append(matched, t)
 		}
 	}
@@ -482,6 +492,17 @@ func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, e
 		cleared++
 	}
 	return cleared, errors.Join(errs...)
+}
+
+// hasFoldedPrefix reports whether t starts with prefix, ignoring ASCII case.
+//
+// A folded [strings.HasPrefix]: comparing only the leading len(prefix) bytes
+// rather than lower-casing both whole strings, so an index of a few thousand
+// topics costs no allocation per candidate on a path a device removal walks
+// synchronously. [strings.EqualFold] folds Unicode too, which is more than
+// needed and never less.
+func hasFoldedPrefix(t, prefix string) bool {
+	return len(t) >= len(prefix) && strings.EqualFold(t[:len(prefix)], prefix)
 }
 
 // Republish re-sends every remembered state value and reports how many went
