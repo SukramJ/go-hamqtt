@@ -258,6 +258,17 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 		return Component{}, err
 	}
 
+	// `name: null` is a statement; an empty name is the absence of one — see
+	// [model.Description.NameNull]. It wins over whatever the name resolved
+	// to and clears it, so the payload carries the null alone instead of a
+	// null beside a literal nobody can see. Only the 30 platforms that
+	// declare `name` get it; on device_automation and tag it would be dropped
+	// in silence.
+	if desc.NameNull && accepts["name"] {
+		comp.Name = ""
+		comp.NameNull = true
+	}
+
 	// Bounds go to the plain keys only where the platform declares them:
 	// `min` and `max` exist on number and text, `step` on number alone.
 	// Climate spells them min_temp/max_temp/temp_step and water_heater

@@ -188,6 +188,39 @@ type Description struct {
 	// by the person who has to move it.
 	NameArgs map[string]string
 
+	// NameNull asks for `name: null` — the statement that this entity has no
+	// name of its own and is to be shown under the device's name alone.
+	//
+	// It is not the same as leaving Name and NameKey empty, and that is the
+	// whole point. Home Assistant's entity.py reads
+	// `config.get(CONF_NAME, UNDEFINED)`: an explicit null comes back as None
+	// and becomes the entity's name, while an absent key comes back UNDEFINED
+	// and makes Home Assistant derive one from the platform or the device
+	// class instead. An empty [Localized] is the absence of an opinion, so the
+	// render pipeline drops the key — which is the second of those two,
+	// never the first.
+	//
+	// Three measured discovery planes need the first and had to set
+	// [discovery.Component.NameNull] after rendering to get it: the notify
+	// plane, the channel-aggregate plane and the per-datapoint plane. Two of
+	// them wrote `comp.NameNull = comp.Name == ""`, re-deriving from the
+	// rendered component a decision their description had already made —
+	// downstream of the pipeline that exists to carry it.
+	//
+	// It wins over Name and NameKey, for the same reason
+	// [discovery.Component.NameNull] wins over Fields and Extra: an entity
+	// that says it has no name of its own has none, whatever a catalogue
+	// default left in Name beforehand. The other precedence would make the
+	// statement unreachable from an [Enricher], which is exactly where an
+	// operator rule saying "show the device name alone" is written.
+	//
+	// A bool rather than a sentinel string, because the zero value has to go
+	// on meaning "no opinion" and false already does. It is projected only
+	// onto the platforms whose schema declares `name` — 30 of the 32, all but
+	// device_automation and tag — since Home Assistant drops an undeclared
+	// key without a word.
+	NameNull bool
+
 	// DeviceClass, StateClass and Unit are Home Assistant's measurement
 	// vocabulary. Their legal combinations are not free — see
 	// [hacatalog.Relations] — and [discovery.Validate] enforces them.
