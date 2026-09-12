@@ -294,6 +294,16 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 		comp.Optimistic = desc.Optimistic
 	}
 
+	// `command_template` is declared by 16 of the 32 platforms — notify,
+	// select, number, text, switch and siren among them, but not climate,
+	// cover, light or water_heater, which spell a template per role. So it is
+	// description vocabulary with a platform gate, like `optimistic`, rather
+	// than a Builder's job: two measured planes opened a builder for this one
+	// key alone.
+	if accepts["command_template"] {
+		comp.CommandTemplate = desc.CommandTemplate
+	}
+
 	// The json-attributes pair is accepted by 30 of the 32 platforms (all
 	// but device_automation and tag), the same bar the other
 	// description-level keys meet. The template only means anything beside

@@ -298,6 +298,33 @@ type Description struct {
 	// `model` depend on `topic` — the rule the package layout enforces.
 	ValueTemplate string
 
+	// CommandTemplate is the Jinja template Home Assistant renders on the way
+	// out, turning the value a user picked into the payload the device
+	// expects.
+	//
+	// It is the counterpart of ValueTemplate and existed only on
+	// [discovery.Component], which is why the per-datapoint plane of the
+	// first full consumer sets it from a [discovery.Builder] — a builder
+	// written for one key, on entities that need nothing else platform-
+	// specific. Its notify plane does the same for one constant string. A
+	// builder is the right place for a key only a platform knows how to
+	// spell; this one is declared by 16 different platforms, which is the bar
+	// the other description-level keys already meet.
+	//
+	// It is projected only onto those 16 — notify, select, number, text,
+	// switch, siren, fan, valve and the rest — and never onto the 16 that do
+	// not declare it, climate, cover, light and water_heater among them.
+	// Those spell a template per role (`temperature_command_template`,
+	// `preset_mode_command_template`), which only a Builder filling the
+	// platform's own Fields struct can name.
+	//
+	// The projection is not gated on there being a command topic beside it.
+	// A [discovery.Builder] runs after this stage and is often the thing that
+	// names the topic, so gating here would drop the template for exactly the
+	// entities that set both. A template with no topic is inert; it is the
+	// unpaired topic that would do harm.
+	CommandTemplate string
+
 	// Multiplier scales the datapoint's value before it is published, and
 	// the bounds along with it. Nil means no scaling, which is not the same
 	// as 1.0 — a rule that says nothing about scale and one that pins it to
