@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
@@ -42,19 +43,17 @@ var (
 	ErrDuplicateRoute = errors.New("publisher: duplicate command route")
 
 	// ErrAmbiguousRoutes is returned when two registered filters can both
-	// match some topic — any overlap, not only one no specificity rule
-	// could order.
+	// match some topic and the router cannot tell the resulting deliveries
+	// apart.
 	//
-	// The router cannot resolve an overlap after the fact, because by the
-	// time a message reaches it the overlap has already multiplied it.
-	// Two fan-outs compose: the broker sends one copy per matching
-	// subscription (MQTT 3.1.1 §4.7.3 / 5.0 §3.3.4 permit it and both
-	// Mosquitto and EMQX do it), and go-mqtt then re-matches each arriving
-	// copy against its whole local filter list and calls every matching
-	// handler, never correlating a copy with the subscription it arrived
-	// on. N overlapping routes therefore turn one message into N
-	// indistinguishable dispatches, and nothing the router can see tells
-	// them apart from N genuine publishes on the same topic.
+	// An overlap is dangerous because by the time a message reaches the
+	// router it has already been multiplied twice over. The broker sends
+	// one copy per matching subscription (MQTT 3.1.1 §4.7.3 / 5.0 §3.3.4
+	// permit it and both Mosquitto and EMQX do it), and a client that
+	// decides delivery by re-matching each arriving copy against its whole
+	// local filter list then calls every matching handler for every copy.
+	// N overlapping routes turn one message into N x N dispatches, of
+	// which N reach each handler.
 	//
 	// Measured against Mosquitto 2.1.2, on 3.1.1 and 5.0 alike and with
 	// two separate clients so No-Local is not in play: the routes
@@ -63,10 +62,43 @@ var (
 	// message into two handler runs. A toggle toggles twice, a relay pulse
 	// fires twice, a dimmer step doubles, and nothing logs anything.
 	//
-	// Refusing the pair at registration is the only resolution that holds
-	// on both protocol versions; [CommandRouter.Handle] documents what it
-	// costs and what to do instead.
+	// Two overlaps are refused, and they are refused for different
+	// reasons:
+	//
+	//   - Any overlap at all, when the transport cannot attribute a
+	//     delivery to the subscription it arrived for. That refusal is
+	//     v0.27.0's, it is what an MQTT 3.1.1 link is stuck with, and the
+	//     error additionally wraps [ErrAttributionUnavailable] so a
+	//     composition root can tell the two apart.
+	//   - An overlap no specificity rule can order, even on an attributing
+	//     transport: `a/+/c` against `a/b/+` both claim `a/b/c`, one by a
+	//     literal in the second level and the other by a literal in the
+	//     third, and there is no principled winner. Attribution says which
+	//     subscription a copy arrived for; it does not say which of two
+	//     equally-strong claims the consumer meant.
+	//
+	// See [AttributingSubscriber] for what the first refusal buys back and
+	// [CommandRouter.Handle] for what to do instead when it stands.
 	ErrAmbiguousRoutes = errors.New("publisher: ambiguous command routes")
+
+	// ErrAttributionUnavailable is returned when overlapping routes need
+	// the transport to say which subscription a delivery arrived for and
+	// it cannot.
+	//
+	// It appears in two places, and the second is the one that matters.
+	// [CommandRouter.Handle] wraps it alongside [ErrAmbiguousRoutes] when
+	// the transport offers no attribution at all, which is a composition
+	// mistake. [CommandRouter.Start] returns it when a transport that
+	// offers attribution could not actually deliver it — the case being a
+	// v5-capable adapter that turns out to be talking MQTT 3.1.1, where
+	// there is no property block to carry a Subscription Identifier.
+	//
+	// Start fails rather than subscribing without identifiers, because the
+	// fallback is the measured defect: the routes were accepted on the
+	// promise of attribution, and unattributed delivery of an accepted
+	// overlap runs a handler twice per published message with nothing in
+	// any log. A refused Start is visible; a doubled write is not.
+	ErrAttributionUnavailable = errors.New("publisher: transport cannot attribute deliveries to subscriptions")
 
 	// ErrInvalidFilter is returned for a filter MQTT does not permit —
 	// empty, or with a wildcard that is not a whole level.
@@ -207,6 +239,94 @@ type NoLocalSubscriber interface {
 	SubscribeNoLocal(ctx context.Context, filter string, qos byte, handler Handler) error
 }
 
+// MaxSubscriptionID is the largest MQTT 5.0 Subscription Identifier
+// (§3.8.2.1.2): a four-byte variable-length integer's range, with zero
+// reserved for "no identifier".
+//
+// Exported because a consumer that stamps subscriptions of its own on the
+// same client has to stay out of the router's way, and cannot do that
+// without knowing the space. The router allocates upward from 1 (see
+// [CommandRouter.SubscriptionID]), so a consumer with its own identifiers
+// should allocate downward from here.
+const MaxSubscriptionID = 268435455
+
+// nextSubscriptionID hands out Subscription Identifiers for every router in
+// the process, not per router.
+//
+// Per-router numbering would be the obvious choice and it is wrong. The
+// identifier space belongs to the MQTT *session*, not to the router: two
+// routers sharing one client — two consumers of this library in one binary,
+// or one consumer that reloads its config and builds a second router over
+// the same connection — would both number their routes from 1, and the
+// client would then deliver a message stamped for the first router's route
+// to the second router's route of the same number. A process-wide counter
+// makes that collision unreachable without either router knowing the other
+// exists.
+//
+// It is never reset. 268 million identifiers at eight routes per router is
+// 33 million routers, which no process reaches; exhaustion is nevertheless
+// an error rather than a wrap, because a wrapped identifier is the
+// collision this counter exists to prevent.
+var nextSubscriptionID atomic.Uint32
+
+// AttributingSubscriber is the optional [Transport] capability that makes
+// overlapping command routes safe: it subscribes with an MQTT 5.0
+// Subscription Identifier (§3.8.2.1.2), so the broker stamps every message
+// it forwards for that subscription and the client can deliver it to that
+// subscription's handler alone.
+//
+// It exists because the refusal it lifts had a real price. A broker sends
+// one copy of a PUBLISH per matching subscription, and a client that
+// re-matches each copy against its whole filter list runs every matching
+// handler per copy — so `ccu/+/+/set` together with `ccu/+/PRESS_SHORT/set`
+// ran one message's handler twice against Mosquitto 2.1.2 on both dialects.
+// [ErrAmbiguousRoutes] refuses that pair outright, which left a consumer
+// with a special case for one parameter name unable to register it: the
+// measured consumer had patched the same collision with a hand-maintained
+// list of reserved segments inside its general handler. An identifier is
+// the missing information, and go-mqtt v1.5.0 is the first release that
+// lets a caller set one.
+//
+// # A claimed capability is not a demonstrated one
+//
+// Implementing this interface is a claim about the transport, and the claim
+// can be false at exactly the moment it matters: MQTT 3.1.1 has no property
+// block, so an adapter over a client that *can* stamp is still unable to
+// stamp on a v3.1.1 link. The router therefore treats the interface as
+// permission to accept an overlap and [CommandRouter.Start] as the proof:
+// every route goes out through SubscribeAttributed, and a transport that
+// cannot honour the identifier must return an error, which fails Start with
+// [ErrAttributionUnavailable]. The router never retries without the
+// identifier. A silent downgrade would leave the consumer with accepted
+// overlapping routes and unattributed delivery, which is strictly worse
+// than the refusal it replaced — the refusal is visible at the composition
+// root, the doubled write is visible nowhere.
+//
+// The shipped adapter behaves that way because go-mqtt does: it refuses
+// WithSubscriptionID on a v3.1.1 link rather than dropping it, and a broker
+// that answers the SUBSCRIBE with "Subscription Identifiers not supported"
+// surfaces as a SUBACK failure. publisher/gomqtt compile-asserts this
+// interface. One residual hazard cannot be closed from here: a transport
+// that implements this, returns nil, and does not actually stamp reproduces
+// the multiplication. Do not implement it unless the identifier reaches the
+// wire and the delivery it comes back on reaches that subscription's
+// handler only.
+//
+// An implementation should also set MQTT 5.0's No Local — see
+// [NoLocalSubscriber] — because a transport that can stamp is on a v5 link
+// by construction, and a router in attributing mode calls this method
+// instead of SubscribeNoLocal rather than as well.
+type AttributingSubscriber interface {
+	// SubscribeAttributed is [Transport.Subscribe] with the MQTT 5.0
+	// Subscription Identifier id attached.
+	//
+	// id is in 1..[MaxSubscriptionID] and is allocated by the router.
+	// handler must be called for a message the broker forwarded for THIS
+	// subscription and for no other — that is the whole contract, and an
+	// implementation that cannot keep it must return an error instead.
+	SubscribeAttributed(ctx context.Context, filter string, qos byte, id uint32, handler Handler) error
+}
+
 // CommandConfig parameterises a [CommandRouter]. The zero value is usable.
 type CommandConfig struct {
 	// QoS applies to every subscription the router registers. [QoSUnset] —
@@ -266,6 +386,12 @@ type route struct {
 	filter  string
 	parts   []string
 	handler CommandHandler
+	// subID is the Subscription Identifier this route's subscription
+	// carries, or 0 for an unattributed one. Assigned by Start and kept
+	// across a Resubscribe, because a broker holds the identifier as part
+	// of the subscription and a replay under a different one would leave
+	// the router attributing to a subscription that no longer exists.
+	subID uint32
 }
 
 // CommandRouter subscribes the command topics a consumer's discovery configs
@@ -279,15 +405,19 @@ type route struct {
 // Three properties are worth stating before the lock order, because they are
 // what the type is for:
 //
-//   - Exactly one handler runs per message, and the router buys that by
-//     refusing overlapping routes outright — see [ErrAmbiguousRoutes] for
-//     why nothing weaker works. A broker fans a message out to every
-//     matching subscription and go-mqtt then calls every locally matching
-//     handler per copy, so the measured consumer dispatched a profile
-//     selection both to the profile handler and, as a parameter write named
-//     `week_profile`, to the data-point handler. It patched that with a
-//     hand-maintained list of reserved segments; this type makes the route
-//     pair that causes it unregisterable.
+//   - Exactly one handler runs per message, and how the router buys that
+//     depends on the transport. A broker fans a message out to every
+//     matching subscription and a client that re-matches each copy against
+//     its whole filter list then calls every matching handler per copy, so
+//     the measured consumer dispatched a profile selection both to the
+//     profile handler and, as a parameter write named `week_profile`, to
+//     the data-point handler. It patched that with a hand-maintained list
+//     of reserved segments. On a plain transport this type makes the route
+//     pair unregisterable instead — see [ErrAmbiguousRoutes]. On one
+//     implementing [AttributingSubscriber] it accepts the pair, subscribes
+//     with a Subscription Identifier per route, and drops the copies that
+//     arrived for a route a more specific one outranks — so the profile
+//     route wins `week_profile` and the data-point route never sees it.
 //
 //     One overlap remains outside the router's reach and is worth naming:
 //     the local fan-out is the whole go-mqtt client's, so a SECOND
@@ -336,6 +466,12 @@ type CommandRouter struct {
 	// at the composition root rather than a subscribe at a level nobody
 	// chose.
 	qos byte
+	// attributor is tr's [AttributingSubscriber] face, or nil. Resolved
+	// once, at construction, because [CommandRouter.Handle] decides whether
+	// an overlap may be accepted and a capability that appeared or vanished
+	// between two registrations would make that decision depend on call
+	// order.
+	attributor AttributingSubscriber
 
 	lifeMu sync.Mutex
 
@@ -343,6 +479,14 @@ type CommandRouter struct {
 	routes  []route
 	started bool
 	stopped bool
+	// attributed records that at least one overlapping pair was accepted,
+	// so every route must go out with an identifier. Every route, not only
+	// the overlapping ones: a copy forwarded for an UNSTAMPED subscription
+	// carries no identifier, so the client falls back to re-matching it
+	// against every filter it holds — which hands it to the stamped
+	// overlapping routes as well and restores the multiplication the
+	// identifiers were taken out for.
+	attributed bool
 	// pool is nil until Start and nil again after Stop, so a router that
 	// is built and abandoned owns no goroutines. See
 	// [NewCommandRouter].
@@ -379,12 +523,16 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CommandRouter{
+	r := &CommandRouter{
 		tr:  tr,
 		cfg: cfg,
 		log: logger,
 		qos: resolveQoS("publisher.CommandConfig.QoS", cfg.QoS, QoSAtLeastOnce),
 	}
+	if as, ok := tr.(AttributingSubscriber); ok {
+		r.attributor = as
+	}
+	return r
 }
 
 // Handle registers handler for filter. Call it for every route before
@@ -404,16 +552,17 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 //     entities is a real but survivable boot cost.
 //   - One wildcard per command shape, which is what the measured consumer
 //     does: thirteen filters covering every device it will ever see. One
-//     SUBSCRIBE each and no per-entity bookkeeping, at the price this type
-//     charges loudly: the shapes must be pairwise disjoint. `ccu/+/+/set`
-//     together with `ccu/+/PRESS_SHORT/set` is refused with
-//     [ErrAmbiguousRoutes], because that exact pair ran one message's
-//     handler twice against Mosquitto 2.1.2. A consumer that wants a
-//     special case for one parameter name registers the general shape only
-//     and branches inside the handler on [Command.Wildcards] — the
-//     discrimination moves from the router to the handler, which is the
-//     whole cost, and it is a cost the previous specificity-based scheme
-//     only appeared to spare it.
+//     SUBSCRIBE each and no per-entity bookkeeping, at a price that depends
+//     on the transport. On one that cannot attribute a delivery the shapes
+//     must be pairwise disjoint: `ccu/+/+/set` together with
+//     `ccu/+/PRESS_SHORT/set` is refused with [ErrAmbiguousRoutes], because
+//     that exact pair ran one message's handler twice against Mosquitto
+//     2.1.2, and a consumer that wants a special case for one parameter
+//     name registers the general shape only and branches inside the handler
+//     on [Command.Wildcards]. On a transport implementing
+//     [AttributingSubscriber] that same pair is accepted and the more
+//     specific route wins the topics it claims, which is the special case
+//     the refusal cost — see below.
 //   - A single `<base>/#`. Never correct here: it subscribes the consumer
 //     to its own state plane, so every state publish comes back as a
 //     command.
@@ -423,12 +572,33 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 // impossible to miss: [CommandRouter.CheckDisjoint] fails loudly the first
 // time a state topic is run past it.
 //
-// Registration is rejected when filter is malformed, already registered, or
-// overlaps an existing route at all — see [ErrAmbiguousRoutes]. The overlap
-// test is structural rather than a comparison of the topics seen so far,
-// because the measured collision (a seven-level all-wildcard filter against
-// a seven-level filter with one literal) is invisible to any check that
-// waits for traffic to demonstrate it.
+// # Overlapping routes
+//
+// Registration is rejected when filter is malformed or already registered.
+// An overlap with an existing route is rejected too, unless BOTH of the
+// following hold:
+//
+//   - The transport implements [AttributingSubscriber], so a delivered
+//     message can be tied to the subscription it arrived for. Without that
+//     the router cannot tell one message's N copies from N genuine
+//     publishes, which is [ErrAmbiguousRoutes] in full.
+//   - One of the two filters is strictly more specific than the other, so
+//     the topics they both claim have a winner. `ccu/+/+/set` against
+//     `ccu/+/PRESS_SHORT/set` does; `a/+/c` against `a/b/+` does not, and
+//     stays refused on any transport.
+//
+// An accepted overlap changes nothing about the promise on [CommandRouter]:
+// each message still runs exactly one handler, the one registered on the
+// most specific route that matches it. The broker still sends one copy per
+// matching subscription, but each copy is now attributable, so the router
+// drops the copies that arrived for a route a more specific one outranks
+// rather than running their handlers. Accepting one overlap makes every
+// route carry an identifier — see [CommandRouter.SubscriptionID].
+//
+// The overlap test is structural rather than a comparison of the topics
+// seen so far, because the measured collision (a seven-level all-wildcard
+// filter against a seven-level filter with one literal) is invisible to any
+// check that waits for traffic to demonstrate it.
 func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if handler == nil {
 		return fmt.Errorf("%w: nil handler for %q", ErrInvalidFilter, filter)
@@ -443,19 +613,75 @@ func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if r.started {
 		return fmt.Errorf("%w: cannot register %q", ErrRouterStarted, filter)
 	}
+	overlaps := false
 	for i := range r.routes {
 		existing := r.routes[i]
 		if existing.filter == filter {
 			return fmt.Errorf("%w: %q", ErrDuplicateRoute, filter)
 		}
-		if filtersOverlap(existing.parts, parts) {
+		if !filtersOverlap(existing.parts, parts) {
+			continue
+		}
+		if r.attributor == nil {
 			return fmt.Errorf("%w: %q and %q both match some topic, so one message would run a handler twice; "+
-				"register the general shape only and branch inside the handler",
+				"register the general shape only and branch inside the handler, or supply a transport "+
+				"that can attribute a delivery to its subscription (%w)",
+				ErrAmbiguousRoutes, existing.filter, filter, ErrAttributionUnavailable)
+		}
+		if cmp, ok := compareSpecificity(existing.parts, parts); !ok || cmp == 0 {
+			return fmt.Errorf("%w: %q and %q both match some topic and neither is more specific, "+
+				"so attribution cannot say which one a shared topic belongs to; make one of them narrower",
 				ErrAmbiguousRoutes, existing.filter, filter)
 		}
+		overlaps = true
 	}
 	r.routes = append(r.routes, route{filter: filter, parts: parts, handler: handler})
+	if overlaps {
+		r.attributed = true
+	}
 	return nil
+}
+
+// Attributed reports whether the router accepted an overlapping route pair
+// and therefore subscribes with MQTT 5.0 Subscription Identifiers.
+//
+// Exported for the boot log and the conformance test, because the mode is
+// otherwise invisible and it is the difference between two failure modes a
+// consumer must be able to tell apart: an attributing router refuses to
+// [CommandRouter.Start] at all when the identifiers do not reach the wire
+// (see [ErrAttributionUnavailable]), while a non-attributing one starts on
+// any transport and any dialect. A consumer whose routes are disjoint reads
+// false here and is on exactly the v0.27.0 path, identifiers and all.
+func (r *CommandRouter) Attributed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.attributed
+}
+
+// SubscriptionID reports the MQTT 5.0 Subscription Identifier filter's
+// subscription carries, or 0 when it carries none — which is every route of
+// a router that accepted no overlap, and every route before
+// [CommandRouter.Start] assigns them.
+//
+// It is exported for one reason, and it is the caveat on the allocation
+// rule rather than curiosity. The router allocates identifiers from a
+// process-wide counter starting at 1, which keeps two routers in one binary
+// from colliding even when they share a client, but it cannot know about a
+// consumer that stamps subscriptions of its own on that same client: the
+// client delivers a message to every subscription whose identifier the
+// message carries, so a consumer that picks 1 for its own subscription
+// receives the first route's commands. A consumer with its own identifiers
+// should allocate downward from [MaxSubscriptionID] and can check its work
+// here.
+func (r *CommandRouter) SubscriptionID(filter string) uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.routes {
+		if r.routes[i].filter == filter {
+			return r.routes[i].subID
+		}
+	}
+	return 0
 }
 
 // Filters lists the registered routes, sorted.
@@ -515,16 +741,24 @@ func (r *CommandRouter) Start(ctx context.Context) error {
 		r.mu.Unlock()
 		return ErrRouterStarted
 	}
+	// Before anything is on the wire and before the router counts as
+	// started, so an exhausted identifier space is a Start that can be
+	// retried rather than a router stuck half-open.
+	subs, err := r.assignSubscriptionIDsLocked()
+	if err != nil {
+		r.mu.Unlock()
+		return err
+	}
 	r.started = true
 	// The pool must exist before the first subscribe: a broker may
 	// deliver on a subscription the moment it acknowledges it.
 	r.pool = newCommandPool(r.cfg.Workers, r.cfg.QueueDepth, r.log)
-	filters := r.routeFiltersLocked()
 	r.mu.Unlock()
 
-	done := make([]string, 0, len(filters))
-	for _, f := range filters {
-		if err := r.subscribe(ctx, f); err != nil {
+	done := make([]string, 0, len(subs))
+	for _, s := range subs {
+		f := s.filter
+		if err := r.subscribe(ctx, s); err != nil {
 			live := r.rollback(ctx, done)
 			r.mu.Lock()
 			r.started = false
@@ -591,13 +825,13 @@ func (r *CommandRouter) Resubscribe(ctx context.Context) error {
 		r.mu.Unlock()
 		return nil
 	}
-	filters := r.routeFiltersLocked()
+	subs := r.routeSubsLocked()
 	r.mu.Unlock()
 
 	var errs []error
-	for _, f := range filters {
-		if err := r.subscribe(ctx, f); err != nil {
-			errs = append(errs, fmt.Errorf("publisher: resubscribe %s: %w", f, err))
+	for _, s := range subs {
+		if err := r.subscribe(ctx, s); err != nil {
+			errs = append(errs, fmt.Errorf("publisher: resubscribe %s: %w", s.filter, err))
 		}
 	}
 	return errors.Join(errs...)
@@ -680,6 +914,11 @@ func (r *CommandRouter) WaitIdle() {
 // check, or an operator diagnosing why a button does nothing, needs to ask
 // "who would get this?" without publishing anything. ok is false for a topic
 // no route claims.
+//
+// With an accepted overlapping pair (see [CommandRouter.Handle]) several
+// routes can match, and this reports the one that would actually run — the
+// most specific. It is therefore still the question worth asking: who would
+// get this, not who matches.
 func (r *CommandRouter) Route(topic string) (cmd Command, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -742,20 +981,73 @@ func (r *CommandRouter) CheckDisjoint(topics ...string) error {
 	return errors.Join(errs...)
 }
 
-// subscribe registers one filter, preferring the No Local form when the
-// transport offers it. See [NoLocalSubscriber].
-func (r *CommandRouter) subscribe(ctx context.Context, filter string) error {
+// routeSub is one route's subscription as the subscribe path needs it: the
+// filter to ask for and the identifier to ask for it under.
+type routeSub struct {
+	filter string
+	subID  uint32
+}
+
+// assignSubscriptionIDsLocked gives every route an identifier when the
+// router is attributing, and none when it is not. Callers hold r.mu.
+//
+// None when it is not, deliberately: a router with disjoint routes has
+// nothing to attribute, and stamping anyway would change what goes on the
+// wire for every existing consumer — including onto brokers that answer a
+// Subscription Identifier with a SUBACK failure, turning a Start that
+// worked in v0.27.0 into one that does not.
+//
+// Identifiers are assigned once and kept, so a Resubscribe replays the
+// subscription the broker forgot under the identifier the router still
+// attributes to.
+func (r *CommandRouter) assignSubscriptionIDsLocked() ([]routeSub, error) {
+	if !r.attributed {
+		return r.routeSubsLocked(), nil
+	}
+	for i := range r.routes {
+		if r.routes[i].subID != 0 {
+			continue
+		}
+		id := nextSubscriptionID.Add(1)
+		if id > MaxSubscriptionID {
+			return nil, fmt.Errorf("%w: the process has allocated all %d MQTT 5.0 subscription identifiers",
+				ErrAttributionUnavailable, MaxSubscriptionID)
+		}
+		r.routes[i].subID = id
+	}
+	return r.routeSubsLocked(), nil
+}
+
+// subscribe registers one route's subscription.
+//
+// Three forms, in a fixed order of preference. An attributing router uses
+// [AttributingSubscriber] and nothing else — a failure there is not retried
+// unattributed, because the routes were accepted on the promise that it
+// works. Otherwise the No Local form is preferred when the transport offers
+// it (see [NoLocalSubscriber]), and a plain Subscribe is the floor.
+func (r *CommandRouter) subscribe(ctx context.Context, s routeSub) error {
 	// The subscribe context deliberately does not reach the handler: a
 	// command's context derives from [CommandConfig.Lifecycle], because
 	// Start's ctx may be a config reload's and die when the reload
 	// returns. See the note on that field.
 	handler := func(topic string, payload []byte, retained bool) { //nolint:contextcheck // see above
-		r.deliver(filter, topic, payload, retained)
+		r.deliver(s.filter, topic, payload, retained)
+	}
+	if s.subID != 0 {
+		err := r.attributor.SubscribeAttributed(ctx, s.filter, r.qos, s.subID, handler)
+		if err != nil {
+			// Named here rather than at the call site because this is the
+			// v5-capable-adapter-on-a-v3.1.1-broker case, and the caller
+			// only sees a subscribe that failed.
+			return fmt.Errorf("%w: identifier %d refused, and overlapping routes were accepted on the "+
+				"promise it would be honoured: %w", ErrAttributionUnavailable, s.subID, err)
+		}
+		return nil
 	}
 	if nl, ok := r.tr.(NoLocalSubscriber); ok {
-		return nl.SubscribeNoLocal(ctx, filter, r.qos, handler)
+		return nl.SubscribeNoLocal(ctx, s.filter, r.qos, handler)
 	}
-	return r.tr.Subscribe(ctx, filter, r.qos, handler)
+	return r.tr.Subscribe(ctx, s.filter, r.qos, handler)
 }
 
 // deliver is the transport-facing handler for one subscription. It runs on
@@ -775,6 +1067,19 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 		return
 	}
 	cmd, handler, ok := r.resolveLocked(topic)
+	if ok && r.attributed && cmd.Filter != filter {
+		// The copy arrived for a route that a more specific one outranks.
+		// One published message produces one copy per matching
+		// subscription; dropping the outranked copies is what keeps
+		// "exactly one handler per message" true while letting the
+		// overlap exist at all. Only reachable when the delivery is
+		// attributable, which is why accepting the overlap required it.
+		r.mu.Unlock()
+		r.log.Debug("publisher.command.superseded",
+			slog.String("topic", topic), slog.String("filter", filter),
+			slog.String("winner", cmd.Filter))
+		return
+	}
 	if !ok {
 		r.mu.Unlock()
 		// Nothing claims it. A shared broker carries traffic that is not
@@ -806,28 +1111,50 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 	r.mu.Unlock()
 }
 
-// resolveLocked finds the route matching topic. Callers hold r.mu.
+// resolveLocked finds the route that owns topic — the most specific one
+// that matches it. Callers hold r.mu.
 //
-// At most one can match: registration refuses any overlapping pair, which
-// is what makes this a search rather than the specificity tournament an
-// earlier version ran. The tournament was not merely redundant — it picked
-// a winner per delivered COPY of a message rather than per message, so it
-// was the mechanism by which one command ran its handler N times. See
-// [ErrAmbiguousRoutes].
+// Without an accepted overlap at most one route can match and the loop
+// finds it. With one, several can, and the winner is the strictest claim;
+// registration has already refused every pair with no strict winner, so the
+// routes matching one topic form a chain and the maximum is unique.
+//
+// A tournament stood here before v0.27.0 and was deleted, correctly: it
+// picked a winner per delivered COPY of a message and then ran that
+// winner's handler for each copy, which is how one command ran its handler
+// N times. What makes this one a different mechanism is that it no longer
+// decides who gets a copy — [CommandRouter.deliver] does, by comparing the
+// winner against the subscription the copy actually arrived for, and
+// dropping the copy when they differ. The ordering answers "which route
+// owns this topic", once per topic, instead of "which route should get this
+// copy", once per copy. It also fixes an inversion the old one shipped:
+// `a/b` lost to `a/b/#`, so an exactly-registered route never fired. See
+// [compareSpecificity].
 func (r *CommandRouter) resolveLocked(topic string) (cmd Command, handler CommandHandler, ok bool) {
+	best := -1
+	var bestWild []string
+	var bestRest string
 	for i := range r.routes {
 		wild, rest, matched := captureFilter(r.routes[i].parts, topic)
 		if !matched {
 			continue
 		}
-		return Command{
-			Topic:     topic,
-			Filter:    r.routes[i].filter,
-			Wildcards: wild,
-			Remainder: rest,
-		}, r.routes[i].handler, true
+		if best >= 0 {
+			if cmp, cmpOK := compareSpecificity(r.routes[i].parts, r.routes[best].parts); !cmpOK || cmp <= 0 {
+				continue
+			}
+		}
+		best, bestWild, bestRest = i, wild, rest
 	}
-	return Command{}, nil, false
+	if best < 0 {
+		return Command{}, nil, false
+	}
+	return Command{
+		Topic:     topic,
+		Filter:    r.routes[best].filter,
+		Wildcards: bestWild,
+		Remainder: bestRest,
+	}, r.routes[best].handler, true
 }
 
 func (r *CommandRouter) routeFiltersLocked() []string {
@@ -836,6 +1163,93 @@ func (r *CommandRouter) routeFiltersLocked() []string {
 		out = append(out, r.routes[i].filter)
 	}
 	return out
+}
+
+func (r *CommandRouter) routeSubsLocked() []routeSub {
+	out := make([]routeSub, 0, len(r.routes))
+	for i := range r.routes {
+		out = append(out, routeSub{filter: r.routes[i].filter, subID: r.routes[i].subID})
+	}
+	return out
+}
+
+// Level ranks, loosest to strictest. They are the whole specificity rule:
+// a filter is more specific than another when it is at least as strict at
+// every level and strictly stricter at one.
+const (
+	// rankRemainder is `#`, and every level after it — a filter that has
+	// given up on the rest of the topic.
+	rankRemainder = 0
+	// rankSingle is `+`: one level, any value.
+	rankSingle = 1
+	// rankLiteral is a named level.
+	rankLiteral = 2
+	// rankEnd is past the last level of a filter that does NOT end in `#`,
+	// and it outranks everything: such a filter matches topics of exactly
+	// its own depth and nothing longer. This rank is the fix for the
+	// inversion the deleted specificity code shipped — it treated the
+	// shorter filter as the weaker one, so `a/b` lost to `a/b/#` and an
+	// exactly-registered route never fired.
+	rankEnd = 3
+)
+
+// levelRank ranks position i of a pre-split filter.
+func levelRank(parts []string, i int) int {
+	for j := 0; j <= i && j < len(parts); j++ {
+		if parts[j] == "#" {
+			return rankRemainder
+		}
+	}
+	if i >= len(parts) {
+		return rankEnd
+	}
+	if parts[i] == "+" {
+		return rankSingle
+	}
+	return rankLiteral
+}
+
+// compareSpecificity orders two pre-split filters by how narrow a claim
+// they make: +1 when a is strictly more specific, -1 when b is, 0 when
+// their claims are equally strong at every level. ok is false when neither
+// outranks the other — each is stricter somewhere the other is looser — and
+// such a pair has no winner for the topics it shares.
+//
+// It is a dominance test over the per-level ranks rather than a score,
+// because a score has to weigh a literal in one level against a literal in
+// another and there is no defensible exchange rate: `a/+/c` and `a/b/+`
+// both claim `a/b/c`, with one literal each, and any total order over them
+// is arbitrary. Dominance says so instead, and [CommandRouter.Handle]
+// refuses the pair.
+//
+// Dominance is transitive, which is what lets [CommandRouter.resolveLocked]
+// run a tournament: the routes matching one topic are pairwise comparable
+// (registration refused the rest), so they form a chain with one maximum.
+func compareSpecificity(a, b []string) (int, bool) {
+	n := len(a)
+	if len(b) > n {
+		n = len(b)
+	}
+	aStricter, bStricter := false, false
+	for i := range n {
+		ra, rb := levelRank(a, i), levelRank(b, i)
+		switch {
+		case ra > rb:
+			aStricter = true
+		case rb > ra:
+			bStricter = true
+		}
+	}
+	switch {
+	case aStricter && bStricter:
+		return 0, false
+	case aStricter:
+		return 1, true
+	case bStricter:
+		return -1, true
+	default:
+		return 0, true
+	}
 }
 
 // sharedPrefix introduces a shared subscription, MQTT 5.0 §4.8.2.
