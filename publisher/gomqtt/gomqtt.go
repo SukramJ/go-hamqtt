@@ -35,6 +35,11 @@ func Split(p mqtt.Publisher, s mqtt.Subscriber) publisher.Transport {
 	return adapter{pub: p, sub: s}
 }
 
+// Compile-time assertion that the adapter carries the optional No-Local
+// capability, so the command router takes its safe path rather than falling
+// back silently.
+var _ publisher.NoLocalSubscriber = adapter{}
+
 // adapter is a value type: it holds two interfaces and no mutable state of
 // its own, so whatever concurrency guarantees the wrapped client makes are
 // exactly the ones it makes.
@@ -58,6 +63,25 @@ func (a adapter) Subscribe(ctx context.Context, filter string, qos byte, h publi
 	_, err := a.sub.Subscribe(ctx, filter, mqtt.QoS(qos), func(msg *mqtt.Message) {
 		h(msg.Topic, msg.Payload, msg.Retain)
 	})
+	return err
+}
+
+// SubscribeNoLocal implements [publisher.NoLocalSubscriber] by asking the
+// broker not to deliver this client's own publishes back to it.
+//
+// It exists because the collision it closes is the measured one: a consumer
+// mirrored a program's state onto that program's own trigger topic, and the
+// echo ran the program on every boot, every republish and once per freshly
+// discovered program, with nothing in the logs saying so. No Local removes
+// the whole class for the process itself.
+//
+// It does NOT remove the need for [publisher.CommandRouter.CheckDisjoint]:
+// No Local is MQTT 5 only, a v3.1.1 link silently ignores the option, and it
+// says nothing about a second process publishing into the same tree.
+func (a adapter) SubscribeNoLocal(ctx context.Context, filter string, qos byte, h publisher.Handler) error {
+	_, err := a.sub.Subscribe(ctx, filter, mqtt.QoS(qos), func(msg *mqtt.Message) {
+		h(msg.Topic, msg.Payload, msg.Retain)
+	}, mqtt.WithNoLocal())
 	return err
 }
 

@@ -39,6 +39,16 @@ type fakeTransport struct {
 	// starting — where a late claim has to be injected to exercise the
 	// second claim check.
 	onUnsubscribe func()
+	// failUnsubscribe decides an error per filter.
+	//
+	// It exists because an unconditional `return nil` here made every
+	// tear-down error branch in the package unreachable from a test — a
+	// broker that refuses an UNSUBSCRIBE, or a connection lost between the
+	// snapshot and the retractions, is exactly when a sweep must not report
+	// a clean run. A fixture that cannot fail is a fixture that certifies
+	// nothing about the failure paths, which is how the sweep's own
+	// tear-down handling reached review untested.
+	failUnsubscribe func(filter string) error
 }
 
 func newFake() *fakeTransport {
@@ -100,12 +110,16 @@ func (f *fakeTransport) Subscribe(_ context.Context, filter string, qos byte, h 
 
 func (f *fakeTransport) Unsubscribe(_ context.Context, filter string) error {
 	f.mu.Lock()
+	fail := f.failUnsubscribe
 	f.ops = append(f.ops, op{kind: "unsubscribe", topic: filter})
 	delete(f.subs, filter)
 	hook := f.onUnsubscribe
 	f.mu.Unlock()
 	if hook != nil {
 		hook()
+	}
+	if fail != nil {
+		return fail(filter)
 	}
 	return nil
 }
@@ -161,4 +175,13 @@ func (f *fakeTransport) seed(topic string, payload []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.retained[topic] = payload
+}
+
+// holds reports whether the broker still retains a non-empty payload on the
+// topic, which is the only way to tell a retraction that happened from one
+// that was merely reported.
+func (f *fakeTransport) holds(topic string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.retained[topic]) > 0
 }

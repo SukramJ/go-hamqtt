@@ -8,6 +8,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	hacatalog "github.com/SukramJ/go-ha-catalog"
@@ -380,5 +381,51 @@ func TestPublishRejectsEmptyTopicAndNilBundle(t *testing.T) {
 	}
 	if _, err := r.PublishBundle(context.Background(), nil); err == nil {
 		t.Fatal("want an error for a nil bundle")
+	}
+}
+
+// TestRepublishReportsWhatWentOutAndWhatDidNot covers the per-topic failure
+// branch a review found untested, and the reason it matters: Republish is
+// the answer to a broker that came back without its retained store, so it
+// runs at exactly the moment the broker is least healthy.
+//
+// A count that included a refused publish would tell the consumer the fleet
+// is re-declared when part of it is not — and a config that never landed is
+// an entity Home Assistant does not know about, which no later state publish
+// can conjure back. So the walk must continue past a refusal, count only
+// what went out, and return the refusals joined rather than the first one.
+func TestRepublishReportsWhatWentOutAndWhatDidNot(t *testing.T) {
+	t.Parallel()
+	f := newFake()
+	r := New(f, Config{})
+	ctx := context.Background()
+
+	good := "homeassistant/sensor/ccu_a/one/config"
+	bad := "homeassistant/sensor/ccu_a/two/config"
+	for _, tp := range []string{good, bad} {
+		if _, err := r.Publish(ctx, tp, []byte(`{"v":1}`)); err != nil {
+			t.Fatalf("seed %s: %v", tp, err)
+		}
+	}
+
+	f.failPublish = func(topic string) error {
+		if topic == bad {
+			return errors.New("broker refused")
+		}
+		return nil
+	}
+
+	sent, err := r.Republish(ctx)
+	if err == nil {
+		t.Fatal("a refused republish reported success")
+	}
+	if !strings.Contains(err.Error(), bad) {
+		t.Errorf("err = %v, want it to name the topic that did not land", err)
+	}
+	if strings.Contains(err.Error(), good) {
+		t.Errorf("err = %v, want it to name only the refused topic", err)
+	}
+	if sent != 1 {
+		t.Errorf("sent = %d, want only the topic that actually went out", sent)
 	}
 }

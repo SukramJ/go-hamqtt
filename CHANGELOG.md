@@ -3,6 +3,344 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.26.0] - 2026-09-12
+
+The rest of the runtime layer ADR 0070 scoped — state publishing,
+command routing and entity availability — plus the escape hatches the
+twelve migrated discovery planes still had to work *around* the model
+instead of *through* it.
+
+The three runtime planes were written against the first full consumer's
+measured behaviour by three authors who could not see each other's
+files, then merged and adversarially reviewed. **The review is the
+reason this release took the shape it did**: it reproduced a
+double-dispatch defect against a real Mosquitto, and proved five
+doc-comment claims and five tests wrong. Those findings are in
+`### Fixed` below, before the release rather than after it.
+
+### Added
+
+- **`publisher.StatePublisher`** — the entity *state* plane, as
+  distinct from the retained discovery configs v0.25.0 carries. A
+  dedup gate keyed on the topic with the full payload bytes, an
+  eviction index (a removed device takes its channel list with it, so
+  the index is the only way its retained topics can still be found),
+  non-retained QoS-0 pulses (a retained pulse re-fires on every
+  reconnect), and the reference implementation's latency probe with
+  both of its negative controls — QoS 0 untimed because it measures
+  this process's own buffer, failures untimed because they measure the
+  failure.
+
+  Two measured defects of the reference are fixed by construction: a
+  nil value has no raw rendering rather than becoming an empty
+  retained payload, which is MQTT's retraction; and floats render
+  through the shortest round-tripping form rather than `%f`-and-trim,
+  which capped at six decimals and sent `0.0000001` as `0`.
+
+  `ComponentStateTopic` and `StateTopicFor` exist because
+  `topic.Layout.State` is **not** the config's `state_topic` on 10 of
+  32 platforms — `climate`, `water_heater`, `camera`, `button` and six
+  more render no `state_topic` at all, while the layout happily returns
+  one. A consumer deriving the publish topic from the layout writes
+  into a topic no config references, and the entity stays "unknown"
+  forever with nothing logged.
+
+- **`publisher.CommandRouter`** — the command plane: registration,
+  subscription, dispatch, resubscribe, lifecycle, and the
+  state-versus-command disjointness guard the reference implementation
+  learned the hard way (it mirrored a program's state onto that
+  program's own trigger topic, and the echo ran the program on every
+  boot, every republish and once per freshly discovered program, with
+  nothing in the logs saying so).
+
+  Handlers run on router workers, never on the transport's read loop.
+  A command is by definition a write outside the process, and a handler
+  that answers by publishing would wait for an ack only the goroutine
+  it occupies could deliver — a self-deadlock on the first command, not
+  a slow path. The three costs are documented on `CommandHandler`.
+
+- **`publisher.AvailabilityPublisher`** — the publishing side of the
+  three availability levels whose declaring side already shipped.
+  `LevelBridge` was already covered by the birth/LWT policy; this adds
+  the device reachability topic, without which an entity never greys
+  out in Home Assistant when its device goes off-bus, and the
+  `LevelSelf` payload — which agrees with the declaring side's
+  `value` key, its bare boolean under `RawEncoding` and its
+  `true`/`false` tokens, rather than with the reference
+  implementation's own spelling.
+
+- **`discovery.DeviceSlot`**, **`publisher.ParentSlot`** and
+  `AvailabilityPublisher.Parent`/`ParentTopic`/`Bridge` — one
+  derivation per availability coordinate, shared by the side that
+  declares the topic and the side that writes to it. Two copies of a
+  coordinate derivation is exactly how the two sides drift apart, and
+  an entity whose availability topic nobody publishes to is one Home
+  Assistant greys out forever.
+
+- **`Config.Layout`** — makes `Config.StatusTopic` checkable instead
+  of free-form. It is the one string every entity's availability list
+  references, and under the default `availability_mode: "all"` a
+  single typo greys out the whole fleet with nothing on the wire
+  naming the cause. With a layout set, an empty status topic is
+  derived from it and a disagreement is refused at the composition
+  root.
+
+- **`SweepRequest.Inspect`** — the sweep is the *last* moment an
+  orphan's other topics can be found. A config removed while the
+  consumer was down is remembered by nobody, and the config body is
+  the only place that still names its availability and state topics.
+  Discarding it left a retained `online` standing forever, so Home
+  Assistant kept a device that no longer exists permanently available,
+  showing its last value.
+
+- **`model.Description.NameNull`** — `name: null` as a statement
+  distinct from "no name". An empty `Localized` means *no opinion* and
+  the pipeline drops the key, which makes Home Assistant derive a name
+  from the platform; `name: null` tells it to use the device name
+  alone. Three planes set it after rendering.
+
+- **`model.Description.CommandTemplate`** — projected onto the 16 of
+  32 platforms whose schema declares it, read out of `go-ha-catalog`
+  rather than assumed.
+
+- **`topic.PulseLayout`**, `PulseKind`, `PulseTopic` and
+  `Default.Pulse` — the four event/impulse topic kinds a consumer
+  publishing pulses needs. Deliberately an **optional capability
+  interface rather than a fifth `Layout` method**: this module states
+  capability interfaces as its extension mechanism, a method would
+  break all six layouts including the ones with nothing to return,
+  and an embedded default would be worse than a compile error — a
+  pulse topic derived from the state topic is plausible, deterministic,
+  and subscribed to by nobody. `PulseTopic` returns `""` for a
+  declining layout and invents nothing.
+
+- **`discovery.PresetModeTemplates`** / `EnumTemplates` — the
+  `preset_mode` Jinja round-trip pair from a `model.Enum`, whose
+  reverse lookup a command template used to re-implement by hand. The
+  emitted bytes were verified against the first consumer's pinned
+  `climate/thermostat` payload, not by eye.
+
+- **`discovery.RenderFrame`** — a merge-*under* render for a consumer
+  that receives a finished component from outside the model. The given
+  component always wins; only a key at its Go zero value is taken from
+  the frame, the mirror image of `Description.Extra`. It replaces six
+  hand-written `if comp.X == ""` lines and the standing risk of
+  forgetting one.
+
+- **A conformance suite** over all four planes against one in-memory
+  broker, pinning the cross-cutting invariants no single plane can
+  check alone: that a config's advertised `state_topic` is the topic
+  the state plane writes to, that its `command_topic` is the one the
+  command plane subscribes to, that a reconnect restores all four
+  planes consistently, and that a removal leaves no retained ghost in
+  any tree. **Both gaps it found are fixed in this release**, and both
+  were invisible to the planes individually.
+
+- **`hacheck` and `hadoctor` reach the runtime layer**: a `unique_id`
+  retained in both discovery forms (which Home Assistant refuses with
+  only a `WARNING`, while both payloads validate and both publishes
+  report success), a command topic something in the same capture also
+  publishes to, an availability topic inside the discovery tree, and
+  an advisory pass for retained availability payloads no config
+  references.
+
+### Fixed
+
+- **One command ran the handler twice.** Reproduced against Mosquitto
+  2.1.2 on both MQTT 3.1.1 and 5.0. The router resolved overlapping
+  filters per *delivered copy* rather than per message, and two
+  multiplications composed: a broker sends one copy per matching
+  subscription, and the client then re-matches each copy against its
+  whole local filter list. A `toggle` toggled twice and a relay pulse
+  fired twice, with nothing logged.
+
+  Overlapping filters are now **refused at registration**
+  (`ErrAmbiguousRoutes`). Specificity cannot fix this in principle: a
+  winner is chosen per copy, and no information in the router
+  distinguishes N copies of one message from N genuine publishes.
+  MQTT 5 Subscription Identifiers would correlate them but are v5-only
+  and cannot be set through the client's current API, so a design
+  resting on them is silently wrong on a v3.1.1 link. The cost is that
+  command shapes must be pairwise disjoint and the discrimination
+  moves into the handler — a cost the old scheme only appeared to
+  spare, since it double-ran. The specificity machinery is removed
+  rather than left unreachable.
+
+- **The availability gate deleted its own index on a failed publish.**
+  `last` is simultaneously the dedup gate, the topic list, the
+  republish worklist and the sweep's ownership set — so a refused
+  `offline` during a broker outage left a retained `online` that
+  nothing could find or retract. All three gates now keep the last
+  payload the broker accepted and merely decline to record a refused
+  one, which is what lets the retry through.
+
+- **A failed `Start` left a live, ungated subscription.** The rollback
+  was best-effort and its failure path left the dispatch gate open, so
+  commands executed against half-initialised dependencies while the
+  consumer saw `Start` fail. A rollback that leaves anything behind now
+  closes the router permanently and names every still-live filter.
+
+- **A command could be dropped between the stop check and the
+  enqueue.** Confirmed at 1–12 losses per 20,000 deliveries once both
+  goroutines were released from one barrier — the earlier review could
+  not reproduce it and correctly labelled it a suspicion rather than
+  dismissing it.
+
+- **An abandoned router leaked its worker goroutines** (ten discarded
+  routers took a process from 2 to 82). The pool starts in `Start` now.
+
+- **`$share/` filters registered cleanly and never fired.** A
+  differential enumeration against `go-mqtt`'s fuzzed matcher found
+  1,070 disagreements, all of this class. `ValidateFilter` also
+  enforces §4.8.2's structure and §1.5.4 now.
+
+- **`BundleStateTopics` omitted the availability list**, so
+  `CheckDisjoint` was blind to the collision class it advertises:
+  availability is rendered as a list of objects, and the extraction
+  walked only the top level.
+
+- **A specificity inversion** made an exactly-registered topic lose to
+  `<that topic>/#`; moot now that the machinery is gone, and the
+  reproducer is a refused-registration test row.
+
+- **`EvictPrefix` was case-sensitive and reported a typo as success**
+  — `(0, nil)` is indistinguishable from "nothing to clear", so a
+  mis-cased address left a removed device's whole retained state
+  standing.
+
+- **`Reset` then `Republish` published nothing**, because the first
+  cleared the index the second walks. `Reset` now opens the gate and
+  keeps the index, and both planes share one shape, so one reconnect
+  handler needs one idiom.
+
+- **Guard coverage was inconsistent across the three planes** — three
+  answers to one question. Every write goes through the guard now.
+
+- **Seven doc comments asserted things the code did not do**, five of
+  them found by the review. In a codebase whose comments carry
+  measurements, a false one is worse than none: the next author trusts
+  it.
+
+- **Five tests could not fail**, proven by mutating the production code
+  and watching them pass — including the one standing exactly where the
+  availability-gate defect lived, whose sole assertion was
+  arithmetically unfalsifiable. All five are replaced and
+  mutation-verified, and the fixtures can now inject transport failures,
+  which several error paths previously made untestable by construction.
+
+### Changed
+
+- **`gomqtt.Transport` implements `publisher.NoLocalSubscriber`**, so
+  the broker does not deliver a consumer's own publishes back to it.
+  That removes the self-echo class for the process itself.
+  `CheckDisjoint` remains load-bearing: No Local is MQTT 5 only, a
+  v3.1.1 link ignores the option silently, and it says nothing about a
+  second process publishing into the same tree.
+
+
+### Added
+
+- **`model.Description.NameNull`** — `name: null` as a statement a
+  description can make.
+
+  Home Assistant's `entity.py` reads
+  `config.get(CONF_NAME, UNDEFINED)`: an explicit null comes back as
+  None and becomes the entity's name, an absent key comes back
+  UNDEFINED and makes it derive one from the platform. An empty
+  `model.Localized` is the absence of an opinion, so the pipeline
+  dropped the key and only the second was reachable — three planes
+  (notify, channel aggregate, per-datapoint) set
+  `discovery.Component.NameNull` after rendering to get the first,
+  two of them by re-deriving it from the component they had just been
+  handed.
+
+  It wins over `Name` and `NameKey`, the same precedence
+  `Component.NameNull` already has over `Fields` and `Extra`, so an
+  enricher can state it after a catalogue default filled in a name.
+  The zero value goes on meaning "no opinion", and the null is
+  projected only onto the 30 platforms whose schema declares `name` —
+  not device_automation, not tag.
+
+- **`model.Description.CommandTemplate`** — projected onto the 16
+  platforms that declare the key.
+
+  It existed on `discovery.Component` only, so the per-datapoint plane
+  and the notify plane each opened a `discovery.Builder` for this one
+  key, on entities that need nothing else platform-specific. climate,
+  cover, light and water_heater declare no such key — they spell a
+  template per role — and get none. The projection is deliberately not
+  gated on a command topic beside it: a `Builder` runs afterwards and
+  is often what names that topic, so gating would drop the template
+  for exactly the entities that set both.
+
+- **`topic.PulseKind`, `topic.PulseLayout`, `topic.PulseTopic`,
+  `topic.Default.Pulse`** — the topics an occurrence is published on:
+  a per-datapoint event, a channel event aggregate, an impulse and a
+  channel device error.
+
+  `topic.Layout` named state, command, availability and bridge. A
+  consumer reaching `publisher.StatePublisher.Pulse` — which takes a
+  plain topic string — formatted the other four itself, outside the
+  one package that knows its topic tree.
+
+  **A capability interface, not a fifth `Layout` method.** Both forms
+  work and the breaking one was on the table; this is the module's own
+  extension mechanism, and the only form under which the five
+  consumers that publish no pulses need no change at all. A fifth
+  method breaks all six layouts at once, including those with nothing
+  to return, and an embedded default answers for them with a
+  deterministic topic nobody subscribes to — worse than a compile
+  error, because it looks like an answer. `PulseTopic` gives the
+  declining case one spelling and invents nothing: an empty string
+  means this layout names no such topic and must not be published to.
+  `topic.Default` implements it, so a consumer with no opinion
+  inherits the shapes.
+
+- **`discovery.PresetModeTemplates`, `discovery.EnumTemplates`,
+  `discovery.JinjaQuote`** — the `preset_mode` Jinja pair, emitted
+  from a `model.Enum`.
+
+  `Enum` already pairs a code the device speaks with the label a
+  person reads, `Enum.Options` already emits the `preset_modes` list
+  and `Enum.Code` is already the reverse lookup — but the climate
+  plane hand-rolls both round-trip dictionaries as string formatting
+  beside them. Both are now built from one enum in one pass, so they
+  cannot disagree about which label belongs to which code; the
+  reference implementation's index-aligned slices could, and a reorder
+  of one renamed a preset in one direction only.
+
+  The emitted bytes match that plane's pinned payload exactly — key
+  order, quoting, the `is not none` guard, both `m.get` fallbacks —
+  verified against the `climate/thermostat` fixture of its byte-pinned
+  aggregate golden. That payload is already retained on brokers, so a
+  divergence would move a published payload.
+
+- **`discovery.RenderFrame`** — `RenderComponent` merged *under* a
+  component whose own keys are authoritative.
+
+  The combined-projection plane receives a finished `Component` built
+  outside the model, where every display key is the projection's, and
+  needs only the frame: device, origin, state topic, availability,
+  unique id. It rendered that frame and gap-filled by hand — six
+  `if comp.X == ""` lines, with nothing to catch the seventh when a
+  key is added here.
+
+  The precedence is stated once on the function: the given component
+  always wins, and only a key it leaves at its zero value is taken
+  from the frame. That is the mirror image of `Description.Extra`,
+  which is applied last and overrides everything. A nil slice is "no
+  opinion", an empty one is a statement and is kept. `Extra` merges
+  key by key into a new map, so one key set by the projection loses
+  neither the frame's other keys nor the caller's own map. The fill is
+  reflective, so a key added to `Component` is carried on the day it
+  is added.
+
+### Notes
+
+- Nothing under `publisher/` changed.
+- No exported signature moved, and no default changed: every addition
+  is reachable only by setting a field or calling a new function.
+
 ## [0.25.0] - 2026-09-12
 
 The publisher runtime ADR 0070 scoped from the start and phase 2

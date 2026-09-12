@@ -37,6 +37,26 @@ type SweepRequest struct {
 
 	// Window overrides [Config.SweepWindow] for this pass.
 	Window time.Duration
+
+	// Inspect, when set, receives the retained body of every owned config
+	// the window delivers, before the pass decides whether to retract it.
+	//
+	// It exists because the sweep is the LAST moment an orphan's other
+	// topics can be found. A config removed while the consumer was down is
+	// remembered by nobody: the availability plane clears only what it
+	// wrote, and after a restart it wrote nothing. The config body is the
+	// one place that still names the entity's availability and state
+	// topics, and discarding it leaves a retained `online` standing
+	// forever — Home Assistant then keeps a device that no longer exists
+	// permanently available, showing its last value.
+	//
+	// Same contract as Owns: it is called from the transport's read loop,
+	// so it must be cheap and must not publish. Collect the topics here and
+	// retract them after Sweep returns, which is also the order a removal
+	// needs — the config retraction is what removes the entity, and
+	// clearing availability first only greys it out in between, which an
+	// operator reads as a fault.
+	Inspect func(t ConfigTopic, body []byte)
 }
 
 // SweepResult is what one pass saw and did.
@@ -125,6 +145,10 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 		mu.Lock()
 		inspected++
 		mu.Unlock()
+
+		if req.Inspect != nil {
+			req.Inspect(parsed, payload)
+		}
 
 		if r.claims(topic) {
 			return
