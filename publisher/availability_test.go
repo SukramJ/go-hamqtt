@@ -142,36 +142,6 @@ func TestDeviceTopicIsTheTopicTheConfigDeclares(t *testing.T) {
 	}
 }
 
-// TestParentTopicIsTheDeviceTopicOfTheParent pins how LevelParent is reached
-// from this side: same call, parent device. The containers travel with the
-// entity, not with the parent.
-func TestParentTopicIsTheDeviceTopicOfTheParent(t *testing.T) {
-	t.Parallel()
-
-	parent := availDevice()
-	dev := &model.Device{
-		Identity: model.Identity{IDs: []model.Identifier{{Namespace: "serial", Value: "CHILD1"}}},
-		Via:      &parent.Identity,
-	}
-	e := availEntity(dev.UID(), false)
-	e.Description.Availability = model.Availability{Levels: []model.AvailabilityLevel{model.LevelParent}}
-
-	ctx := discovery.StdContext{Layout: availLayout(), Namespace: availRoot}
-	entries := ctx.Availability(dev, e)
-	if len(entries) != 1 {
-		t.Fatalf("want one parent entry, got %+v", entries)
-	}
-
-	a := newAvail(t, &availBroker{})
-	got, err := a.DeviceTopic(DeviceSlot(&model.Device{Identity: *dev.Via}, e))
-	if err != nil {
-		t.Fatalf("DeviceTopic: %v", err)
-	}
-	if got != entries[0].Topic {
-		t.Errorf("parent topic %q, config declares %q", got, entries[0].Topic)
-	}
-}
-
 // TestDevicePublishesRetainedTokens checks the three things Home Assistant
 // actually reads: the payload word, the retain flag and the QoS the measured
 // consumer pins for this topic.
@@ -843,5 +813,110 @@ func TestAvailabilityHonoursTheCollisionGuard(t *testing.T) {
 	// subscribes to, not availability as such.
 	if _, err := a.Publish(ctx, "loom/ccu-01/VEQ0001/availability", true); err != nil {
 		t.Errorf("a disjoint availability topic must pass: %v", err)
+	}
+}
+
+// TestParentTopicIsTheTopicTheConfigDeclares is the [model.LevelParent] half
+// of the seam [DeviceSlot] closed for [model.LevelDevice]: the declaring side
+// derives the parent coordinate inline, and a publishing side that rebuilt it
+// by hand addresses a different topic.
+//
+// The two things a hand-derivation gets wrong are both pinned here: the
+// channel travels with the scope, and the scope comes from the child's
+// bindings rather than the parent's own identity. Either mistake greys out
+// every child of the sub-device forever.
+func TestParentTopicIsTheTopicTheConfigDeclares(t *testing.T) {
+	t.Parallel()
+
+	parent := model.Identity{IDs: []model.Identifier{{Namespace: "serial", Value: "INV0001"}}}
+	dev := availDevice()
+	dev.Via = &parent
+	e := availEntity(dev.UID(), false)
+	e.Description.Availability = model.Availability{
+		Levels: []model.AvailabilityLevel{model.LevelParent},
+	}
+
+	dctx := discovery.StdContext{Layout: availLayout(), Namespace: availRoot}
+	entries := dctx.Availability(dev, e)
+	if len(entries) != 1 {
+		t.Fatalf("want the single parent entry, got %+v", entries)
+	}
+
+	b := &availBroker{}
+	a := newAvail(t, b)
+	got, ok, err := a.ParentTopic(dev, e)
+	if err != nil || !ok {
+		t.Fatalf("ParentTopic = %q, %v, %v", got, ok, err)
+	}
+	if got != entries[0].Topic {
+		t.Fatalf("ParentTopic = %q, config declares %q", got, entries[0].Topic)
+	}
+	if !strings.Contains(got, parent.UID()) {
+		t.Errorf("the parent topic %q does not name the parent address", got)
+	}
+	// The containers travel with the entity, not with the parent — which is
+	// the half a hand-derivation off dev.Via alone cannot see, because an
+	// identity carries no scope.
+	if !strings.Contains(got, "ccu-01/HmIP-RF") {
+		t.Errorf("the parent topic %q lost the containers the entity binds in", got)
+	}
+	if s, ok := ParentSlot(dev, e); !ok || s.Channel != "1" {
+		t.Errorf("ParentSlot = %+v, %v; want the channel kept", s, ok)
+	}
+
+	changed, err := a.Parent(context.Background(), dev, e, true)
+	if err != nil || !changed {
+		t.Fatalf("Parent = %v, %v", changed, err)
+	}
+	writes := b.all()
+	if len(writes) != 1 || writes[0].topic != entries[0].Topic {
+		t.Fatalf("Parent wrote %+v, want the declared topic", writes)
+	}
+
+	// A device with no parent is the normal case for a reused description,
+	// and the declaring side skips the level rather than erroring.
+	orphan := availDevice()
+	if _, ok, err = a.ParentTopic(orphan, e); ok || err != nil {
+		t.Errorf("ParentTopic(no parent) = %v, %v; want the level skipped", ok, err)
+	}
+	if changed, err = a.Parent(context.Background(), orphan, e, true); changed || err != nil {
+		t.Errorf("Parent(no parent) = %v, %v; want the level skipped", changed, err)
+	}
+	if _, ok = ParentSlot(nil, nil); ok {
+		t.Error("ParentSlot(nil, nil) claimed a parent")
+	}
+}
+
+// TestBridgeIsTheStringEveryConfigReferences exposes the one availability
+// string this module structurally could not cross-check: the declaring side
+// writes [topic.Layout.Bridge], the publishing side writes
+// [Config.StatusTopic], a free-form string, and [Runtime] holds no layout. A
+// typo greys out the whole fleet under the default availability_mode.
+func TestBridgeIsTheStringEveryConfigReferences(t *testing.T) {
+	t.Parallel()
+
+	dev := availDevice()
+	e := availEntity(dev.UID(), false)
+	dctx := discovery.StdContext{Layout: availLayout(), Namespace: availRoot}
+	entries := dctx.Availability(dev, e)
+	if len(entries) == 0 {
+		t.Fatal("the fixture declares no availability")
+	}
+
+	a := newAvail(t, &availBroker{})
+	got, err := a.Bridge()
+	if err != nil {
+		t.Fatalf("Bridge: %v", err)
+	}
+	if got != entries[0].Topic {
+		t.Errorf("Bridge() = %q, the bridge-level entry names %q", got, entries[0].Topic)
+	}
+
+	// The assertion a consumer can now make about its own Config.StatusTopic.
+	if got != availLayout().Bridge() {
+		t.Errorf("Bridge() = %q, layout renders %q", got, availLayout().Bridge())
+	}
+	if _, err = NewAvailability(&availBroker{}, AvailabilityConfig{}).Bridge(); !errors.Is(err, ErrNoAvailabilityLayout) {
+		t.Errorf("Bridge without a layout = %v", err)
 	}
 }

@@ -163,6 +163,93 @@ func DeviceSlot(dev *model.Device, e model.Entity) model.Slot {
 	return discovery.DeviceSlot(dev, e)
 }
 
+// ParentSlot is the coordinate [model.LevelParent] resolves against: the
+// parent device's address, in the same containers the child's entities sit
+// in. The second return is false when the device declares no parent, which is
+// the normal case for a description written once and reused across device
+// shapes — [discovery.StdContext.Availability] skips the level there rather
+// than rendering a broken topic, and so must a consumer.
+//
+// It exists for the same reason [DeviceSlot] does, and the seam it closes is
+// the one [DeviceSlot] left open. The declaring side derives this coordinate
+// inline: the device slot, with the address swapped for the parent's UID and
+// — the part a hand-derivation gets wrong — the channel left in place. A
+// consumer that rebuilt it and dropped the channel, or took the parent's own
+// scope instead of the child's bindings', publishes to a topic no config
+// names. Any sub-device declaring [model.LevelParent] — a battery pack under
+// an inverter is the measured shape — then has every one of its children
+// greyed out forever, with nothing on the wire naming the mismatch.
+func ParentSlot(dev *model.Device, e model.Entity) (model.Slot, bool) {
+	if dev == nil || dev.Via == nil {
+		return model.Slot{}, false
+	}
+	s := DeviceSlot(dev, e)
+	s.Address = dev.Via.UID()
+	return s, true
+}
+
+// Parent flips the retained reachability topic of a device's parent and
+// reports whether that was a transition, exactly as
+// [AvailabilityPublisher.Device] does for the device itself.
+//
+// It reports (false, nil) for a device with no parent, matching what the
+// declaring side does with the level: skip it. That is not an error a
+// consumer walking a mixed fleet should have to filter out of its logs.
+func (a *AvailabilityPublisher) Parent(
+	ctx context.Context,
+	dev *model.Device,
+	e model.Entity,
+	online bool,
+) (bool, error) {
+	s, ok := ParentSlot(dev, e)
+	if !ok {
+		return false, nil
+	}
+	return a.Device(ctx, s, online)
+}
+
+// ParentTopic renders the availability topic of a device's parent, for the
+// same reason [AvailabilityPublisher.DeviceTopic] is exported: a diagnostic
+// dump, a retraction list built before the devices are gone and the ownership
+// predicate of [AvailabilityPublisher.Sweep] all need the string and none of
+// them wants the message. The second return is false when there is no parent.
+func (a *AvailabilityPublisher) ParentTopic(dev *model.Device, e model.Entity) (string, bool, error) {
+	s, ok := ParentSlot(dev, e)
+	if !ok {
+		return "", false, nil
+	}
+	t, err := a.DeviceTopic(s)
+	if err != nil {
+		return "", false, err
+	}
+	return t, true, nil
+}
+
+// Bridge is the daemon's own status topic as this publisher's [topic.Layout]
+// renders it — the string every entity's [model.LevelBridge] availability
+// entry names.
+//
+// It is a passthrough, and it exists because the two sides of that one string
+// cannot otherwise be compared inside this module. The declaring side writes
+// [topic.Layout.Bridge]; the publishing side writes [Config.StatusTopic], a
+// free-form string, and [Runtime] holds no layout to check it against. A typo
+// there greys out the whole fleet at once under the default
+// `availability_mode: all`, and the only evidence is every entity being
+// unavailable. A consumer can now assert the two agree in its own
+// composition root:
+//
+//	want, err := avail.Bridge()
+//	if err != nil || cfg.StatusTopic != want { … }
+//
+// Reports [ErrNoAvailabilityLayout] when no layout was configured, like every
+// other layout-shaped call here.
+func (a *AvailabilityPublisher) Bridge() (string, error) {
+	if a.layout == nil {
+		return "", ErrNoAvailabilityLayout
+	}
+	return a.layout.Bridge(), nil
+}
+
 // DeviceTopic renders the availability topic of one device coordinate.
 //
 // Exported alongside the publish calls because a consumer has to be able to

@@ -152,8 +152,12 @@ func deviceSlot(dev *model.Device, e model.Entity) model.Slot {
 // which renders a topic no config names — and an entity whose availability
 // topic nobody publishes to is one Home Assistant greys out forever.
 //
-// The parent topic of [model.LevelParent] is this same call on dev.Via: the
-// address changes, the containers do not.
+// The parent topic of [model.LevelParent] is this same slot with its Address
+// replaced by dev.Via.UID(): the address changes, the containers do not. It
+// is not this call on dev.Via — [model.Device.Via] is a [model.Identity],
+// which carries no scope and is not a [model.Device], so that expression does
+// not compile. The publishing side has the derivation as
+// publisher.ParentSlot, so a consumer does not rebuild it by hand.
 func DeviceSlot(dev *model.Device, e model.Entity) model.Slot {
 	if dev == nil {
 		return model.Slot{}
