@@ -757,3 +757,54 @@ func TestNilTransportAndNilRuntimePanic(t *testing.T) {
 		})
 	}
 }
+
+// TestEveryWriteHonoursTheCollisionGuard is the consistency regression.
+//
+// The guard used to cover [StatePublisher.Publish] and [StatePublisher.Pulse]
+// and nothing else, so [StatePublisher.Evict] — the one call a consumer
+// reaches for the moment a device is removed — published an empty retained
+// payload straight into this process's own command subscription, where it
+// arrives as an empty command. Evict legitimately reaches topics this process
+// never published; that is a question about the index, and the guard asks a
+// different one: does this process subscribe to the topic.
+func TestEveryWriteHonoursTheCollisionGuard(t *testing.T) {
+	t.Parallel()
+
+	f := newFake()
+	p := NewStatePublisher(f, StateConfig{CommandFilters: []string{"b/+/+/set"}})
+	ctx := context.Background()
+	const colliding = "b/1/2/set"
+
+	if err := p.Evict(ctx, colliding); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Evict err = %v, want ErrStateCommandCollision", err)
+	}
+	if n := len(stateOps(f)); n != 0 {
+		t.Fatalf("the eviction reached the wire: %+v", stateOps(f))
+	}
+
+	// Best-effort across the list: the disjoint topic still goes out.
+	if err := p.Evict(ctx, colliding, "b/1/2/state"); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Evict err = %v, want the collision reported", err)
+	}
+	if got := f.retractions(); len(got) != 1 || got[0] != "b/1/2/state" {
+		t.Errorf("retractions = %v, want only the disjoint topic", got)
+	}
+
+	// A consumer that widens its filters after publishing must not have the
+	// index walks echo to itself either.
+	wide := newFake()
+	q := NewStatePublisher(wide, StateConfig{})
+	if _, err := q.Publish(ctx, colliding, []byte("21.5")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	q.cfg.CommandFilters = []string{"b/+/+/set"}
+	if n, err := q.EvictPrefix(ctx, "b/1"); n != 0 || !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("EvictPrefix = %d, %v; want the collision reported", n, err)
+	}
+	if n, err := q.Republish(ctx); n != 0 || !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Republish = %d, %v; want the collision reported", n, err)
+	}
+	if got := len(stateOps(wide)); got != 1 {
+		t.Errorf("ops = %d, want only the original publish", got)
+	}
+}

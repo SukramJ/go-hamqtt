@@ -380,6 +380,17 @@ func (p *StatePublisher) Pulse(ctx context.Context, topic string, payload []byte
 // previous build's and this process knows none of them — skipping them
 // because they are unfamiliar is how they become permanent.
 //
+// What it will not reach is a topic inside the consumer's own command
+// subscriptions: those are refused with [ErrStateCommandCollision], for the
+// same reason [StatePublisher.Publish] refuses them and with no exemption for
+// being unfamiliar. An eviction is a write like any other, and an empty
+// retained payload on a command topic is a command — an empty one, echoed
+// straight back into this process's own handler, which is the least
+// diagnosable shape the collision has. The guard is about what this process
+// subscribes to, not about what it has published, so reaching an unpublished
+// topic and reaching a subscribed one are independent questions with
+// independent answers.
+//
 // Best-effort across the list: one topic a broker refuses must not leave the
 // rest of a removed device's datapoints standing. Every failure is joined so
 // the caller sees the whole picture, and a cancelled context stops the walk
@@ -393,6 +404,10 @@ func (p *StatePublisher) Evict(ctx context.Context, topics ...string) error {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
 			break
+		}
+		if err := p.guard(t); err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		if err := p.tr.Publish(ctx, t, nil, p.cfg.QoS, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: evict %s: %w", t, err))
@@ -421,6 +436,13 @@ func (p *StatePublisher) Evict(ctx context.Context, topics ...string) error {
 // whose address is a prefix of another's is not the failure, a device whose
 // address appears as some other device's channel name is.
 //
+// Guarded like [StatePublisher.Evict]: a matched topic that falls inside the
+// consumer's own command subscriptions is reported as
+// [ErrStateCommandCollision] and left standing. The index cannot normally
+// hold one — [StatePublisher.Publish] refused it — but a consumer that
+// widened [StateConfig.CommandFilters] after the fact would otherwise have
+// the eviction walk echo empty commands to itself.
+//
 // Best-effort like [StatePublisher.Evict]: a topic the broker refuses stays
 // in the index, so a later call retries it rather than declaring it gone.
 func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, error) {
@@ -445,6 +467,10 @@ func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, e
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
 			break
+		}
+		if err := p.guard(t); err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		if err := p.tr.Publish(ctx, t, nil, p.cfg.QoS, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: evict %s: %w", t, err))
@@ -476,6 +502,11 @@ func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, e
 // consumer's own reconnect, where the thing that may have been lost is the
 // broker's retained tree. A consumer that wants both calls both.
 //
+// It does not bypass the collision guard, which is the one check that is not
+// part of the dedup gate: replaying a topic the consumer now subscribes for
+// commands would echo a state payload into its own handler. Such a topic is
+// reported as [ErrStateCommandCollision] and skipped.
+//
 // Best-effort per topic: a breaker open for one datapoint must not abort the
 // replay for the fleet behind it. A cancelled context stops the walk rather
 // than turning every remaining topic into an error.
@@ -496,6 +527,10 @@ func (p *StatePublisher) Republish(ctx context.Context) (int, error) {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, err)
 			break
+		}
+		if err := p.guard(t); err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		if err := p.send(ctx, t, snapshot[t], p.cfg.QoS, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: republish state %s: %w", t, err))
@@ -634,6 +669,14 @@ func (p *StatePublisher) record(d time.Duration) {
 
 // guard refuses a topic that matches one of the consumer's own command
 // subscriptions. See [ErrStateCommandCollision].
+//
+// Every write this publisher makes goes through it — publish, pulse,
+// republish, evict and prefix eviction alike — because the question it
+// answers is "does this process subscribe to this topic", which does not
+// depend on which call is doing the writing. The asymmetry it replaces was
+// itself the defect: a collision refused on Publish and Pulse but accepted on
+// Evict meant the one write a consumer reaches for when a device is removed
+// was also the one that echoed to itself.
 func (p *StatePublisher) guard(topic string) error {
 	for _, f := range p.cfg.CommandFilters {
 		if MatchFilter(f, topic) {

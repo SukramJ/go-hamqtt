@@ -46,6 +46,23 @@ type AvailabilityConfig struct {
 	// something else happens to flip the topic.
 	QoS byte
 
+	// CommandFilters are the topic filters the consumer subscribes for
+	// commands, and they are checked for the same reason
+	// [StateConfig.CommandFilters] are: a write that lands inside this
+	// process's own subscription is echoed back into its command handler.
+	//
+	// It matters here and not only on the state plane because
+	// [AvailabilityPublisher.Self] writes to [topic.Layout.State] — a
+	// state-plane topic, which is exactly where a collision lives — and a
+	// consumer whose availability datapoint sits under a wildcard command
+	// filter would otherwise have the same topic refused by
+	// [StatePublisher.Publish] and accepted here.
+	//
+	// Opt-in and off by default, identically to the state plane: the runtime
+	// cannot discover the consumer's subscriptions, and an empty list must
+	// not silently mean "nothing collides".
+	CommandFilters []string
+
 	// Logger receives the diagnostics. Nil means [slog.Default].
 	Logger *slog.Logger
 }
@@ -86,10 +103,11 @@ type AvailabilityConfig struct {
 // [Handler] is a self-deadlock. Hand the work to a worker, exactly as
 // [Runtime.WatchBirth] does with its replay.
 type AvailabilityPublisher struct {
-	tr     Transport
-	layout topic.Layout
-	qos    byte
-	log    *slog.Logger
+	tr      Transport
+	layout  topic.Layout
+	qos     byte
+	log     *slog.Logger
+	filters []string
 
 	mu sync.Mutex
 	// last is the payload the broker accepted per topic, and it is the
@@ -119,11 +137,12 @@ func NewAvailability(tr Transport, cfg AvailabilityConfig) *AvailabilityPublishe
 		logger = slog.Default()
 	}
 	return &AvailabilityPublisher{
-		tr:     tr,
-		layout: cfg.Layout,
-		qos:    cfg.QoS,
-		log:    logger,
-		last:   map[string][]byte{},
+		tr:      tr,
+		layout:  cfg.Layout,
+		qos:     cfg.QoS,
+		log:     logger,
+		filters: cfg.CommandFilters,
+		last:    map[string][]byte{},
 	}
 }
 
@@ -271,10 +290,27 @@ func (a *AvailabilityPublisher) Self(
 	return a.write(ctx, a.layout.State(b.Slot), SelfAvailabilityPayload(enc, available))
 }
 
+// guard refuses a topic that matches one of the consumer's own command
+// subscriptions, exactly as [StatePublisher] does and with the same
+// [ErrStateCommandCollision]. One answer to one question across the whole
+// package: three planes with three different answers to "may I write a topic
+// I also subscribe to" was the defect, not the check.
+func (a *AvailabilityPublisher) guard(t string) error {
+	for _, f := range a.filters {
+		if MatchFilter(f, t) {
+			return fmt.Errorf("%w: %s matches %s", ErrStateCommandCollision, t, f)
+		}
+	}
+	return nil
+}
+
 // write is the gated retained publish every call above lands on.
 func (a *AvailabilityPublisher) write(ctx context.Context, t string, payload []byte) (bool, error) {
 	if t == "" {
 		return false, errors.New("publisher: empty availability topic")
+	}
+	if err := a.guard(t); err != nil {
+		return false, err
 	}
 
 	a.mu.Lock()
@@ -400,6 +436,10 @@ func (a *AvailabilityPublisher) Reset() {
 // already hold — because the case it exists for is precisely a broker that
 // does not.
 //
+// It bypasses the gate but not [AvailabilityConfig.CommandFilters]: a topic
+// the consumer now subscribes to is reported as [ErrStateCommandCollision]
+// and skipped rather than echoed to its own handler.
+//
 // Best-effort per topic: a breaker open for one device must not abort the
 // replay for the fleet behind it, which would leave most of it unavailable
 // after a broker restart. A cancelled context stops the walk rather than
@@ -425,6 +465,10 @@ func (a *AvailabilityPublisher) Republish(ctx context.Context) (int, error) {
 			errs = append(errs, err)
 			break
 		}
+		if err := a.guard(t); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		if err := a.tr.Publish(ctx, t, snapshot[t], a.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: republish availability %s: %w", t, err))
 			continue
@@ -448,6 +492,11 @@ func (a *AvailabilityPublisher) Republish(ctx context.Context) (int, error) {
 // topic first only makes it unavailable for the moment in between, which an
 // operator watching the restart reads as a fault.
 //
+// A topic inside [AvailabilityConfig.CommandFilters] is refused with
+// [ErrStateCommandCollision] and left standing, as it is on every other write
+// here: an empty retained payload on a topic this process subscribes to is an
+// empty command delivered to its own handler.
+//
 // Best-effort across the list: one topic a broker refuses must not leave the
 // rest of a removed device's markers standing. Every failure is joined so the
 // caller sees the whole picture.
@@ -458,6 +507,10 @@ func (a *AvailabilityPublisher) Retract(ctx context.Context, topics ...string) e
 			// A cancelled context is a shutdown, not a per-topic failure.
 			errs = append(errs, err)
 			break
+		}
+		if err := a.guard(t); err != nil {
+			errs = append(errs, err)
+			continue
 		}
 		if err := a.tr.Publish(ctx, t, nil, a.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: retract availability %s: %w", t, err))

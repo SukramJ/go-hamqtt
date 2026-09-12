@@ -783,3 +783,49 @@ func TestAFailedFlipKeepsTheTopicInTheIndex(t *testing.T) {
 		t.Errorf("the retraction left %v in the index", got)
 	}
 }
+
+// TestAvailabilityHonoursTheCollisionGuard closes the third of the three
+// answers this package used to give to one question.
+//
+// [AvailabilityPublisher.Self] writes to [topic.Layout.State] — a state-plane
+// topic, which is precisely where a collision lives — while
+// [StatePublisher.Publish] refused that same topic. A consumer wiring both
+// planes against one command subscription got the write refused on one and
+// accepted on the other.
+func TestAvailabilityHonoursTheCollisionGuard(t *testing.T) {
+	t.Parallel()
+
+	dev := availDevice()
+	e := availEntity(dev.UID(), true)
+	bind, ok := model.Bind(e, model.RoleAvailability)
+	if !ok {
+		t.Fatal("the fixture entity lost its availability binding")
+	}
+	selfTopic := availLayout().State(bind.Slot)
+
+	b := &availBroker{}
+	a := NewAvailability(b, AvailabilityConfig{
+		Layout:         availLayout(),
+		CommandFilters: []string{selfTopic, "loom/+/availability"},
+	})
+	ctx := context.Background()
+
+	if _, err := a.Self(ctx, e, discovery.EnvelopeEncoding, true); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Self err = %v, want ErrStateCommandCollision", err)
+	}
+	if _, err := a.Publish(ctx, "loom/x/availability", true); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Publish err = %v, want ErrStateCommandCollision", err)
+	}
+	if err := a.Retract(ctx, "loom/x/availability"); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("Retract err = %v, want ErrStateCommandCollision", err)
+	}
+	if got := b.all(); len(got) != 0 {
+		t.Errorf("a guarded write reached the wire: %+v", got)
+	}
+
+	// A disjoint topic is unaffected: the guard refuses what the consumer
+	// subscribes to, not availability as such.
+	if _, err := a.Publish(ctx, "loom/ccu-01/VEQ0001/availability", true); err != nil {
+		t.Errorf("a disjoint availability topic must pass: %v", err)
+	}
+}
