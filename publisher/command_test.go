@@ -738,10 +738,20 @@ func TestCommandRouterHandlerRunsOffTheReadLoop(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	start := time.Now()
-	b.deliver("gh/lamp/set", []byte("on"), false)
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("delivery took %v while the handler was still blocked; it must not run on the read loop", elapsed)
+	// The delivery itself has to be watched from another goroutine: the
+	// handler blocks until this test releases it, so a delivery that DID
+	// run the handler inline would never reach a `time.Since` after it.
+	// Measuring elapsed time on this goroutine could only ever pass.
+	returned := make(chan struct{})
+	go func() {
+		b.deliver("gh/lamp/set", []byte("on"), false)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the delivery had not returned while the handler was still blocked; " +
+			"a handler must not run on the transport's read loop")
 	}
 	select {
 	case <-entered:
@@ -769,22 +779,60 @@ func TestCommandRouterHandlerRunsOffTheReadLoop(t *testing.T) {
 	}
 }
 
-// TestCommandRouterPreservesOrderPerTopic proves a burst on ONE topic is
-// never reordered even though several workers run, which is the property
-// that lets a consumer treat a topic as an ordered command channel.
+// TestCommandRouterPreservesOrderPerTopic proves both halves of the
+// dispatch promise: a burst on one topic is never reordered, and unrelated
+// topics do not wait for each other.
+//
+// The second half is what the earlier version of this test was missing. It
+// sent all 200 messages to ONE topic, which one worker delivers serially,
+// so the multi-worker premise was never exercised and hardcoding poolIndex
+// to 0 still passed it. Here each topic's first command parks until every
+// topic has one in flight, which only completes if the topics really landed
+// on different workers, and the barrier has a deadline so a serial pool
+// fails with a message rather than as a whole-binary timeout.
 func TestCommandRouterPreservesOrderPerTopic(t *testing.T) {
 	t.Parallel()
-	const n = 200
-	b := newCmdBroker()
-	var (
-		mu   sync.Mutex
-		seen []string
+	const (
+		lanes = 4
+		burst = 50
 	)
+	// Topics that hash to distinct workers. Asserting the premise beats
+	// assuming it: a poolIndex that collapses every key onto one worker
+	// is caught here, by name.
+	topics := make([]string, 0, lanes)
+	used := map[int]bool{}
+	for i := 0; i < 200 && len(topics) < lanes; i++ {
+		topic := "gh/lamp" + strconv.Itoa(i) + "/set"
+		slot := poolIndex(topic, DefaultCommandWorkers)
+		if used[slot] {
+			continue
+		}
+		used[slot] = true
+		topics = append(topics, topic)
+	}
+	if len(topics) != lanes {
+		t.Fatalf("only found %d topics on distinct workers; the pool is not spreading keys", len(topics))
+	}
+
+	var (
+		mu      sync.Mutex
+		seen    = map[string][]string{}
+		release = make(chan struct{})
+		entered = make(chan string, lanes)
+	)
+	b := newCmdBroker()
 	r := quietRouter(t, b, CommandConfig{})
 	if err := r.Handle("gh/+/set", func(_ context.Context, cmd Command) {
 		mu.Lock()
-		seen = append(seen, string(cmd.Payload))
+		first := len(seen[cmd.Topic]) == 0
+		seen[cmd.Topic] = append(seen[cmd.Topic], string(cmd.Payload))
 		mu.Unlock()
+		if first {
+			// Park the lane: if the four topics shared a worker, the
+			// other three could never arrive.
+			entered <- cmd.Topic
+			<-release
+		}
 	}); err != nil {
 		t.Fatalf("handle: %v", err)
 	}
@@ -793,19 +841,34 @@ func TestCommandRouterPreservesOrderPerTopic(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = r.Stop(context.Background()) })
 
-	for i := range n {
-		b.deliver("gh/lamp/set", []byte(strconv.Itoa(i)), false)
+	for i := range burst {
+		for _, topic := range topics {
+			b.deliver(topic, []byte(strconv.Itoa(i)), false)
+		}
 	}
+	for range lanes {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("not every topic had a command in flight; commands on different topics " +
+				"must not wait for each other, which is what several workers are for")
+		}
+	}
+	close(release)
 	r.WaitIdle()
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(seen) != n {
-		t.Fatalf("saw %d commands, want %d", len(seen), n)
-	}
-	for i, v := range seen {
-		if v != strconv.Itoa(i) {
-			t.Fatalf("command %d was %q — same-topic commands reordered", i, v)
+	for _, topic := range topics {
+		got := seen[topic]
+		if len(got) != burst {
+			t.Fatalf("%s saw %d commands, want %d", topic, len(got), burst)
+		}
+		for i, v := range got {
+			if v != strconv.Itoa(i) {
+				t.Fatalf("%s command %d was %q — same-topic commands reordered", topic, i, v)
+			}
 		}
 	}
 }
@@ -1050,17 +1113,54 @@ func TestFiltersOverlap(t *testing.T) {
 	}
 }
 
+// TestCommandPoolEnqueueAfterCloseDoesNotRun pins that a job arriving after
+// close is refused and SAID SO.
+//
+// "Did not run" alone is not assertable after close: no worker remains, so
+// a queue that silently accepted the job would satisfy it too — the old
+// version of this test could not fail. What distinguishes the two is the
+// warning, which is also the only evidence an operator would ever get. The
+// flush is watched from another goroutine for the same reason: a flush that
+// parked would otherwise surface as a whole-binary timeout, taking every
+// parallel test in the package down with it.
 func TestCommandPoolEnqueueAfterCloseDoesNotRun(t *testing.T) {
 	t.Parallel()
-	p := newCommandPool(2, 1, slog.New(slog.DiscardHandler))
+	var (
+		mu      sync.Mutex
+		dropped []string
+	)
+	log := slog.New(countingHandler{fn: func(msg string) {
+		mu.Lock()
+		if msg == "publisher.command.dropped_after_close" {
+			dropped = append(dropped, msg)
+		}
+		mu.Unlock()
+	}})
+	p := newCommandPool(2, 1, log)
 	p.close()
+
 	ran := make(chan struct{})
 	p.enqueue("k", func() { close(ran) })
-	p.flush()
+
+	flushed := make(chan struct{})
+	go func() {
+		p.flush()
+		close(flushed)
+	}()
+	select {
+	case <-flushed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush parked on a closed pool")
+	}
 	select {
 	case <-ran:
 		t.Fatal("a job enqueued after close ran; no worker remains to run it")
 	default:
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(dropped) != 1 {
+		t.Errorf("logged %d drops, want 1 — a discarded command an operator cannot see is a lost command", len(dropped))
 	}
 }
 
