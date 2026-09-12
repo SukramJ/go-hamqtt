@@ -38,6 +38,37 @@ type SweepRequest struct {
 	// Window overrides [Config.SweepWindow] for this pass.
 	Window time.Duration
 
+	// ReportOnly runs the pass without retracting anything: the window
+	// opens, every owned config is parsed and handed to [Inspect], the
+	// result lists what was seen in [SweepResult.Owned], and not one
+	// message goes out.
+	//
+	// It exists because looking and clearing were one act, and that
+	// coupling blocked a migration outright. openccu-loom PR #797 tried
+	// it: its one-off scrub has to run BEFORE the first snapshot, because
+	// the retraction is what makes Home Assistant forget a stale
+	// `unique_id` and the snapshot that follows re-announces under the
+	// corrected one. At that moment this runtime's claim set is empty, so
+	// an [Owns] wide enough for [Inspect] to see anything makes the
+	// ordinary pass judge the entire retained discovery fleet an orphan and
+	// delete it — the exact hazard [Runtime.Sweep] warns about. Running it
+	// after the snapshot finds nothing, because the retained payload is by
+	// then already the corrected one. That consumer therefore kept a second
+	// hand-rolled broker snapshot beside this one, purely because the
+	// library could not be asked to report without acting.
+	//
+	// This is the pass that is safe before the first publish, and the
+	// ordinary one explicitly is not. It is also the one mode in which a
+	// deliberately wide Owns — `func(ConfigTopic) bool { return true }`, to
+	// see a whole shared discovery tree — costs nothing, because a pass
+	// that retracts nothing cannot retract another writer's config either.
+	// The caller then decides, and retracts through [Runtime.Retract] with
+	// a list it chose itself.
+	//
+	// False — the zero value — is the retracting pass every release before
+	// v0.27.0 performed, so a consumer that says nothing is unchanged.
+	ReportOnly bool
+
 	// Inspect, when set, receives the retained body of every owned config
 	// the window delivers, before the pass decides whether to retract it.
 	//
@@ -69,7 +100,17 @@ type SweepRequest struct {
 type SweepResult struct {
 	// Inspected counts the owned config topics the window delivered.
 	Inspected int
+	// Owned lists those same topics, in arrival order.
+	//
+	// A caller doing its own judging needs the list it judged, not just its
+	// size — and under [SweepRequest.ReportOnly] it is the entire output of
+	// the pass, since [Retracted] is then empty by construction. It is
+	// filled on both kinds of pass: a retracting pass's Owned minus its
+	// Retracted is what this process still claims, which is the number an
+	// operator reads a sweep log line for.
+	Owned []string
 	// Retracted lists the topics actually cleared, sorted by arrival.
+	// Always empty under [SweepRequest.ReportOnly].
 	Retracted []string
 }
 
@@ -102,9 +143,13 @@ type SweepResult struct {
 //     [Runtime.PublishBundle] therefore does its own targeted retraction and
 //     does not wait for this pass.
 //
-// Both topic forms are recognised — see [ParseConfigTopic]. One snapshot
+// All three topic forms are recognised — see [ParseConfigTopic]. One snapshot
 // window runs at a time per runtime; a second call waits, bounded by its own
 // context.
+//
+// [SweepRequest.ReportOnly] turns the pass into a look without a touch, and
+// that is the version which may run before the first publish. This one may
+// not.
 func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, error) {
 	if req.Owns == nil {
 		return SweepResult{}, ErrSweepUnscoped
@@ -130,6 +175,7 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 	var (
 		mu        sync.Mutex
 		candidate []string
+		owned     []string
 		inspected int
 	)
 	collect := func(topic string, payload []byte, _ bool) {
@@ -144,6 +190,7 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 		}
 		mu.Lock()
 		inspected++
+		owned = append(owned, topic)
 		mu.Unlock()
 
 		if req.Inspect != nil {
@@ -167,8 +214,20 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 	// can still be inside the append while this goroutine reads.
 	mu.Lock()
 	topics := append([]string(nil), candidate...)
-	result := SweepResult{Inspected: inspected}
+	result := SweepResult{Inspected: inspected, Owned: append([]string(nil), owned...)}
 	mu.Unlock()
+
+	if req.ReportOnly {
+		// Returned before the retraction loop rather than skipped inside
+		// it: there is no branch further down that could be reached with
+		// ReportOnly set, so the promise in the doc comment is a property
+		// of the control flow and not of five conditions staying in
+		// agreement.
+		r.log.Debug("publisher.sweep.report_only",
+			slog.Int("inspected", result.Inspected),
+			slog.Int("unclaimed", len(topics)))
+		return result, nil
+	}
 
 	for _, t := range topics {
 		if err := ctx.Err(); err != nil {

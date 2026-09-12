@@ -275,3 +275,94 @@ func TestSweepReportsOnlyWhatItCleared(t *testing.T) {
 		t.Error("the refused topic is no longer retained, so the refusal was not real")
 	}
 }
+
+// TestSweepReportOnlyLooksWithoutTouching is the measured need of
+// [SweepRequest.ReportOnly]: openccu-loom PR #797 had to give up on this pass
+// because looking and clearing were one act. Its one-off scrub must run
+// before the first snapshot, when the claim set is still empty — so the
+// retracting pass would have deleted the entire retained discovery fleet.
+//
+// The assertion that matters is the negative one: not a single message leaves
+// the process, and the broker still holds every topic afterwards.
+func TestSweepReportOnlyLooksWithoutTouching(t *testing.T) {
+	t.Parallel()
+	f := newFake()
+	f.seed("homeassistant/sensor/ccu_old/temperature/config", []byte(`{"old":1}`))
+	f.seed("homeassistant/device/ccu_gone/config", []byte(`{"old":2}`))
+	f.seed("homeassistant/sensor/zigbee_thing/x/config", []byte(`{"theirs":1}`))
+
+	// The claim set is empty, exactly as it is before the first snapshot —
+	// which is what makes the retracting pass unusable there.
+	r := New(f, Config{})
+	res, err := r.Sweep(context.Background(), SweepRequest{
+		Owns:       ownsNode("ccu_"),
+		Window:     testWindow,
+		ReportOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if len(res.Retracted) != 0 {
+		t.Fatalf("retracted %v — a report-only pass must clear nothing", res.Retracted)
+	}
+	if n := f.count("publish"); n != 0 {
+		t.Fatalf("%d publishes — a report-only pass must not write at all", n)
+	}
+	for _, topic := range []string{
+		"homeassistant/sensor/ccu_old/temperature/config",
+		"homeassistant/device/ccu_gone/config",
+		"homeassistant/sensor/zigbee_thing/x/config",
+	} {
+		if !f.holds(topic) {
+			t.Fatalf("%s was cleared — the whole point is that it survives", topic)
+		}
+	}
+
+	// And it reports what it judged, which is what lets the caller retract
+	// a list of its own: the two owned topics, not the third writer's.
+	owned := append([]string(nil), res.Owned...)
+	slices.Sort(owned)
+	want := []string{
+		"homeassistant/device/ccu_gone/config",
+		"homeassistant/sensor/ccu_old/temperature/config",
+	}
+	if !reflect.DeepEqual(owned, want) {
+		t.Fatalf("owned %v want %v", owned, want)
+	}
+	if res.Inspected != 2 {
+		t.Fatalf("inspected %d want 2", res.Inspected)
+	}
+}
+
+// TestSweepReportsOwnedOnARetractingPassToo pins that Owned is not a
+// report-only field: on an ordinary pass, Owned minus Retracted is what this
+// process still claims, and a result that reported only the retractions could
+// not tell a window that saw nothing from one that found nothing to do.
+func TestSweepReportsOwnedOnARetractingPassToo(t *testing.T) {
+	t.Parallel()
+	f := newFake()
+	f.seed("homeassistant/sensor/ccu_old/temperature/config", []byte(`{"old":1}`))
+	f.seed("homeassistant/sensor/ccu_live/temperature/config", []byte(`{"live":0}`))
+
+	r := New(f, Config{})
+	ctx := context.Background()
+	if _, err := r.Publish(ctx, "homeassistant/sensor/ccu_live/temperature/config", []byte(`{"live":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.Sweep(ctx, SweepRequest{Owns: ownsNode("ccu_"), Window: testWindow})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	owned := append([]string(nil), res.Owned...)
+	slices.Sort(owned)
+	want := []string{
+		"homeassistant/sensor/ccu_live/temperature/config",
+		"homeassistant/sensor/ccu_old/temperature/config",
+	}
+	if !reflect.DeepEqual(owned, want) {
+		t.Fatalf("owned %v want %v — the claimed config must be reported as seen, not only spared", owned, want)
+	}
+	if len(res.Retracted) != 1 {
+		t.Fatalf("retracted %v want just the orphan", res.Retracted)
+	}
+}
