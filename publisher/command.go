@@ -318,13 +318,25 @@ type CommandRouter struct {
 	routes  []route
 	started bool
 	stopped bool
-
+	// pool is nil until Start and nil again after Stop, so a router that
+	// is built and abandoned owns no goroutines. See
+	// [NewCommandRouter].
 	pool *commandPool
 }
 
 // NewCommandRouter builds a router over tr. A nil transport panics here
 // rather than on the first subscribe, where the stack no longer names the
 // composition root that got it wrong — the same bargain [New] makes.
+//
+// Construction starts no goroutines: the worker pool belongs to
+// [CommandRouter.Start] and is reclaimed by [CommandRouter.Stop]. It used
+// to be started here, and a router that never reached Start therefore
+// leaked [CommandConfig.Workers] goroutines parked on a condition variable
+// with nothing left to reclaim them — measured at eight per router, 2 -> 82
+// goroutines over ten routers built and discarded. Three ordinary paths get
+// there: a [CommandRouter.Handle] that reports an error at a composition
+// root, a config reload replacing the router (see
+// [CommandConfig.Lifecycle]), and a failed Start the consumer gives up on.
 func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if tr == nil {
 		panic("publisher: nil transport")
@@ -345,12 +357,7 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CommandRouter{
-		tr:   tr,
-		cfg:  cfg,
-		log:  logger,
-		pool: newCommandPool(cfg.Workers, cfg.QueueDepth, logger),
-	}
+	return &CommandRouter{tr: tr, cfg: cfg, log: logger}
 }
 
 // Handle registers handler for filter. Call it for every route before
@@ -482,6 +489,9 @@ func (r *CommandRouter) Start(ctx context.Context) error {
 		return ErrRouterStarted
 	}
 	r.started = true
+	// The pool must exist before the first subscribe: a broker may
+	// deliver on a subscription the moment it acknowledges it.
+	r.pool = newCommandPool(r.cfg.Workers, r.cfg.QueueDepth, r.log)
 	filters := r.routeFiltersLocked()
 	r.mu.Unlock()
 
@@ -495,7 +505,13 @@ func (r *CommandRouter) Start(ctx context.Context) error {
 			// a consumer whose start just failed, so the gate closes
 			// permanently rather than pretending the rollback worked.
 			r.stopped = len(live) > 0
+			pool := r.pool
+			r.pool = nil
 			r.mu.Unlock()
+			// Nothing will be enqueued now, so the workers this Start
+			// spun up are reclaimed here rather than waiting for a
+			// Stop the consumer has no reason to call.
+			pool.close()
 			if len(live) > 0 {
 				return fmt.Errorf("publisher: subscribe %s: %w (rollback failed, still subscribed: %s; router closed)",
 					f, err, strings.Join(live, ", "))
@@ -589,6 +605,8 @@ func (r *CommandRouter) Stop(ctx context.Context) error {
 	r.stopped = true
 	started := r.started
 	filters := r.routeFiltersLocked()
+	pool := r.pool
+	r.pool = nil
 	r.mu.Unlock()
 
 	var errs []error
@@ -599,7 +617,9 @@ func (r *CommandRouter) Stop(ctx context.Context) error {
 			}
 		}
 	}
-	r.pool.close()
+	// Outside r.mu: close drains, so it blocks on whatever a handler is
+	// doing, and a handler is free to call back into the router.
+	pool.close()
 	return errors.Join(errs...)
 }
 
@@ -611,7 +631,15 @@ func (r *CommandRouter) Stop(ctx context.Context) error {
 // asserts on its fake sink is racing the router. Production code does not
 // need it — commands are fire-and-forget by design, and shutdown is
 // [CommandRouter.Stop]'s job.
-func (r *CommandRouter) WaitIdle() { r.pool.flush() }
+//
+// A no-op on a router that has not started or has stopped: there is
+// nothing accepted to wait for.
+func (r *CommandRouter) WaitIdle() {
+	r.mu.Lock()
+	pool := r.pool
+	r.mu.Unlock()
+	pool.flush()
+}
 
 // Route reports which registered filter claims topic, and what its wildcards
 // matched.
@@ -703,7 +731,8 @@ func (r *CommandRouter) subscribe(ctx context.Context, filter string) error {
 // beyond resolving the route is an enqueue.
 func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained bool) {
 	r.mu.Lock()
-	stopped := r.stopped
+	stopped := r.stopped || r.pool == nil
+	pool := r.pool
 	cmd, handler, ok := r.resolveLocked(topic)
 	r.mu.Unlock()
 
@@ -732,7 +761,7 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 	cmd.Retained = retained
 	// Keyed by topic, so two commands for the same entity never reorder
 	// while unrelated entities proceed in parallel.
-	r.pool.enqueue(topic, func() {
+	pool.enqueue(topic, func() {
 		ctx, cancel := context.WithCancel(r.cfg.Lifecycle)
 		defer cancel()
 		handler(ctx, cmd)

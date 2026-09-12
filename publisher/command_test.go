@@ -1204,3 +1204,86 @@ func TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails(t *testing.T
 			"because a command now runs against half-initialised dependencies", got)
 	}
 }
+
+// TestCommandRouterOwnsNoGoroutinesUntilStarted is the regression for the
+// leak: the pool used to be started in NewCommandRouter, so a router that
+// never reached Start left its workers parked on a condition variable with
+// nothing to reclaim them — eight goroutines per router, measured at 2 -> 82
+// over ten routers built and discarded. Three ordinary paths get there: a
+// Handle that errors at a composition root, a config reload replacing the
+// router, and a failed Start the consumer gives up on.
+//
+// Asserted on the pool field rather than by counting goroutines, because a
+// count is not attributable in a package whose tests run in parallel.
+func TestCommandRouterOwnsNoGoroutinesUntilStarted(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	r := quietRouter(t, b, CommandConfig{})
+
+	// Built and abandoned: the composition root's Handle failed.
+	if err := r.Handle("a/#/b", (&recorder{}).handle); err == nil {
+		t.Fatal("fixture broke: that filter is malformed")
+	}
+	r.mu.Lock()
+	pool := r.pool
+	r.mu.Unlock()
+	if pool != nil {
+		t.Fatal("construction started the worker pool; a router that never starts must own no goroutines")
+	}
+
+	if err := r.Handle("gh/+/set", (&recorder{}).handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	r.mu.Lock()
+	pool = r.pool
+	r.mu.Unlock()
+	if pool == nil {
+		t.Fatal("Start left no pool; the workers are what take handlers off the read loop")
+	}
+	if err := r.Stop(context.Background()); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	r.mu.Lock()
+	after := r.pool
+	r.mu.Unlock()
+	if after != nil {
+		t.Error("Stop left the pool in place")
+	}
+	// close() returns only once every worker has exited, so a closed
+	// queue set proves the goroutines are gone, not merely unreferenced.
+	for i, q := range pool.queues {
+		q.mu.Lock()
+		closed := q.closed
+		q.mu.Unlock()
+		if !closed {
+			t.Errorf("worker queue %d survived Stop", i)
+		}
+	}
+}
+
+// TestCommandRouterFailedStartReclaimsItsWorkers pins the third path into
+// the leak: a Start that fails spins up the pool before its first subscribe
+// (a broker may deliver the moment it acknowledges one) and must hand it
+// back, because the consumer has been told the start failed and has no
+// reason to call Stop.
+func TestCommandRouterFailedStartReclaimsItsWorkers(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	b.failSubscribe = func(string) error { return errors.New("broker said no") }
+	r := quietRouter(t, b, CommandConfig{})
+	if err := r.Handle("gh/+/set", (&recorder{}).handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	if err := r.Start(context.Background()); err == nil {
+		t.Fatal("fixture broke: the subscribe must fail")
+	}
+	r.mu.Lock()
+	pool := r.pool
+	r.mu.Unlock()
+	if pool != nil {
+		t.Error("a failed Start kept its worker pool alive")
+	}
+}
