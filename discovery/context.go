@@ -4,6 +4,8 @@
 package discovery
 
 import (
+	"strings"
+
 	"github.com/SukramJ/go-hamqtt/model"
 	"github.com/SukramJ/go-hamqtt/topic"
 )
@@ -26,6 +28,13 @@ type StdContext struct {
 	Enc Encoding
 	// Translator resolves a catalogue key into [Lang]. Nil means the key is
 	// its own label, which is what a consumer with no catalogue wants.
+	//
+	// It stays a plain key -> string lookup although [Translate] now takes
+	// arguments: the catalogue answers with the template as authored, and
+	// the substitution is [StdContext]'s job. A consumer whose translator
+	// already exists therefore keeps it unchanged and gains the parameters
+	// for free — which is what the measured consumer's own two-function
+	// pairing (a lookup plus a placeholder helper beside it) collapses to.
 	Translator func(key string) string
 }
 
@@ -87,12 +96,37 @@ func (c StdContext) MethodTopic(dev *model.Device, e model.Entity, method string
 
 // Translate implements [Context]. Without a translator a key is its own
 // label, so a consumer with no catalogue still renders something readable
-// rather than an empty string.
-func (c StdContext) Translate(key string) string {
-	if c.Translator == nil {
-		return key
+// rather than an empty string — placeholders included, so a missing
+// catalogue entry degrades to a readable key rather than to a half-filled
+// sentence.
+func (c StdContext) Translate(key string, args map[string]string) string {
+	text := key
+	if c.Translator != nil {
+		text = c.Translator(key)
 	}
-	return c.Translator(key)
+	return Substitute(text, args)
+}
+
+// Substitute fills `{name}` placeholders in text from args.
+//
+// Exported because a consumer that overrides [Context.Translate] — to reach
+// its own catalogue, or to pick a plural form — still wants the same
+// substitution the default does, and writing it again is how two call sites
+// end up disagreeing about the placeholder syntax. The measured consumer had
+// a private helper doing exactly this, for exactly one placeholder.
+//
+// A placeholder with no matching argument is left standing rather than
+// blanked: an entity named "Connectivity {iface}" says where the gap is,
+// while "Connectivity " says only that something went wrong somewhere.
+func Substitute(text string, args map[string]string) string {
+	if len(args) == 0 || !strings.ContainsRune(text, '{') {
+		return text
+	}
+	pairs := make([]string, 0, 2*len(args))
+	for k, v := range args {
+		pairs = append(pairs, "{"+k+"}", v)
+	}
+	return strings.NewReplacer(pairs...).Replace(text)
 }
 
 // deviceSlot is the device-level coordinate an availability topic is
@@ -168,6 +202,11 @@ func (c StdContext) Availability(dev *model.Device, e model.Entity) []Availabili
 			if entry, ok := c.selfAvailability(e); ok {
 				out = append(out, entry)
 			}
+
+		case model.LevelNone:
+			// Unreachable: [model.Availability.Resolved] answers a list
+			// containing it with no levels at all. Named anyway so the
+			// exhaustiveness check keeps pointing here if that changes.
 		}
 	}
 	return out

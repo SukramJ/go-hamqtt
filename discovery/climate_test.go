@@ -354,7 +354,7 @@ func TestAggregateSitsWithItsParts(t *testing.T) {
 func TestTranslateFallsBackToTheKey(t *testing.T) {
 	t.Parallel()
 
-	if got := (discovery.StdContext{}).Translate("discovery.entity_name.boost"); got != "discovery.entity_name.boost" {
+	if got := (discovery.StdContext{}).Translate("discovery.entity_name.boost", nil); got != "discovery.entity_name.boost" {
 		t.Errorf("Translate = %q, want the key unchanged", got)
 	}
 	ctx := discovery.StdContext{Translator: func(k string) string {
@@ -363,7 +363,7 @@ func TestTranslateFallsBackToTheKey(t *testing.T) {
 		}
 		return k
 	}}
-	if got := ctx.Translate("discovery.entity_name.boost"); got != "Boost" {
+	if got := ctx.Translate("discovery.entity_name.boost", nil); got != "Boost" {
 		t.Errorf("Translate = %q, want Boost", got)
 	}
 }

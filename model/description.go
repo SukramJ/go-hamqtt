@@ -43,6 +43,25 @@ const (
 	// LevelSelf is the entity's own [RoleAvailability] binding, for a
 	// datapoint that reports its own validity.
 	LevelSelf
+	// LevelNone is the explicit absence of availability: no `availability`
+	// list and no `availability_mode`, which is not the same as saying
+	// nothing (the zero [Availability], which means bridge and device).
+	//
+	// One measured entity needs it: a bridge's own daemon-status sensor,
+	// whose state topic IS the bridge LWT. Gating it on that topic makes it
+	// unavailable in exactly the situation it exists to report, so the
+	// consumer cleared both keys again after rendering — the only escape
+	// hatch of its plane that was not platform vocabulary.
+	//
+	// It is a level rather than an explicitly-empty Levels slice because
+	// nil and empty are the same thing at every call site that builds a
+	// list conditionally, and a rule table that filtered its levels down to
+	// none would then silently mean "none" where it means "the default".
+	// Naming the absence makes it a statement instead of a leftover.
+	//
+	// LevelNone wins over anything listed beside it: an entity that says it
+	// has no availability has none, whatever else the list accumulated.
+	LevelNone
 )
 
 // AvailabilityMode says how several availability sources combine. The values
@@ -69,7 +88,9 @@ const (
 // it can never deliver the news.
 //
 // That case is expressed by omission — Levels: {LevelBridge} — rather than by
-// an opt-out flag, which is why there is no such flag.
+// an opt-out flag, which is why there is no such flag. Its limit case, an
+// entity that must carry no availability at all, is [LevelNone]: see
+// [NoAvailability].
 type Availability struct {
 	// Levels are the sources. Empty means the default: bridge and device.
 	Levels []AvailabilityLevel
@@ -78,7 +99,17 @@ type Availability struct {
 }
 
 // Resolved returns the effective levels and mode, applying the defaults.
+//
+// [LevelNone] resolves to no levels AND no mode, which is what suppresses
+// `availability_mode` along with the list — a mode beside an absent list is
+// the one combination Home Assistant reads as a contradiction and the reason
+// the measured consumer had to clear both by hand.
 func (a Availability) Resolved() ([]AvailabilityLevel, AvailabilityMode) {
+	for _, l := range a.Levels {
+		if l == LevelNone {
+			return nil, ""
+		}
+	}
 	levels := a.Levels
 	if len(levels) == 0 {
 		levels = []AvailabilityLevel{LevelBridge, LevelDevice}
@@ -99,6 +130,14 @@ func (a Availability) Has(l AvailabilityLevel) bool {
 		}
 	}
 	return false
+}
+
+// NoAvailability is the daemon-status case: an entity that must stay visible
+// precisely when the thing an availability topic would gate it on is gone.
+// Named so a call site reads as the intent rather than as a one-element list
+// literal of a constant called None.
+func NoAvailability() Availability {
+	return Availability{Levels: []AvailabilityLevel{LevelNone}}
 }
 
 // BridgeOnly is the connectivity-sensor case, named so call sites read as the
@@ -132,6 +171,23 @@ type Description struct {
 	// renders something readable.
 	NameKey string
 
+	// NameArgs fills the placeholders of the string NameKey resolves to,
+	// and of a literal Name that carries any: a key whose value is
+	// "Connectivity {iface}" renders with NameArgs{"iface": "HmIP-RF"}.
+	//
+	// Without it a parameterised name has to be resolved eagerly by the
+	// consumer and passed as a literal Name, which bypasses the NameKey
+	// path entirely — the catalogue key never reaches the model, so nothing
+	// downstream can re-render it in another language. Two measured entity
+	// families (install-mode and per-interface connectivity) did exactly
+	// that, each with its own substitution helper beside the translator.
+	//
+	// A named map rather than positional arguments because the placeholder
+	// is written in the catalogue, by a translator, in a sentence whose word
+	// order is not the source language's — a positional %s cannot be moved
+	// by the person who has to move it.
+	NameArgs map[string]string
+
 	// DeviceClass, StateClass and Unit are Home Assistant's measurement
 	// vocabulary. Their legal combinations are not free — see
 	// [hacatalog.Relations] — and [discovery.Validate] enforces them.
@@ -162,6 +218,33 @@ type Description struct {
 
 	// Availability says which sources gate this entity.
 	Availability Availability
+
+	// Optimistic maps to `optimistic`: Home Assistant assumes a command
+	// took effect instead of waiting for the state topic to confirm it.
+	//
+	// It is not platform-specific vocabulary — switch, select, text and
+	// number all declare it, 17 platforms in total — but it was reachable
+	// only through a [discovery.Builder] or Extra, which is why eight
+	// measured hub entities set it after rendering. Pointer for the same
+	// reason Enabled is: nil defers to Home Assistant's default, which is
+	// not the same as an explicit false.
+	//
+	// It is projected only onto the platforms whose schema declares it; the
+	// rest silently drop it, so emitting it there would be invisible noise.
+	Optimistic *bool
+
+	// JSONAttributesTopic and JSONAttributesTemplate attach a whole JSON
+	// document to the entity as attributes — the way a consumer publishes a
+	// datapoint's descriptor, or an aggregate's detail rows, without
+	// inventing an entity per field.
+	//
+	// 30 of the 32 platforms accept them, the same bar the other
+	// description-level keys meet, and three measured message aggregates
+	// set them in a post-render builder because the description could not.
+	// The template is only meaningful beside the topic and is projected
+	// only with it.
+	JSONAttributesTopic    string
+	JSONAttributesTemplate string
 
 	// ValueTemplate overrides the template the render pipeline would derive
 	// from the context's encoding.
@@ -212,6 +295,12 @@ func (d *Description) Clone() *Description {
 		out.Name.Lang = make(map[string]string, len(d.Name.Lang))
 		for k, v := range d.Name.Lang {
 			out.Name.Lang[k] = v
+		}
+	}
+	if d.NameArgs != nil {
+		out.NameArgs = make(map[string]string, len(d.NameArgs))
+		for k, v := range d.NameArgs {
+			out.NameArgs[k] = v
 		}
 	}
 	if d.Availability.Levels != nil {
