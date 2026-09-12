@@ -190,11 +190,17 @@ type CommandHandler func(ctx context.Context, cmd Command)
 //
 // MQTT 5.0 §3.8.3.1 has an option for exactly this, and go-mqtt exposes it
 // as WithNoLocal. A transport that can pass it implements this interface and
-// the router uses it; one that cannot — the shipped go-mqtt adapter today,
-// whose Subscribe takes no options — is subscribed to normally. Either way
-// [CommandRouter.CheckDisjoint] remains the load-bearing guard: No Local is
-// v5-only, and it does nothing about a second process in the same deployment
-// publishing the same tree.
+// the router uses it; one that cannot — a consumer's own hand-rolled
+// transport, or a test fake — is subscribed to normally. The shipped go-mqtt
+// adapter does implement it: publisher/gomqtt compile-asserts the interface
+// and passes mqtt.WithNoLocal, so a consumer on the shipped adapter takes
+// the safe path without asking for it.
+//
+// Either way [CommandRouter.CheckDisjoint] remains the load-bearing guard,
+// and on two counts. No Local is v5-only — go-mqtt sets the bit only for
+// V50, so a v3.1.1 link silently ignores the option and the echo class is
+// wide open — and it says nothing about a second process in the same
+// deployment publishing the same tree.
 type NoLocalSubscriber interface {
 	// SubscribeNoLocal is [Transport.Subscribe] with the MQTT 5.0 No Local
 	// option set.
