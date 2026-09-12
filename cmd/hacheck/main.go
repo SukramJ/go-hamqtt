@@ -29,7 +29,9 @@
 // Exit status is 1 when any payload carries a blocking finding — something
 // Home Assistant would reject or silently strip — and 0 when the only
 // findings are advisories, which are values Home Assistant accepts and then
-// rewrites.
+// rewrites, or wires to do the wrong thing. The two runtime-layer wiring
+// checks are in runtime.go; the cross-payload half of the runtime layer
+// cannot be seen from one record and is hadoctor's.
 package main
 
 import (
@@ -103,7 +105,7 @@ func run(in io.Reader, prefix string) ([]finding, int, error) {
 			// down, which the summary should not hide.
 			return nil
 		}
-		findings = append(findings, check(rec.Topic, topic, body)...)
+		findings = append(findings, check(rec.Topic, topic, body, prefix)...)
 		return nil
 	})
 	if err != nil {
@@ -114,14 +116,15 @@ func run(in io.Reader, prefix string) ([]finding, int, error) {
 
 // check validates one retained config, in whichever of the two discovery
 // forms its topic said it is.
-func check(topic string, t dump.Topic, body map[string]any) []finding {
+func check(topic string, t dump.Topic, body map[string]any, prefix string) []finding {
 	if t.Form == dump.FormBundle {
-		return checkBundle(topic, t.Node, body)
+		return checkBundle(topic, t.Node, body, prefix)
 	}
-	return collect(topic, t.Label(), discovery.ValidateBody(hacatalog.Platform(t.Platform), body))
+	out := collect(topic, t.Label(), discovery.ValidateBody(hacatalog.Platform(t.Platform), body))
+	return append(out, checkRuntime(topic, t.Label(), body, prefix)...)
 }
 
-func checkBundle(topic, node string, body map[string]any) []finding {
+func checkBundle(topic, node string, body map[string]any, prefix string) []finding {
 	comps, ok := body["components"].(map[string]any)
 	if !ok {
 		return []finding{{
@@ -135,7 +138,10 @@ func checkBundle(topic, node string, body map[string]any) []finding {
 	}
 	sort.Strings(keys)
 
-	var out []finding
+	// The document's own frame may carry an availability list that applies
+	// to every component, so it is checked once here rather than missed
+	// entirely — a wrongly-treed topic there affects the whole device.
+	out := checkAvailabilityTree(topic, node, body, prefix)
 	for _, key := range keys {
 		comp, ok := comps[key].(map[string]any)
 		if !ok {
@@ -159,6 +165,7 @@ func checkBundle(topic, node string, body map[string]any) []finding {
 		}
 		out = append(out, collect(topic, node+"/"+key,
 			discovery.ValidateBody(hacatalog.Platform(platform), comp))...)
+		out = append(out, checkRuntime(topic, node+"/"+key, comp, prefix)...)
 	}
 	return out
 }

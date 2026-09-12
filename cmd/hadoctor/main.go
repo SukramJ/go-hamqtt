@@ -20,6 +20,21 @@
 // Feeding it only `homeassistant/#` is the one way to get a wrong answer
 // from it — every state topic would look unpublished — so it refuses to
 // report when the capture contains nothing but discovery topics.
+//
+// What it reports, in the order the report leads with:
+//
+//	form-conflict         one unique_id retained in BOTH discovery forms
+//	command-echo          a command topic something also publishes
+//	dead-availability     an availability topic that carries nothing
+//	dead-state            a state topic that carries nothing
+//	no-availability       an entity that declares none at all
+//	orphan-availability   a retained availability marker no config names
+//
+// Everything but the last sets exit 1. `orphan-availability` is the one
+// verdict a capture cannot reach on its own — a shared broker legitimately
+// carries other integrations' unreferenced markers — so it is reported and
+// left to the operator. See runtime.go for what each of the first two costs
+// when it ships.
 package main
 
 import (
@@ -74,6 +89,25 @@ type capture struct {
 	// tells a full capture from a discovery-only one.
 	nonDiscovery int
 	declared     []entity
+
+	// markers holds the retained topics outside the discovery tree whose
+	// payload is an availability token, keyed by topic. It is what the
+	// orphan check reads; see [maxMarkerPayload] for why only these bodies
+	// are kept.
+	markers map[string]string
+	// byUniqueID records which discovery forms each unique id was retained
+	// in, which is the only way to see the migration conflict Home
+	// Assistant reports with a log line and nothing else.
+	byUniqueID map[string]*formsSeen
+}
+
+// formsSeen is the config topics one unique id was found on, per discovery
+// form. Both lists rather than two booleans because the report has to name
+// the topics an operator must retract, and "you have a conflict somewhere"
+// is not an actionable sentence.
+type formsSeen struct {
+	entity []string
+	bundle []string
 }
 
 // entity is one declared thing and the topics it depends on.
@@ -84,10 +118,22 @@ type entity struct {
 	// state is the topic it reads its value from, empty for a write-only
 	// platform.
 	state string
+	// commands are the topics Home Assistant publishes to for this entity.
+	// Empty for a read-only entity, which is most of them.
+	commands []string
+	// reads are every topic this entity tells Home Assistant to read, not
+	// just `state_topic`: a climate names one per role, a cover names its
+	// position separately. The echo check needs all of them, because an
+	// overlap with any one of them is the same self-inflicted write.
+	reads []string
 }
 
 func load(in io.Reader, prefix string) (*capture, error) {
-	c := &capture{published: map[string]bool{}}
+	c := &capture{
+		published:  map[string]bool{},
+		markers:    map[string]string{},
+		byUniqueID: map[string]*formsSeen{},
+	}
 	err := dump.Read(in, func(rec dump.Record) error {
 		if !dump.IsEmpty(rec.Payload) {
 			c.published[rec.Topic] = true
@@ -96,6 +142,7 @@ func load(in io.Reader, prefix string) (*capture, error) {
 		if !ok {
 			if !strings.HasPrefix(rec.Topic, strings.TrimSuffix(prefix, "/")+"/") {
 				c.nonDiscovery++
+				c.noteMarker(rec)
 			}
 			return nil
 		}
@@ -120,11 +167,13 @@ func load(in io.Reader, prefix string) (*capture, error) {
 					continue
 				}
 				c.entities++
+				c.noteUniqueID(comp, rec.Topic, dump.FormBundle)
 				c.declared = append(c.declared, read(topic.Node+"/"+k, comp, body))
 			}
 			return nil
 		}
 		c.entities++
+		c.noteUniqueID(body, rec.Topic, dump.FormEntity)
 		c.declared = append(c.declared, read(topic.Label(), body, nil))
 		return nil
 	})
@@ -142,6 +191,8 @@ func load(in io.Reader, prefix string) (*capture, error) {
 func read(label string, body, frame map[string]any) entity {
 	e := entity{label: label}
 	e.state, _ = body["state_topic"].(string)
+	e.commands = commandTopicsOf(body)
+	e.reads = readTopicsOf(body)
 	e.availability = availabilityTopics(body)
 	if len(e.availability) == 0 && frame != nil {
 		e.availability = availabilityTopics(frame)
@@ -205,6 +256,7 @@ func diagnose(c *capture) []diagnosis {
 			})
 		}
 	}
+	out = append(out, diagnoseRuntime(c)...)
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].kind != out[j].kind {
 			return rank(out[i].kind) < rank(out[j].kind)
@@ -218,12 +270,25 @@ func diagnose(c *capture) []diagnosis {
 // means the entity is unusable right now; a missing one means it lies later.
 func rank(kind string) int {
 	switch kind {
-	case "dead-availability":
+	case "form-conflict":
+		// First because it is the only kind where the payload an operator
+		// is looking at is not the one Home Assistant is using.
 		return 0
-	case "dead-state":
+	case "command-echo":
+		// Second: the consumer is actively writing to a device it did not
+		// mean to write to, which is the only kind that changes the world.
 		return 1
-	default:
+	case "dead-availability":
 		return 2
+	case "dead-state":
+		return 3
+	case "orphan-availability":
+		// Last, because it is the only kind whose verdict is the
+		// operator's rather than the tool's.
+		return 5
+	default:
+		// no-availability: the entity works until the bridge dies.
+		return 4
 	}
 }
 
@@ -244,7 +309,13 @@ func report(w io.Writer, found []diagnosis) int {
 	for _, k := range kinds {
 		fprintf(w, "%-20s %d\n", k, byKind[k])
 	}
-	if byKind["dead-availability"] > 0 || byKind["dead-state"] > 0 {
+	// orphan-availability is deliberately not here. It is the only kind
+	// whose verdict needs an ownership judgement a capture cannot make —
+	// a shared broker legitimately carries other integrations' unreferenced
+	// markers — so it is reported and left to the operator rather than
+	// failing a CI run somebody else's zigbee2mqtt would break.
+	if byKind["dead-availability"] > 0 || byKind["dead-state"] > 0 ||
+		byKind["form-conflict"] > 0 || byKind["command-echo"] > 0 {
 		return 1
 	}
 	return 0
@@ -255,4 +326,44 @@ func report(w io.Writer, found []diagnosis) int {
 // there is nowhere left to report that to.
 func fprintf(w io.Writer, format string, a ...any) {
 	_, _ = fmt.Fprintf(w, format, a...)
+}
+
+// noteMarker records a retained availability-shaped payload outside the
+// discovery tree.
+//
+// Only the short ones: the orphan check compares against four tokens, and
+// keeping every body of a full `#` capture to answer a question about seven
+// bytes is what makes an operator stop running the tool. See
+// [maxMarkerPayload].
+func (c *capture) noteMarker(rec dump.Record) {
+	body := strings.TrimSpace(string(rec.Payload))
+	if len(body) > maxMarkerPayload {
+		return
+	}
+	// A capture gives a payload either as a JSON string or as a bare token,
+	// depending on which source produced it — the same split [dump.Object]
+	// exists for — so both are unwrapped before the comparison.
+	body = strings.Trim(body, `"`)
+	if !availabilityPayloads[strings.ToLower(body)] {
+		return
+	}
+	c.markers[rec.Topic] = body
+}
+
+// noteUniqueID records which discovery form a unique id was retained in.
+func (c *capture) noteUniqueID(body map[string]any, topic string, form dump.Form) {
+	id, _ := body["unique_id"].(string)
+	if id == "" {
+		return
+	}
+	seen := c.byUniqueID[id]
+	if seen == nil {
+		seen = &formsSeen{}
+		c.byUniqueID[id] = seen
+	}
+	if form == dump.FormBundle {
+		seen.bundle = append(seen.bundle, topic)
+		return
+	}
+	seen.entity = append(seen.entity, topic)
 }
