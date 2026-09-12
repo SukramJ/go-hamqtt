@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
 )
@@ -418,7 +419,7 @@ func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if err := ValidateFilter(filter); err != nil {
 		return err
 	}
-	parts := strings.Split(filter, "/")
+	parts := filterParts(filter)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -820,13 +821,74 @@ func (r *CommandRouter) routeFiltersLocked() []string {
 	return out
 }
 
+// sharedPrefix introduces a shared subscription, MQTT 5.0 §4.8.2.
+const sharedPrefix = "$share/"
+
+// splitShared decides whether filter is a well-formed shared subscription
+// and, if so, returns the filter that actually takes part in matching.
+//
+// Well-formed means the three levels §4.8.2 requires: the literal
+// `$share`, a non-empty ShareName carrying neither `+` nor `#` (a `/`
+// cannot occur in one — it terminates it), and a non-empty topic filter
+// after it. Anything else is not a shared subscription and is the ordinary
+// literal filter it looks like on the wire, which is what keeps the literal
+// filter `$share` matching the literal topic `$share`.
+func splitShared(filter string) (wrapped string, ok bool) {
+	rest, found := strings.CutPrefix(filter, sharedPrefix)
+	if !found {
+		return "", false
+	}
+	shareName, wrapped, found := strings.Cut(rest, "/")
+	if !found || shareName == "" || wrapped == "" || strings.ContainsAny(shareName, "+#") {
+		return "", false
+	}
+	return wrapped, true
+}
+
+// filterParts splits filter into the levels that take part in matching.
+//
+// For a shared subscription that is the wrapped filter alone: a PUBLISH
+// carries the real topic and never the `$share/{ShareName}/` prefix
+// (§4.8.2), so the prefix is structural and matching it would match
+// nothing. Registration, matching and the overlap check all go through
+// this, which is what keeps a shared route's overlap with a plain one
+// visible.
+func filterParts(filter string) []string {
+	if wrapped, ok := splitShared(filter); ok {
+		filter = wrapped
+	}
+	return strings.Split(filter, "/")
+}
+
 // ValidateFilter reports whether filter is a topic filter MQTT permits.
 //
 // Checked at registration rather than left to the broker, because a broker
 // answers a malformed filter with a SUBACK failure code that the transport
 // interface deliberately drops — so the only symptom would be a route that
-// never fires. The rules are §4.7: a filter is non-empty, `+` occupies a
-// whole level, and `#` occupies a whole level and is the last one.
+// never fires. The rules are §4.7: a filter is non-empty, no longer than
+// 65535 bytes, valid UTF-8 without U+0000 (§1.5.4), `+` occupies a whole
+// level, and `#` occupies a whole level and is the last one.
+//
+// A filter starting with `$share/` is additionally held to §4.8.2's
+// structure — `$share/{ShareName}/{filter}` with a non-empty ShareName
+// carrying no wildcard — and its wrapped filter is then validated exactly
+// like a standalone one.
+//
+// The rule set is deliberately the same one go-mqtt's
+// protocol.ValidateTopicFilter enforces, because a filter this module
+// accepts and go-mqtt routes differently is a silent routing failure. A
+// differential enumeration found the two disagreeing on 109 filter shapes,
+// every one of them `$share`-prefixed: they were accepted here as ordinary
+// literal levels, so a multi-instance consumer registering a shared
+// subscription got a route that could never fire — with nothing to show for
+// it but a `publisher.command.unroutable` warning per command. The UTF-8
+// and U+0000 checks were missing outright.
+//
+// One deliberate difference remains, in the matcher rather than here: a
+// filter with `#` before its last level matches nothing instead of being
+// read as if the `#` ended it. Both reject it, so it cannot be registered;
+// [MatchFilter] is reachable with any string and failing closed is the
+// safer answer there. See [captureFilter].
 func ValidateFilter(filter string) error {
 	if filter == "" {
 		return fmt.Errorf("%w: empty", ErrInvalidFilter)
@@ -834,7 +896,34 @@ func ValidateFilter(filter string) error {
 	if len(filter) > 65535 {
 		return fmt.Errorf("%w: longer than an MQTT topic may be", ErrInvalidFilter)
 	}
-	parts := strings.Split(filter, "/")
+	if !utf8.ValidString(filter) {
+		return fmt.Errorf("%w: %q is not valid UTF-8", ErrInvalidFilter, filter)
+	}
+	if strings.ContainsRune(filter, 0) {
+		return fmt.Errorf("%w: %q contains U+0000", ErrInvalidFilter, filter)
+	}
+	if rest, found := strings.CutPrefix(filter, sharedPrefix); found {
+		shareName, wrapped, split := strings.Cut(rest, "/")
+		switch {
+		case !split:
+			return fmt.Errorf("%w: %q must be $share/{ShareName}/{filter}", ErrInvalidFilter, filter)
+		case shareName == "":
+			return fmt.Errorf("%w: %q has an empty ShareName", ErrInvalidFilter, filter)
+		case strings.ContainsAny(shareName, "+#"):
+			return fmt.Errorf("%w: %q has a wildcard in its ShareName", ErrInvalidFilter, filter)
+		case wrapped == "":
+			return fmt.Errorf("%w: %q wraps an empty topic filter", ErrInvalidFilter, filter)
+		}
+		return validateFilterLevels(filter, wrapped)
+	}
+	return validateFilterLevels(filter, filter)
+}
+
+// validateFilterLevels enforces MQTT's wildcard placement on the matchable
+// part of a filter, naming the whole filter in the error so an operator
+// reading a log sees what they registered.
+func validateFilterLevels(filter, matchable string) error {
+	parts := strings.Split(matchable, "/")
 	for i, p := range parts {
 		switch {
 		case p == "+" || p == "#":
@@ -858,8 +947,17 @@ func ValidateFilter(filter string) error {
 // `+` matches exactly one level, `#` matches the remainder including zero
 // levels, so `a/#` matches `a`. Neither wildcard matches a topic beginning
 // with `$`, per §4.7.2, which is what keeps a broad filter off `$SYS`.
+//
+// A shared-subscription filter (`$share/{ShareName}/{filter}`, §4.8.2)
+// matches against the topic a PUBLISH actually carries, which is the real
+// topic and never carries the prefix: the `$share/{ShareName}/` levels are
+// stripped and only the wrapped filter matches, so
+// MatchFilter("$share/grp/sensors/+", "sensors/temp") is true. Treating
+// them as literal levels — which this did — meant every shared
+// subscription a consumer registered routed nothing at all while go-mqtt
+// delivered on it. See [ValidateFilter].
 func MatchFilter(filter, topic string) bool {
-	return matchFilter(strings.Split(filter, "/"), topic)
+	return matchFilter(filterParts(filter), topic)
 }
 
 func matchFilter(parts []string, topic string) bool {

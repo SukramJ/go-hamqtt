@@ -15,6 +15,7 @@ import (
 	"time"
 
 	hacatalog "github.com/SukramJ/go-ha-catalog"
+	"github.com/SukramJ/go-mqtt/protocol"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
 )
@@ -232,6 +233,22 @@ func TestValidateFilter(t *testing.T) {
 		{"a/#/b", false},
 		{"a/b+/c", false},
 		{"a/#b", false},
+		// §4.8.2: the shared-subscription structure, and the wrapped
+		// filter validated exactly like a standalone one. These are the
+		// shapes that used to be accepted as ordinary literal levels
+		// and then routed nothing — see TestFilterRulesAgreeWithGoMQTT.
+		{"$share/grp/a/+/set", true},
+		{"$share/grp/#", true},
+		{"$share", true}, // no separator: the literal filter it looks like
+		{"$share/", false},
+		{"$share/grp", false},
+		{"$share/grp/", false},
+		{"$share//set", false},
+		{"$share/gr+p/set", false},
+		{"$share/grp/a/#/b", false},
+		// §1.5.4 applies to a filter as much as to a topic name.
+		{"a/\x00/b", false},
+		{"a/\xff/b", false},
 	} {
 		err := ValidateFilter(tc.filter)
 		if tc.ok != (err == nil) {
@@ -262,6 +279,12 @@ func TestMatchFilter(t *testing.T) {
 		{"#", "$SYS/broker/uptime", false},
 		{"+/broker", "$SYS/broker", false},
 		{"$SYS/#", "$SYS/broker", true},
+		// §4.8.2: the prefix is structural — a PUBLISH carries the real
+		// topic — so only the wrapped filter matches.
+		{"$share/grp/sensors/+", "sensors/temp", true},
+		{"$share/grp/sensors/+", "$share/grp/sensors/temp", false},
+		{"$share/grp/#", "$SYS/x", false},
+		{"$share", "$share", true},
 	} {
 		if got := MatchFilter(tc.filter, tc.topic); got != tc.want {
 			t.Errorf("MatchFilter(%q, %q) = %v, want %v", tc.filter, tc.topic, got, tc.want)
@@ -484,10 +507,12 @@ func TestCommandRouterOneHandlerPerMessage(t *testing.T) {
 		t.Fatalf("the surviving route ran %d times, want exactly one per message", len(got))
 	}
 	// The discrimination the refused route used to buy is the handler's
-	// now, and the wildcard capture is what it reads.
-	if got[0].Wildcards[3] != "week_profile" || got[1].Wildcards[3] != "LEVEL" {
-		t.Errorf("handler saw %v / %v, want the parameter name in the fourth `+`",
-			got[0].Wildcards, got[1].Wildcards)
+	// now, and the wildcard capture is what it reads. Asserted as a set:
+	// the two commands are on different topics, so they run on different
+	// workers and order between them is deliberately not promised.
+	params := sorted([]string{got[0].Wildcards[3], got[1].Wildcards[3]})
+	if strings.Join(params, ",") != "LEVEL,week_profile" {
+		t.Errorf("handler saw %v, want the parameter name in the fourth `+` of each", params)
 	}
 }
 
@@ -1366,5 +1391,122 @@ func TestCommandRouterStopDropsNothingItAccepted(t *testing.T) {
 	if got := drops.Load(); got != 0 {
 		t.Errorf("%d of %d deliveries racing Stop were dropped after accepting the gate; "+
 			"Stop must drain what it accepted, not discard it", got, iterations*deliveries)
+	}
+}
+
+// filterCorpus enumerates the filter and topic shapes the two matchers can
+// disagree on: the wildcards, the empty level a leading/trailing/doubled
+// slash produces, the `$`-prefixed trees §4.7.2 protects, and the `$share`
+// levels §4.8.2 makes structural.
+func filterCorpus() []string {
+	levels := []string{"a", "b", "+", "#", "", "$SYS", "$share", "grp"}
+	shapes := []string{
+		"$share", "$share/", "$share//f", "$share/g", "$share/g/",
+		"$share/g+/f", "$share/g#/f", "$share/g/a/#", "$share/g/a/#/b", "$share/g/$SYS/x",
+		"$share/g/$share/g/a", "a\x00b", "a/\xff/b",
+	}
+	n := len(levels)
+	out := make([]string, 0, len(shapes)+n+n*n+n*n*n)
+	out = append(out, shapes...)
+	for _, one := range levels {
+		out = append(out, one)
+		for _, two := range levels {
+			out = append(out, one+"/"+two)
+			for _, three := range levels {
+				out = append(out, one+"/"+two+"/"+three)
+			}
+		}
+	}
+	return out
+}
+
+// TestFilterRulesAgreeWithGoMQTT is the regression for the $share class.
+//
+// The router's filters are handed to go-mqtt, which routes by its own
+// fuzzed matcher; any shape the two decide differently is a silent routing
+// failure whose only evidence is a `publisher.command.unroutable` warning
+// per command. A differential enumeration over 7.84M (filter, topic) pairs
+// found exactly one disagreement class, for filters BOTH validators accept:
+// `$share`, which go-mqtt strips per §4.8.2 while this module matched it as
+// ordinary literal levels. ValidateFilter is what let those through — 109
+// shapes it accepted that protocol.ValidateTopicFilter rejects, all
+// $share-prefixed — and it checked neither valid UTF-8 nor U+0000.
+//
+// This is the enumeration in test form, narrow enough to run every time.
+// Only filters both validators accept take part in the matching half: a
+// filter with `#` before its last level is rejected by both, so the one
+// deliberate difference in [captureFilter] is excluded by construction
+// rather than by a special case here.
+func TestFilterRulesAgreeWithGoMQTT(t *testing.T) {
+	t.Parallel()
+	corpus := filterCorpus()
+	mismatches := 0
+	for _, filter := range corpus {
+		ours := ValidateFilter(filter)
+		theirs := protocol.ValidateTopicFilter(filter)
+		if (ours == nil) != (theirs == nil) {
+			mismatches++
+			if mismatches <= 10 {
+				t.Errorf("ValidateFilter(%q) = %v but protocol.ValidateTopicFilter = %v", filter, ours, theirs)
+			}
+			continue
+		}
+		if ours != nil {
+			continue
+		}
+		for _, topic := range corpus {
+			if protocol.ValidateTopicName(topic) != nil {
+				continue
+			}
+			if got, want := MatchFilter(filter, topic), protocol.MatchTopic(filter, topic); got != want {
+				mismatches++
+				if mismatches <= 10 {
+					t.Errorf("MatchFilter(%q, %q) = %v but protocol.MatchTopic = %v", filter, topic, got, want)
+				}
+			}
+		}
+	}
+	if mismatches > 10 {
+		t.Errorf("%d disagreements in total", mismatches)
+	}
+}
+
+// TestCommandRouterRoutesASharedSubscription is the consumer-visible half:
+// a multi-instance consumer registers `$share/...` so the broker load
+// balances commands across its instances, and the router must claim the
+// real topic the PUBLISH carries — which never contains the prefix.
+func TestCommandRouterRoutesASharedSubscription(t *testing.T) {
+	t.Parallel()
+	b := newCmdBroker()
+	rc := &recorder{}
+	r := quietRouter(t, b, CommandConfig{})
+	if err := r.Handle("$share/bridges/gh/+/set", rc.handle); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	// The overlap check runs on the wrapped filter too, or a shared route
+	// and its plain twin would both be registered and one message would
+	// run two handlers.
+	if err := r.Handle("gh/+/set", rc.handle); !errors.Is(err, ErrAmbiguousRoutes) {
+		t.Errorf("a shared route and its plain twin: %v, want ErrAmbiguousRoutes", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	cmd, ok := r.Route("gh/lamp/set")
+	if !ok {
+		t.Fatal("a shared subscription claimed nothing; the broker delivers the real topic, never the $share prefix")
+	}
+	if cmd.Filter != "$share/bridges/gh/+/set" {
+		t.Errorf("Command.Filter = %q, want the route as registered", cmd.Filter)
+	}
+	if strings.Join(cmd.Wildcards, "|") != "lamp" {
+		t.Errorf("Wildcards = %v, want the wrapped filter's `+`", cmd.Wildcards)
+	}
+	// CheckDisjoint reads the same parts, so the state plane is checked
+	// against what a shared route really matches.
+	if err := r.CheckDisjoint("gh/lamp/set"); !errors.Is(err, ErrStateCommandCollision) {
+		t.Errorf("CheckDisjoint over a shared route: %v, want ErrStateCommandCollision", err)
 	}
 }
