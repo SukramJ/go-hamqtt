@@ -303,10 +303,19 @@ type route struct {
 // [CommandRouter.Stop] end-to-end; there must never be two of those in
 // flight, because each is a sequence of transport calls whose interleaving
 // would leave the broker's subscription set disagreeing with the router's.
-// mu guards the route set and the started/stopped flags and is never held
-// across a [Transport] call, a handler call or an enqueue — a subscribe
-// blocks on a SUBACK, and holding the route lock across one would stall
-// every inbound message behind it.
+// mu guards the route set, the started/stopped flags and the pool pointer,
+// and is never held across a [Transport] call or a handler call — a
+// subscribe blocks on a SUBACK, and holding the route lock across one would
+// stall every inbound message behind it.
+//
+// It IS held across the enqueue, deliberately, and that is what makes the
+// shutdown promise on [CommandRouter.Stop] true rather than probable: the
+// stopped check and the enqueue have to be one step, or a command whose
+// check passed can still land on a queue Stop closed in between and be
+// discarded with a `dropped_after_close` warning. Measured at roughly one
+// in four thousand deliveries racing a Stop. The enqueue can be held under
+// a lock because it never blocks — an unbounded slice, not a buffered
+// channel, for the separate reason [commandQueue] documents.
 type CommandRouter struct {
 	tr  Transport
 	cfg CommandConfig
@@ -582,7 +591,12 @@ func (r *CommandRouter) Resubscribe(ctx context.Context) error {
 // handler starts after Stop is entered — the gate is set before the first
 // unsubscribe, because a broker delivers whatever was already in flight and
 // a command arriving during shutdown would run against half-torn-down
-// dependencies. But a command already accepted does run to completion:
+// dependencies. And the boundary is exact in both directions: a delivery
+// whose gate check passed before Stop entered is accepted and drained
+// rather than discarded, because the check and the enqueue happen under one
+// lock Stop must take. Without that, roughly one in four thousand
+// deliveries racing a Stop was dropped with a `dropped_after_close`
+// warning. But a command already accepted does run to completion:
 // abandoning a queued write is how a consumer loses the last command of a
 // session with nothing anywhere to say so. Stop therefore blocks on whatever
 // a handler is currently doing, which is the shutdown cost
@@ -729,18 +743,22 @@ func (r *CommandRouter) subscribe(ctx context.Context, filter string) error {
 // deliver is the transport-facing handler for one subscription. It runs on
 // the transport's read loop and must return promptly; everything it does
 // beyond resolving the route is an enqueue.
+//
+// The locking is hand-rolled rather than deferred because the shutdown gate
+// and the enqueue must be one atomic step against Stop — see the lock-order
+// note on [CommandRouter] — while the two calls that can reach consumer
+// code, the logger and [CommandConfig.OnUnroutable], must not run under the
+// route lock at all.
 func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained bool) {
 	r.mu.Lock()
-	stopped := r.stopped || r.pool == nil
-	pool := r.pool
-	cmd, handler, ok := r.resolveLocked(topic)
-	r.mu.Unlock()
-
-	if stopped {
+	if r.stopped || r.pool == nil {
+		r.mu.Unlock()
 		r.log.Debug("publisher.command.after_stop", slog.String("topic", topic))
 		return
 	}
+	cmd, handler, ok := r.resolveLocked(topic)
 	if !ok {
+		r.mu.Unlock()
 		// Nothing claims it. A shared broker carries traffic that is not
 		// this consumer's, and a route removed while its subscription
 		// lingers lands here too, so this is a diagnostic rather than a
@@ -753,6 +771,7 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 		return
 	}
 	if retained && !r.cfg.DeliverRetained {
+		r.mu.Unlock()
 		r.log.Debug("publisher.command.retained_drop", slog.String("topic", topic))
 		return
 	}
@@ -761,11 +780,12 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 	cmd.Retained = retained
 	// Keyed by topic, so two commands for the same entity never reorder
 	// while unrelated entities proceed in parallel.
-	pool.enqueue(topic, func() {
+	r.pool.enqueue(topic, func() {
 		ctx, cancel := context.WithCancel(r.cfg.Lifecycle)
 		defer cancel()
 		handler(ctx, cmd)
 	})
+	r.mu.Unlock()
 }
 
 // resolveLocked finds the route matching topic. Callers hold r.mu.

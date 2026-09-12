@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1285,5 +1286,85 @@ func TestCommandRouterFailedStartReclaimsItsWorkers(t *testing.T) {
 	r.mu.Unlock()
 	if pool != nil {
 		t.Error("a failed Start kept its worker pool alive")
+	}
+}
+
+// TestCommandRouterStopDropsNothingItAccepted closes the window S10
+// suspected and this fixture confirmed: deliver used to read the stopped
+// flag under the route lock, release it, and only then enqueue, so a Stop
+// completing in between discarded the command with a
+// `dropped_after_close` warning — contradicting Stop's promise that
+// anything already accepted runs to completion. It is rare (about one in
+// four thousand deliveries racing a Stop, with both goroutines released
+// from one barrier) and it is logged rather than silent, which is why it
+// took a stress fixture to see; the gate check and the enqueue are one
+// locked step now, so it cannot happen rather than seldom happening.
+//
+// The stronger property is asserted alongside it, because the fix must not
+// buy one at the other's expense: no handler ever runs after Stop returns.
+func TestCommandRouterStopDropsNothingItAccepted(t *testing.T) {
+	t.Parallel()
+	const (
+		iterations = 400
+		deliveries = 50
+	)
+	var drops atomic.Int64
+	log := slog.New(countingHandler{fn: func(msg string) {
+		if msg == "publisher.command.dropped_after_close" {
+			drops.Add(1)
+		}
+	}})
+	for range iterations {
+		b := newCmdBroker()
+		var (
+			stopReturned atomic.Bool
+			lateRun      atomic.Bool
+		)
+		r := NewCommandRouter(b, CommandConfig{Workers: 2, Logger: log})
+		if err := r.Handle("gh/+/set", func(context.Context, Command) {
+			if stopReturned.Load() {
+				lateRun.Store(true)
+			}
+		}); err != nil {
+			t.Fatalf("handle: %v", err)
+		}
+		if err := r.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		// Hold the subscription handler directly: a broker delivers
+		// what was already in flight while Stop is running.
+		b.mu.Lock()
+		h := b.subs["gh/+/set"]
+		b.mu.Unlock()
+
+		barrier := make(chan struct{})
+		var wg sync.WaitGroup
+		// Many concurrent deliveries per Stop: the window is a handful
+		// of instructions wide, so the fixture needs enough of them in
+		// flight for one to be descheduled inside it.
+		wg.Add(deliveries + 1)
+		for i := range deliveries {
+			go func() {
+				defer wg.Done()
+				<-barrier
+				h("gh/lamp"+strconv.Itoa(i)+"/set", []byte("on"), false)
+			}()
+		}
+		go func() {
+			defer wg.Done()
+			<-barrier
+			_ = r.Stop(context.Background())
+			stopReturned.Store(true)
+		}()
+		close(barrier)
+		wg.Wait()
+
+		if lateRun.Load() {
+			t.Fatal("a handler ran after Stop returned")
+		}
+	}
+	if got := drops.Load(); got != 0 {
+		t.Errorf("%d of %d deliveries racing Stop were dropped after accepting the gate; "+
+			"Stop must drain what it accepted, not discard it", got, iterations*deliveries)
 	}
 }
