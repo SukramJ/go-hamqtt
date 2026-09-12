@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
+	"github.com/SukramJ/go-hamqtt/topic"
 )
 
 // Handler receives one delivered message.
@@ -95,6 +96,23 @@ type Config struct {
 	// the right one, and [discovery.StdContext] already points
 	// [model.LevelBridge] at it.
 	StatusTopic string
+
+	// Layout, when set, is the same [topic.Layout] the consumer hands
+	// [discovery.StdContext]. It makes StatusTopic checkable instead of
+	// free-form.
+	//
+	// This is the one string every entity's availability list references,
+	// and under the default `availability_mode: "all"` a single typo greys
+	// out the whole fleet with nothing on the wire naming the cause. The
+	// declaring side renders it from [topic.Layout.Bridge] and the
+	// publishing side used to take a literal, so the module structurally
+	// could not compare them — and a mismatch is invisible until an
+	// operator asks why every entity is unavailable.
+	//
+	// With Layout set, an empty StatusTopic is filled from it, and a
+	// StatusTopic that disagrees with it is a programming error [New]
+	// refuses rather than a fleet that comes up dark.
+	Layout topic.Layout
 
 	// QoS applies to every publish and subscribe the runtime performs.
 	// The zero value is QoS 1, which is what a retained config wants: at
@@ -194,6 +212,21 @@ func New(tr Transport, cfg Config) *Runtime {
 	if cfg.SweepWindow <= 0 {
 		cfg.SweepWindow = DefaultSweepWindow
 	}
+	if cfg.Layout != nil {
+		// The declaring side's answer for LevelBridge. Deriving it is the
+		// only way the two sides cannot drift; refusing a disagreement is
+		// the only way a typo surfaces at the composition root rather than
+		// as a silently dark fleet.
+		declared := cfg.Layout.Bridge()
+		switch {
+		case cfg.StatusTopic == "":
+			cfg.StatusTopic = declared
+		case declared != "" && cfg.StatusTopic != declared:
+			panic("publisher: Config.StatusTopic " + cfg.StatusTopic +
+				" disagrees with Layout.Bridge() " + declared +
+				"; every entity's availability list references the latter")
+		}
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -207,6 +240,14 @@ func New(tr Transport, cfg Config) *Runtime {
 		superseded: map[string]bool{},
 	}
 }
+
+// BridgeTopic is the consumer's own availability topic, after
+// [Config.Layout] has been consulted.
+//
+// Exported so a consumer can assert the string its configs reference and
+// the string its Last Will clears are one string — see [Config.Layout] for
+// why that assertion is worth making.
+func (r *Runtime) BridgeTopic() string { return r.cfg.StatusTopic }
 
 // Prefix is the discovery prefix this runtime publishes under, after the
 // default has been applied.

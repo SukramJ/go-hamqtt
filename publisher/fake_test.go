@@ -176,3 +176,12 @@ func (f *fakeTransport) seed(topic string, payload []byte) {
 	defer f.mu.Unlock()
 	f.retained[topic] = payload
 }
+
+// holds reports whether the broker still retains a non-empty payload on the
+// topic, which is the only way to tell a retraction that happened from one
+// that was merely reported.
+func (f *fakeTransport) holds(topic string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.retained[topic]) > 0
+}

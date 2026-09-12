@@ -228,3 +228,50 @@ func TestSweepRecheckesClaimsBeforeRetracting(t *testing.T) {
 		t.Fatal("the late publish must still be declared after the sweep")
 	}
 }
+
+// TestSweepReportsOnlyWhatItCleared covers the branch a review found wholly
+// untested: a retraction the broker refuses.
+//
+// The distinction matters because the result is what a consumer acts on. A
+// sweep that reports a topic as retracted when the broker still holds it
+// tells the consumer the ghost is gone, so nothing retries and nothing
+// escalates — and the entity stays in Home Assistant, permanently available,
+// showing the last value it ever saw. The pass must therefore continue past
+// the refusal (one unreachable topic must not abandon the rest) while
+// reporting only the topics it actually cleared, and must keep claiming the
+// refused one so a later publish is not dedup-suppressed against a payload
+// that was never written.
+func TestSweepReportsOnlyWhatItCleared(t *testing.T) {
+	t.Parallel()
+	f := newFake()
+	stubborn := "homeassistant/sensor/ccu_x/stubborn/config"
+	willing := "homeassistant/sensor/ccu_x/willing/config"
+	f.seed(stubborn, []byte(`{"old":1}`))
+	f.seed(willing, []byte(`{"old":2}`))
+	f.failPublish = func(topic string) error {
+		if topic == stubborn {
+			return errors.New("broker refused")
+		}
+		return nil
+	}
+	r := New(f, Config{})
+
+	res, err := r.Sweep(context.Background(), SweepRequest{
+		Owns: ownsNode("ccu_"), Window: testWindow,
+	})
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if res.Inspected != 2 {
+		t.Errorf("inspected = %d, want both configs seen", res.Inspected)
+	}
+	if slices.Contains(res.Retracted, stubborn) {
+		t.Error("the sweep reported a topic the broker refused to clear")
+	}
+	if !slices.Contains(res.Retracted, willing) {
+		t.Error("one refusal abandoned the rest of the pass")
+	}
+	if !f.holds(stubborn) {
+		t.Error("the refused topic is no longer retained, so the refusal was not real")
+	}
+}
