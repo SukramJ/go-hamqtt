@@ -1,8 +1,9 @@
 # go-hamqtt
 
-The shared data model and Home Assistant MQTT discovery layer for the
-`go-*2mqtt` family: what a device is, what its datapoints mean, and how that
-becomes a discovery bundle Home Assistant accepts.
+The shared data model, Home Assistant MQTT discovery layer and publisher
+runtime for the `go-*2mqtt` family: what a device is, what its datapoints
+mean, how that becomes a discovery bundle Home Assistant accepts — and how it
+gets onto a broker and off it again.
 
 Zero third-party dependencies. Sits on
 [go-mqtt](https://github.com/SukramJ/go-mqtt) for transport and
@@ -24,8 +25,8 @@ Recorded as [ADR 0070](https://github.com/SukramJ/openccu-loom/blob/main/docs/ad
 | `topic` | the only place that turns a coordinate into a string |
 | `payload` | `payload:"info\|config\|state"` struct-tag partitioning |
 | `catalog` | priority rules as an `Enricher`, a static table as an `EntitySource` |
-
-Not here yet: the publisher runtime (phase 4).
+| `publisher` | the publish loop: hash-dedup, the retraction ordering, the orphan sweep, birth/LWT |
+| `publisher/gomqtt` | the ten lines that adapt a go-mqtt client to the runtime's transport |
 
 ## The shape of it
 
@@ -69,6 +70,48 @@ if err := discovery.Validate(bundle); err != nil {
 }
 // publish bundle at bundle.Topic(prefix), retained
 ```
+
+## Publishing
+
+`publisher` is the other half: the loop each consumer would otherwise write
+again, with the ordering Home Assistant enforces baked in.
+
+```go
+run := publisher.New(gomqtt.Split(breaker, client), publisher.Config{
+    StatusTopic: layout.Bridge(), // the will's topic, and one entities reference
+})
+defer run.Close()
+
+will, err := run.Will()          // hand this to the client's CONNECT
+…
+_ = run.AnnounceOnline(ctx)
+_ = run.WatchBirth(ctx)          // replay every config when HA comes back
+
+_, err = run.PublishBundle(ctx, bundle) // retract-then-publish, deduped
+
+// after the boot snapshot, never before it
+res, err := run.Sweep(ctx, publisher.SweepRequest{
+    Owns: func(t publisher.ConfigTopic) bool {
+        return strings.HasPrefix(t.NodeID, myNamespace)
+    },
+})
+```
+
+Four facts it encodes, each measured rather than chosen:
+
+- **Retract first, publish second.** Home Assistant refuses a device bundle
+  while a per-entity config for the same `unique_id` is still retained, and
+  the refusal is a `WARNING` in its log and nothing else. It is symmetric, so
+  the rollback needs the same care.
+- **The dedup store survives reconnects** and holds the bytes, not a digest —
+  the birth resync replays them.
+- **The sweep recognises both topic forms.** Matching only
+  `<prefix>/<platform>/<node>/<object>/config` makes every
+  `<prefix>/device/<node>/config` invisible, and a broker keeps those forever.
+- **A will nobody reads is no will at all.** `Will()` returns the same topic
+  and payloads `AnnounceOnline`/`AnnounceOffline` use, so the two halves
+  cannot drift apart — which is how two reference bridges ended up with an
+  inert LWT.
 
 ## Design rules worth knowing
 

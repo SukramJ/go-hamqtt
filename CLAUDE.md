@@ -11,13 +11,16 @@ go test -run TestName ./...
 ```
 
 No third-party dependencies. The only requires are `go-ha-catalog` (Home
-Assistant's vocabulary) and, once the runtime lands, `go-mqtt`.
+Assistant's vocabulary) and `go-mqtt`, and the latter is imported by
+`publisher/gomqtt` alone — the runtime itself takes a transport interface of
+its own so it stays testable without a broker.
 
 ## What this repository is
 
-The shared data model and Home Assistant discovery layer for the `go-*2mqtt`
-family, extracted per openccu-loom ADR 0070. Phase 2 delivered the model,
-the bundle, validation and naming; the publisher runtime is phase 4.
+The shared data model, Home Assistant discovery layer and publisher runtime
+for the `go-*2mqtt` family, extracted per openccu-loom ADR 0070. Phase 2
+delivered the model, the bundle, validation and naming; phase 4 added
+`publisher`.
 
 openccu-loom is the architectural source **and** the first full consumer. When
 a design question here has no obvious answer, loom's existing implementation is
@@ -33,13 +36,16 @@ payload/    struct-tag partitioning; no domain knowledge at all
 topic/      the ONLY place that turns a Slot into a string
 discovery/  the device bundle, the render pipeline, the validator
 catalog/    rules as an Enricher, a static table as an EntitySource
+publisher/  the publish loop: hash-dedup, retract-then-publish, the orphan
+            sweep over both topic forms, birth/LWT availability
 cmd/        the tools: hacheck validates payloads one at a time,
             hadoctor reads a whole capture and sees between them
 internal/   dump/ reads an NDJSON capture; shared by the tools only
 ```
 
 Dependencies point strictly downward:
-`discovery → {topic, model} → go-ha-catalog`, and `catalog → model`.
+`discovery → {topic, model} → go-ha-catalog`, `catalog → model`, and
+`publisher → discovery`.
 
 **Nothing in `model` imports `topic`.** That is not a style preference — it is
 what mechanically prevents the model from formatting a topic, which is what
