@@ -3,6 +3,97 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.24.0] - 2026-09-12
+
+The four measured model gaps left after migrating openccu-loom's hub
+and message planes: every place a plane had to work *around* the model
+instead of *through* it, counted as an escape hatch and traced back to
+the field that was missing. Twelve hatches, four causes.
+
+### Added
+
+- **`model.LevelNone` and `model.NoAvailability()`** — the explicit
+  absence of availability: no `availability` list and no
+  `availability_mode`, which is not the same as saying nothing.
+
+  One measured entity needs it. A bridge's daemon-status sensor
+  publishes on the bridge LWT itself, so gating it on that topic makes
+  it unavailable in exactly the situation it exists to report. Before
+  this, `Availability.Resolved` answered every entity with a mode, so
+  even an empty level list projected `availability_mode: "all"` beside
+  an absent list — and the consumer cleared both fields again in a
+  post-render `Builder`, the only hatch of its plane that was not
+  platform vocabulary.
+
+  It is a level rather than an explicitly-empty `Levels` slice because
+  nil and empty are the same thing at every call site that builds a
+  list conditionally, and a rule table that filtered its levels down
+  to none would then silently mean "none" where it means "the
+  default". `LevelNone` wins over anything listed beside it, so the
+  payload does not depend on the order two rules happened to run in.
+  The zero `Availability` is unchanged: bridge and device, mode `all`.
+
+- **`model.Description.NameArgs`** — the arguments that fill the
+  `{name}` placeholders of the string `NameKey` resolves to, and of a
+  literal `Name` that carries any.
+
+  Two measured entity families (install-mode and per-interface
+  connectivity) name themselves after an interface id. With no
+  parameterised translation the name had to be resolved eagerly and
+  handed over as a literal `Description.Name`, which bypasses the
+  whole `NameKey` path: the catalogue key never reached the model, so
+  nothing downstream could render it in another language.
+
+  A named map rather than positional arguments, because the
+  placeholder is written in the catalogue, by a translator, in a
+  sentence whose word order is not the source language's — a
+  positional `%s` cannot be moved by the person who has to move it.
+
+- **`discovery.Substitute`** — the placeholder substitution
+  `StdContext.Translate` applies, exported for a consumer that
+  overrides `Translate` and would otherwise write it again. A
+  placeholder with no matching argument is left standing rather than
+  blanked: "Connectivity {iface}" says where the gap is.
+
+- **`model.Description.Optimistic`** — `optimistic` as a typed
+  description field, projected onto the 17 platforms whose schema
+  declares it (switch, select, text and number among them; not sensor
+  or binary_sensor). It is not platform-specific vocabulary, but it
+  was reachable only through a `Builder` or `Extra`, which is why
+  eight measured hub entities set it after rendering.
+
+- **`model.Description.JSONAttributesTopic`** and
+  **`.JSONAttributesTemplate`** — the attributes pair 30 of the 32
+  platforms accept (all but `device_automation` and `tag`), the same
+  bar the description's other `Component`-level keys meet. Three
+  measured message aggregates published their detail rows through a
+  post-render `Builder` for want of it. The template is projected only
+  beside the topic: alone it selects a field of a document Home
+  Assistant was never told to read.
+
+### Changed
+
+- **`discovery.Context.Translate` takes arguments** (breaking
+  interface change):
+
+  ```go
+  Translate(key string) string                          // 0.23.0
+  Translate(key string, args map[string]string) string  // 0.24.0
+  ```
+
+  A custom `Context` adds the parameter and passes it to whatever it
+  resolves with; a caller passes `nil` for the unparameterised case,
+  which behaves exactly as the one-argument form did.
+  `StdContext.Translator` is **unchanged** — it stays a plain
+  key -> string lookup, because the catalogue answers with the
+  template as authored and the substitution is `StdContext`'s job. A
+  consumer whose translator already exists therefore keeps it and
+  gains the parameters for free, which is what the measured consumer's
+  own pairing of a lookup plus a placeholder helper collapses to.
+
+- **`Description.Clone` copies `NameArgs`**, like every other map an
+  enricher may write.
+
 ## [0.23.0] - 2026-09-12
 
 The three measured causes of avoidable escape hatches in the

@@ -75,13 +75,23 @@ type Context interface {
 	// surface.
 	MethodTopic(dev *model.Device, e model.Entity, method string) string
 
-	// Translate resolves a catalogue key into the context's language.
+	// Translate resolves a catalogue key into the context's language, with
+	// args filling the `{name}` placeholders the resolved string carries.
 	//
 	// [Language] alone is not enough: the catalogues live with the consumer,
 	// so the model can ask for a label but cannot look one up. A key with no
 	// entry comes back unchanged, which is what lets a caller tell a missing
 	// translation from an empty one.
-	Translate(key string) string
+	//
+	// The arguments are what make [model.Description.NameKey] usable for a
+	// parameterised name. Without them a name like "Connectivity {iface}"
+	// had to be resolved by the consumer and handed over as a literal
+	// [model.Description.Name], so the key never reached the model and
+	// nothing downstream could render it in another language — measured on
+	// two entity families of the first full consumer. A nil map is the
+	// unparameterised case and must behave exactly as the one-argument form
+	// did.
+	Translate(key string, args map[string]string) string
 }
 
 // Encoding is the shape of a state payload.
@@ -184,14 +194,18 @@ func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Orig
 // entityName resolves the display name: a literal wins, a catalogue key is
 // translated, and neither leaves the name empty so Home Assistant derives one
 // from the platform or the device class.
+//
+// [model.Description.NameArgs] fills the placeholders of either, because a
+// consumer mid-migration parameterises the literal before it parameterises
+// the key, and a literal that silently kept its braces would publish them.
 func entityName(ctx Context, desc *model.Description, lang string) string {
 	if name := desc.Name.In(lang); name != "" {
-		return name
+		return Substitute(name, desc.NameArgs)
 	}
 	if desc.NameKey == "" {
 		return ""
 	}
-	return ctx.Translate(desc.NameKey)
+	return ctx.Translate(desc.NameKey, desc.NameArgs)
 }
 
 // valueTemplateFor picks the template for one entity.
@@ -258,6 +272,27 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	}
 	if accepts["step"] {
 		comp.Step = desc.Step
+	}
+
+	// `optimistic` is declared by 17 of the 32 platforms — switch, select,
+	// text and number among them, but not sensor or binary_sensor — so it is
+	// description vocabulary with a platform gate rather than a Builder's
+	// job. Eight measured hub entities set it after rendering for want of
+	// this projection.
+	if accepts["optimistic"] {
+		comp.Optimistic = desc.Optimistic
+	}
+
+	// The json-attributes pair is accepted by 30 of the 32 platforms (all
+	// but device_automation and tag), the same bar the other
+	// description-level keys meet. The template only means anything beside
+	// the topic, so it is projected with it: a template alone selects a
+	// field of a document Home Assistant was never told to read.
+	if desc.JSONAttributesTopic != "" && accepts["json_attributes_topic"] {
+		comp.JSONAttributesTopic = desc.JSONAttributesTopic
+		if accepts["json_attributes_template"] {
+			comp.JSONAttributesTemplate = desc.JSONAttributesTemplate
+		}
 	}
 
 	if _, mode := desc.Availability.Resolved(); mode != "" {
