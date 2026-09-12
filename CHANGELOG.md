@@ -3,6 +3,52 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.29.0] - 2026-09-12
+
+The inbound half of the payload package: the coercions every consumer
+needs to read a service call Home Assistant sent.
+
+### Added
+
+- **`payload.ParamBool`, `ParamFloat64`, `ParamInt32`, `ParamString`**,
+  with `ErrMissingParam` and `ErrInvalidParam` — decoders for the body
+  of an inbound service call, as JSON already unmarshalled into a
+  `map[string]any`.
+
+  They belong here because every consumer needs the same coercions for
+  the same reason: Home Assistant's templating decides what type
+  reaches the wire and the caller cannot control it. A plain
+  `{{ value }}` template sends the string `"42"` where the author meant
+  a number, `payload_on` sends whatever the platform's default spelling
+  is, and a hand-written automation sends a JSON bool. A consumer that
+  accepted only the declared Go type would reject a command Home
+  Assistant considers well formed, and the operator would see a control
+  that does nothing.
+
+  Three decisions are carried over from the reference implementation
+  with their reasons, because each is a boundary where the generous
+  answer is the wrong one:
+  - A numeric string goes through `strconv.ParseFloat`/`ParseInt`
+    rather than a scanning helper, so `"42xyz"` is an error. Reading it
+    as 42 would turn a typo in an automation into a command nobody
+    wrote.
+  - An out-of-range integer is an error, not a truncation. Truncation
+    would surprise a caller supplying a 64-bit index, and the surprise
+    would arrive as a write to the wrong thing rather than as a
+    rejected command.
+  - `ParamBool`'s spelling list is exact rather than case-insensitive
+    and excludes `"yes"`/`"no"`. The set of spellings Home Assistant
+    emits is knowable; a consumer's own coercion of *device* values
+    against a parameter descriptor is a different boundary with a
+    different set, and the two are deliberately not converged.
+
+  Nothing here touches a published string — these are the read side,
+  which is why the reference consumer's golden payload pins correctly
+  say nothing about them. ADR 0070's move-up measurement names this as
+  the first non-trivial piece of the consumer's `payload` package that
+  is genuinely daemon-agnostic: 137 lines the consumer deletes and
+  imports back.
+
 ## [0.28.0] - 2026-09-12
 
 Overlapping command routes are registerable again — on a transport that
