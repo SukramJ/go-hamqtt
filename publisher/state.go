@@ -115,30 +115,42 @@ var (
 // gives QoS 1 retained state in the envelope encoding, which is what a
 // consumer with no opinion wants.
 type StateConfig struct {
-	// QoS applies to every retained state publish and to eviction. The zero
-	// value is QoS 1, matching [Config.QoS]: at most once loses a value, and
-	// the broker then retains the previous one until the datapoint next
-	// changes, which on a sensor that reports on change alone is forever.
+	// QoS applies to every retained state publish and to eviction.
+	// [QoSUnset] — the zero value — is QoS 1, matching [Config.QoS]: at
+	// most once loses a value, and the broker then retains the previous one
+	// until the datapoint next changes, which on a sensor that reports on
+	// change alone is forever.
 	//
 	// The reference implementation defaults its state plane to QoS 0
 	// instead. That default is not a measurement: its own configuration
 	// never populates the field, so the operator cannot reach it and it has
 	// never been weighed against a lossy broker. It also makes
 	// [StatePublisher.Latency] permanently blind, since only an acknowledged
-	// publish can be timed. Both reasons point the same way, so this default
-	// follows the rest of the package rather than that consumer.
-	QoS byte
+	// publish can be timed. Both reasons point the same way, so this
+	// default follows the rest of the package rather than that consumer.
+	//
+	// A default, though, and not a floor. [QoSAtMostOnce] states QoS 0 and
+	// is honoured: the ADR 0070 phase-5 measurement of 2026-09-12 found
+	// go-zendure2mqtt publishing its entire state plane at QoS 0 across an
+	// installed base, and a migration step whose purpose is de-duplication
+	// is not the place to change that on the wire. See [QoS].
+	QoS QoS
 
-	// PulseQoS applies to [StatePublisher.Pulse]. The zero value is QoS 0,
-	// which is what the measured consumer hardcodes for every pulse topic —
-	// a keypress that arrives late is worse than one that does not arrive,
-	// and the acknowledgement round trip is on the event path.
+	// PulseQoS applies to [StatePublisher.Pulse]. [QoSUnset] — the zero
+	// value — is QoS 0, which is what the measured consumer hardcodes for
+	// every pulse topic: a keypress that arrives late is worse than one
+	// that does not arrive, and the acknowledgement round trip is on the
+	// event path.
 	//
 	// A separate knob rather than reusing QoS because the two answer
 	// different questions, and the reference implementation having only one
 	// is why its pulses ignore the operator's configured state QoS
 	// entirely.
-	PulseQoS byte
+	//
+	// This is the one field in the package whose default is
+	// [QoSAtMostOnce], so here [QoSUnset] and [QoSAtMostOnce] resolve to
+	// the same wire byte.
+	PulseQoS QoS
 
 	// Encoding selects the payload shape [StatePublisher.PublishValue]
 	// renders. The zero value is [discovery.EnvelopeEncoding], the same
@@ -237,6 +249,12 @@ type StatePublisher struct {
 	tr  Transport
 	cfg StateConfig
 	log *slog.Logger
+	// qos and pulseQoS are [StateConfig.QoS] and [StateConfig.PulseQoS]
+	// resolved once, at construction, to the wire bytes a [Transport]
+	// takes — so an unrecognised level is a panic at the composition root
+	// rather than a publish at a level nobody chose.
+	qos      byte
+	pulseQoS byte
 
 	mu sync.Mutex
 	// published maps a retained state topic to the exact bytes the broker
@@ -257,9 +275,6 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 	if tr == nil {
 		panic("publisher: nil transport")
 	}
-	if cfg.QoS == 0 {
-		cfg.QoS = 1
-	}
 	if cfg.LatencyWindow == 0 {
 		cfg.LatencyWindow = DefaultLatencyWindow
 	}
@@ -270,6 +285,8 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 	return &StatePublisher{
 		tr:        tr,
 		cfg:       cfg,
+		qos:       resolveQoS("publisher.StateConfig.QoS", cfg.QoS, QoSAtLeastOnce),
+		pulseQoS:  resolveQoS("publisher.StateConfig.PulseQoS", cfg.PulseQoS, QoSAtMostOnce),
 		log:       logger,
 		published: map[string]cachedWrite{},
 	}
@@ -286,9 +303,7 @@ func StateFor(r *Runtime, cfg StateConfig) *StatePublisher {
 	if r == nil {
 		panic("publisher: nil runtime")
 	}
-	if cfg.QoS == 0 {
-		cfg.QoS = r.cfg.QoS
-	}
+	cfg.QoS = cfg.QoS.Or(r.cfg.QoS)
 	if cfg.Logger == nil {
 		cfg.Logger = r.log
 	}
@@ -349,7 +364,7 @@ func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []by
 		return false, nil
 	}
 
-	if err := p.send(ctx, topic, payload, p.cfg.QoS, true); err != nil {
+	if err := p.send(ctx, topic, payload, p.qos, true); err != nil {
 		return false, fmt.Errorf("publisher: publish state %s: %w", topic, err)
 	}
 
@@ -503,7 +518,7 @@ func (p *StatePublisher) Pulse(ctx context.Context, topic string, payload []byte
 	if err := p.guard(topic); err != nil {
 		return err
 	}
-	if err := p.send(ctx, topic, payload, p.cfg.PulseQoS, false); err != nil {
+	if err := p.send(ctx, topic, payload, p.pulseQoS, false); err != nil {
 		return fmt.Errorf("publisher: pulse %s: %w", topic, err)
 	}
 	return nil
@@ -552,7 +567,7 @@ func (p *StatePublisher) Evict(ctx context.Context, topics ...string) error {
 			errs = append(errs, err)
 			continue
 		}
-		if err := p.tr.Publish(ctx, t, nil, p.cfg.QoS, true); err != nil {
+		if err := p.tr.Publish(ctx, t, nil, p.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: evict %s: %w", t, err))
 			continue
 		}
@@ -625,7 +640,7 @@ func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, e
 			errs = append(errs, err)
 			continue
 		}
-		if err := p.tr.Publish(ctx, t, nil, p.cfg.QoS, true); err != nil {
+		if err := p.tr.Publish(ctx, t, nil, p.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: evict %s: %w", t, err))
 			continue
 		}
@@ -696,7 +711,7 @@ func (p *StatePublisher) Republish(ctx context.Context) (int, error) {
 			errs = append(errs, err)
 			continue
 		}
-		if err := p.send(ctx, t, snapshot[t], p.cfg.QoS, true); err != nil {
+		if err := p.send(ctx, t, snapshot[t], p.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: republish state %s: %w", t, err))
 			continue
 		}

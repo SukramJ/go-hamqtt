@@ -35,8 +35,8 @@ type AvailabilityConfig struct {
 	// wrote the `availability` list into every config.
 	Layout topic.Layout
 
-	// QoS applies to every availability publish and retraction. The zero
-	// value is QoS 1.
+	// QoS applies to every availability publish and retraction. [QoSUnset]
+	// — the zero value — is QoS 1.
 	//
 	// One is not the state plane's default by accident. The measured
 	// consumer pins QoS 1 on the device availability topic even where its
@@ -44,7 +44,24 @@ type AvailabilityConfig struct {
 	// message is corrected by the next reading, while a lost `offline`
 	// leaves every entity of a dead device showing its last value until
 	// something else happens to flip the topic.
-	QoS byte
+	//
+	// It is nevertheless a default and not a floor, and that is a decision
+	// with a reason rather than an omission. Availability has the strongest
+	// case for a hard floor in the package — openccu-loom's own PR evidence
+	// is two availability topics in one daemon with different guarantees,
+	// and an availability marker lost at QoS 0 leaves an entity wrongly
+	// available until the next flip, which for a crash is never. Three
+	// things still point the other way. A floor would be this package
+	// deciding what a consumer meant, which is exactly the silent
+	// imposition [QoS] exists to remove; it would make this type disagree
+	// with the other three, and three answers to one question is a defect
+	// this package has already fixed once; and the defect the evidence
+	// actually records is two topics *differing by accident*, which a
+	// single stated level per publisher makes unreachable. So a consumer
+	// can say [QoSAtMostOnce] here — and [NewAvailability] logs a warning
+	// naming the consequence when it does, because a stated choice with a
+	// known cost should still be visible in an operator's log.
+	QoS QoS
 
 	// CommandFilters are the topic filters the consumer subscribes for
 	// commands, and they are checked for the same reason
@@ -135,17 +152,22 @@ func NewAvailability(tr Transport, cfg AvailabilityConfig) *AvailabilityPublishe
 	if tr == nil {
 		panic("publisher: nil transport")
 	}
-	if cfg.QoS == 0 {
-		cfg.QoS = 1
-	}
+	qos := resolveQoS("publisher.AvailabilityConfig.QoS", cfg.QoS, QoSAtLeastOnce)
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if qos == 0 {
+		// Honoured, and said out loud. See [AvailabilityConfig.QoS] for why
+		// this is a warning rather than a refusal.
+		logger.Warn("publisher.availability.at_most_once",
+			slog.String("effect",
+				"an availability marker lost at QoS 0 leaves an entity wrongly available until the next flip"))
+	}
 	return &AvailabilityPublisher{
 		tr:      tr,
 		layout:  cfg.Layout,
-		qos:     cfg.QoS,
+		qos:     qos,
 		log:     logger,
 		filters: cfg.CommandFilters,
 		last:    map[string]cachedWrite{},

@@ -115,9 +115,14 @@ type Config struct {
 	Layout hatopic.Layout
 
 	// QoS applies to every publish and subscribe the runtime performs.
-	// The zero value is QoS 1, which is what a retained config wants: at
-	// most once loses the config a consumer may never publish again.
-	QoS byte
+	// [QoSUnset] — the zero value — is QoS 1, which is what a retained
+	// config wants: at most once loses the config a consumer may never
+	// publish again.
+	//
+	// The default is unchanged from v0.26.0; what is new is that
+	// [QoSAtMostOnce] states QoS 0 and is honoured. See [QoS] for the
+	// measured consumer that could not say it.
+	QoS QoS
 
 	// SweepWindow is how long [Runtime.Sweep] listens before judging. Zero
 	// means [DefaultSweepWindow].
@@ -173,6 +178,11 @@ type Runtime struct {
 	tr  Transport
 	cfg Config
 	log *slog.Logger
+	// qos is [Config.QoS] resolved once, at construction, to the wire byte
+	// a [Transport] takes. Resolved once rather than per call so an
+	// unrecognised level is a panic at the composition root instead of a
+	// publish at a level nobody chose.
+	qos byte
 
 	sweepMu sync.Mutex
 
@@ -206,9 +216,6 @@ func New(tr Transport, cfg Config) *Runtime {
 	if cfg.Prefix == "" {
 		cfg.Prefix = discovery.DefaultPrefix
 	}
-	if cfg.QoS == 0 {
-		cfg.QoS = 1
-	}
 	if cfg.SweepWindow <= 0 {
 		cfg.SweepWindow = DefaultSweepWindow
 	}
@@ -234,6 +241,7 @@ func New(tr Transport, cfg Config) *Runtime {
 	return &Runtime{
 		tr:         tr,
 		cfg:        cfg,
+		qos:        resolveQoS("publisher.Config.QoS", cfg.QoS, QoSAtLeastOnce),
 		log:        logger,
 		declared:   map[string][]byte{},
 		announced:  map[string]bool{},
@@ -295,7 +303,7 @@ func (r *Runtime) Publish(ctx context.Context, topic string, payload []byte) (bo
 		r.mu.Unlock()
 	}
 
-	if err := r.tr.Publish(ctx, topic, payload, r.cfg.QoS, true); err != nil {
+	if err := r.tr.Publish(ctx, topic, payload, r.qos, true); err != nil {
 		// The claim is dropped again on failure. Leaving it standing would
 		// keep the sweep off a topic that carries a previous build's config
 		// and that this process has just failed to overwrite — the one case
@@ -446,7 +454,7 @@ func (r *Runtime) supersede(ctx context.Context, topics []string) error {
 		if done {
 			continue
 		}
-		if err := r.tr.Publish(ctx, t, nil, r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, nil, r.qos, true); err != nil {
 			return fmt.Errorf("publisher: retract superseded %s: %w", t, err)
 		}
 		r.mu.Lock()
@@ -481,7 +489,7 @@ func (r *Runtime) Retract(ctx context.Context, topics ...string) error {
 			errs = append(errs, err)
 			break
 		}
-		if err := r.tr.Publish(ctx, t, nil, r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, nil, r.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: retract %s: %w", t, err))
 			continue
 		}
@@ -542,7 +550,7 @@ func (r *Runtime) Republish(ctx context.Context) (int, error) {
 			errs = append(errs, err)
 			break
 		}
-		if err := r.tr.Publish(ctx, t, snapshot[t], r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, snapshot[t], r.qos, true); err != nil {
 			errs = append(errs, fmt.Errorf("publisher: republish %s: %w", t, err))
 			continue
 		}

@@ -209,10 +209,14 @@ type NoLocalSubscriber interface {
 
 // CommandConfig parameterises a [CommandRouter]. The zero value is usable.
 type CommandConfig struct {
-	// QoS applies to every subscription the router registers. Zero means
-	// QoS 1: a command dropped in transit is a button press that did
-	// nothing, with no error anywhere to explain it.
-	QoS byte
+	// QoS applies to every subscription the router registers. [QoSUnset] —
+	// the zero value — means QoS 1: a command dropped in transit is a
+	// button press that did nothing, with no error anywhere to explain it.
+	//
+	// A default, not a floor: [QoSAtMostOnce] states QoS 0 and is
+	// honoured, for the consumer whose whole installed base subscribes at
+	// QoS 0 today — go-zendure2mqtt, measured on 2026-09-12. See [QoS].
+	QoS QoS
 
 	// Workers bounds how many handlers run concurrently. Zero means
 	// [DefaultCommandWorkers]; a negative value means one.
@@ -327,6 +331,11 @@ type CommandRouter struct {
 	tr  Transport
 	cfg CommandConfig
 	log *slog.Logger
+	// qos is [CommandConfig.QoS] resolved once, at construction, to the
+	// wire byte a [Transport] takes — so an unrecognised level is a panic
+	// at the composition root rather than a subscribe at a level nobody
+	// chose.
+	qos byte
 
 	lifeMu sync.Mutex
 
@@ -357,9 +366,6 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if tr == nil {
 		panic("publisher: nil transport")
 	}
-	if cfg.QoS == 0 {
-		cfg.QoS = 1
-	}
 	if cfg.Workers == 0 {
 		cfg.Workers = DefaultCommandWorkers
 	}
@@ -373,7 +379,12 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &CommandRouter{tr: tr, cfg: cfg, log: logger}
+	return &CommandRouter{
+		tr:  tr,
+		cfg: cfg,
+		log: logger,
+		qos: resolveQoS("publisher.CommandConfig.QoS", cfg.QoS, QoSAtLeastOnce),
+	}
 }
 
 // Handle registers handler for filter. Call it for every route before
@@ -742,9 +753,9 @@ func (r *CommandRouter) subscribe(ctx context.Context, filter string) error {
 		r.deliver(filter, topic, payload, retained)
 	}
 	if nl, ok := r.tr.(NoLocalSubscriber); ok {
-		return nl.SubscribeNoLocal(ctx, filter, r.cfg.QoS, handler)
+		return nl.SubscribeNoLocal(ctx, filter, r.qos, handler)
 	}
-	return r.tr.Subscribe(ctx, filter, r.cfg.QoS, handler)
+	return r.tr.Subscribe(ctx, filter, r.qos, handler)
 }
 
 // deliver is the transport-facing handler for one subscription. It runs on

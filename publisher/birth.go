@@ -53,7 +53,9 @@ type Will struct {
 	// Payload is [DeathPayload]. The broker publishes it when the
 	// connection drops without a clean DISCONNECT.
 	Payload []byte
-	// QoS is [Config.QoS].
+	// QoS is [Config.QoS], resolved to the wire byte an MQTT client takes —
+	// this is the only place in the package where a QoS crosses back out to
+	// a consumer's own client, and a client takes a byte.
 	QoS byte
 	// Retain is always true: an availability marker that is not retained
 	// tells nothing to a Home Assistant that subscribes after the crash,
@@ -71,7 +73,7 @@ func (r *Runtime) Will() (Will, error) {
 	return Will{
 		Topic:   r.cfg.StatusTopic,
 		Payload: []byte(DeathPayload),
-		QoS:     r.cfg.QoS,
+		QoS:     r.qos,
 		Retain:  true,
 	}, nil
 }
@@ -97,7 +99,7 @@ func (r *Runtime) announce(ctx context.Context, payload string) error {
 	if r.cfg.StatusTopic == "" {
 		return ErrNoStatusTopic
 	}
-	return r.tr.Publish(ctx, r.cfg.StatusTopic, []byte(payload), r.cfg.QoS, true)
+	return r.tr.Publish(ctx, r.cfg.StatusTopic, []byte(payload), r.qos, true)
 }
 
 // WatchBirth subscribes to [BirthTopic] and replays every declared config
@@ -158,7 +160,7 @@ func (r *Runtime) WatchBirth(ctx context.Context) error {
 			}
 		})
 	}
-	return r.tr.Subscribe(ctx, BirthTopic(r.cfg.Prefix), r.cfg.QoS, handler)
+	return r.tr.Subscribe(ctx, BirthTopic(r.cfg.Prefix), r.qos, handler)
 }
 
 // Close stops accepting birth events and blocks until an in-flight or queued

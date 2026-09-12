@@ -182,7 +182,7 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 		if r.claims(t) {
 			continue
 		}
-		if err := r.tr.Publish(ctx, t, nil, r.cfg.QoS, true); err != nil {
+		if err := r.tr.Publish(ctx, t, nil, r.qos, true); err != nil {
 			r.log.Warn("publisher.sweep.retract_failed",
 				slog.String("topic", t),
 				slog.String("err", err.Error()))
@@ -258,7 +258,7 @@ func (r *Runtime) snapshot(
 		}
 		collect(topic, payload, retained)
 	}
-	if err := r.tr.Subscribe(ctx, filter, r.cfg.QoS, gated); err != nil {
+	if err := r.tr.Subscribe(ctx, filter, r.qos, gated); err != nil {
 		return fmt.Errorf("publisher: snapshot subscribe %s: %w", filter, err)
 	}
 	timer := time.NewTimer(window)
