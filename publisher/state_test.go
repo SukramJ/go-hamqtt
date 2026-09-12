@@ -25,19 +25,39 @@ type slowTransport struct {
 	mu    sync.Mutex
 	delay time.Duration
 	calls int
+	// failPublish, failSubscribe and failUnsubscribe make the slow path
+	// fail too.
+	//
+	// All three used to return nil unconditionally, which put the latency
+	// window's own exclusion rule out of reach: a failed publish must not be
+	// timed, and the only way to assert that on a transport that takes
+	// measurable time is one that can both take time and fail.
+	failPublish     error
+	failSubscribe   error
+	failUnsubscribe error
 }
 
 func (s *slowTransport) Publish(_ context.Context, _ string, _ []byte, _ byte, _ bool) error {
 	s.mu.Lock()
 	d := s.delay
+	fail := s.failPublish
 	s.calls++
 	s.mu.Unlock()
 	time.Sleep(d)
-	return nil
+	return fail
 }
 
-func (s *slowTransport) Subscribe(context.Context, string, byte, Handler) error { return nil }
-func (s *slowTransport) Unsubscribe(context.Context, string) error              { return nil }
+func (s *slowTransport) Subscribe(context.Context, string, byte, Handler) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failSubscribe
+}
+
+func (s *slowTransport) Unsubscribe(context.Context, string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failUnsubscribe
+}
 
 // stateOps snapshots the fake's recorded operations.
 func stateOps(f *fakeTransport) []op {
@@ -972,5 +992,42 @@ func TestComponentStateTopicIsTheOnlyProvablyEqualRoute(t *testing.T) {
 	ops := stateOps(f)
 	if len(ops) != 1 || ops[0].topic != sensorComp.StateTopic {
 		t.Errorf("published to %+v, want %q", ops, sensorComp.StateTopic)
+	}
+}
+
+// TestLatencyIgnoresASlowFailure is the assertion the fixtures previously
+// made unreachable: only a transport that both takes measurable time and
+// fails can show that a failed publish is not timed.
+//
+// It matters because the duration of a failure is the distance to a refused
+// connection or a tripped breaker, not to a working broker. Timing it would
+// make [StatePublisher.Latency] report a healthy median during an outage, or
+// a catastrophic one, depending on how the failure happens to be produced —
+// either way a number describing something other than the broker.
+func TestLatencyIgnoresASlowFailure(t *testing.T) {
+	t.Parallel()
+
+	boom := errors.New("breaker open")
+	s := &slowTransport{delay: 2 * time.Millisecond, failPublish: boom}
+	p := NewStatePublisher(s, StateConfig{})
+	ctx := context.Background()
+
+	if _, err := p.Publish(ctx, "b/1/state", []byte("v")); !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the refusal", err)
+	}
+	if got := p.Latency(); got.Total != 0 || got.MedianMs != 0 {
+		t.Errorf("Latency = %+v, want nothing timed", got)
+	}
+
+	// The same transport, no longer failing, does get timed — so the
+	// exclusion above is the failure and not the fixture.
+	s.mu.Lock()
+	s.failPublish = nil
+	s.mu.Unlock()
+	if _, err := p.Publish(ctx, "b/1/state", []byte("v")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if got := p.Latency(); got.Total != 1 || got.MedianMs <= 0 {
+		t.Errorf("Latency = %+v, want the accepted publish timed", got)
 	}
 }

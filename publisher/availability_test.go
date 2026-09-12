@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,16 @@ type availBroker struct {
 	// fail decides an error per topic, standing in for a breaker open on
 	// one device.
 	fail func(topic string) error
+	// failSubscribe and failUnsubscribe do the same for the two
+	// subscription calls, which used to return nil unconditionally.
+	//
+	// Nothing in the availability plane subscribes today, so these are the
+	// knobs a consumer's composition test needs rather than this file's —
+	// but a fixture whose Subscribe and Unsubscribe cannot fail silently
+	// makes every tear-down branch reached through it unreachable, and the
+	// three fixtures in this package all had that shape at once.
+	failSubscribe   error
+	failUnsubscribe error
 }
 
 func (b *availBroker) Publish(_ context.Context, t string, payload []byte, qos byte, retain bool) error {
@@ -51,9 +62,17 @@ func (b *availBroker) Publish(_ context.Context, t string, payload []byte, qos b
 	return nil
 }
 
-func (b *availBroker) Subscribe(context.Context, string, byte, Handler) error { return nil }
+func (b *availBroker) Subscribe(context.Context, string, byte, Handler) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.failSubscribe
+}
 
-func (b *availBroker) Unsubscribe(context.Context, string) error { return nil }
+func (b *availBroker) Unsubscribe(context.Context, string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.failUnsubscribe
+}
 
 func (b *availBroker) all() []availWrite {
 	b.mu.Lock()
@@ -670,34 +689,117 @@ func TestDeviceSlotOfANilEntity(t *testing.T) {
 	}
 }
 
-// TestConcurrentFlipsDoNotRace exercises the gate under the race detector:
-// a bus-wide outage flips several hundred devices at once.
-func TestConcurrentFlipsDoNotRace(t *testing.T) {
+// TestConcurrentFlipsUnderTheRaceDetector drives the gate the way a bus-wide
+// outage does — several hundred devices flipping at once — and asserts what
+// the flips did, not only that the race detector stayed quiet.
+//
+// The previous version of this test could not fail. Its one assertion was
+// `len(Topics()) > 4` while its goroutines wrote exactly four distinct
+// topics, so it was arithmetically unfalsifiable: with Forget made a no-op it
+// still passed. It also had four goroutines share each topic, which violates
+// the one-writer-per-topic contract [StatePublisher] and this type document,
+// so nothing per-topic could be asserted at all.
+//
+// One goroutine per topic makes every per-topic outcome deterministic while
+// keeping the concurrency real: sixteen writers, a concurrent Republish
+// walking the shared map, and the gate, index and Forget all checked
+// afterwards. It is also the test standing where the failed-publish path
+// lives, so it asserts the index survives a refused write rather than
+// stepping around it.
+func TestConcurrentFlipsUnderTheRaceDetector(t *testing.T) {
 	t.Parallel()
 
-	b := &availBroker{}
+	const writers = 16
+	const flips = 8
+	// One topic in the set is refused by the broker throughout, which is the
+	// correlated case: a breaker open for one device while the fleet flips.
+	const refused = "loom/d3/availability"
+	boom := errors.New("breaker open")
+
+	b := &availBroker{fail: func(t string) error {
+		if t == refused {
+			return boom
+		}
+		return nil
+	}}
 	a := newAvail(t, b)
 	ctx := context.Background()
 
+	names := make([]string, writers)
+	for i := range names {
+		names[i] = "loom/d" + strconv.Itoa(i) + "/availability"
+	}
+
 	var wg sync.WaitGroup
-	for i := range 16 {
+	for i := range writers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			name := "loom/d" + string(rune('a'+i%4)) + "/availability"
-			for j := range 8 {
-				if _, err := a.Publish(ctx, name, j%2 == 0); err != nil {
-					t.Errorf("Publish: %v", err)
+			name := names[i]
+			for j := range flips {
+				// Alternating payloads, so every call is a transition and
+				// the gate must let every one of them through.
+				changed, err := a.Publish(ctx, name, j%2 == 0)
+				switch {
+				case name == refused:
+					if !errors.Is(err, boom) {
+						t.Errorf("%s: want the refusal, got %v", name, err)
+						return
+					}
+				case err != nil:
+					t.Errorf("%s: Publish: %v", name, err)
+					return
+				case !changed:
+					t.Errorf("%s: flip %d was suppressed although the payload changed", name, j)
 					return
 				}
 			}
+			// Walks the same map the writers are mutating; its result is not
+			// deterministic under concurrency, only its safety.
 			_, _ = a.Republish(ctx)
-			a.Forget(name)
 		}()
 	}
 	wg.Wait()
-	if len(a.Topics()) > 4 {
-		t.Errorf("gate holds %v", a.Topics())
+
+	// The index holds every topic the broker accepted and nothing else. The
+	// refused one is absent because its first write never landed — not
+	// because a failure deleted it; that half is
+	// TestAFailedFlipKeepsTheTopicInTheIndex.
+	got := a.Topics()
+	if len(got) != writers-1 {
+		t.Fatalf("Topics() = %v, want the %d accepted topics", got, writers-1)
+	}
+	for _, name := range got {
+		if name == refused {
+			t.Fatalf("the refused topic %q entered the index", name)
+		}
+		if _, known := a.Online(name); !known {
+			t.Errorf("%s is listed but has no remembered value", name)
+		}
+	}
+
+	// Every accepted topic saw at least its own flips on the wire. The exact
+	// sequence is not asserted here because the concurrent Republish writes
+	// into it; the gate's ordering is pinned sequentially by
+	// TestTheGateFlipsOnlyOnTransitions, and what this test adds is that
+	// every one of the alternating flips above returned changed=true — a
+	// gate that suppressed a real transition under concurrency fails in the
+	// goroutine, not here.
+	for _, name := range got {
+		if n := len(b.payloads(name)); n < flips {
+			t.Errorf("%s carried %d writes, want at least the %d flips", name, n, flips)
+		}
+	}
+
+	// And Forget actually forgets: the assertion the old shape could not
+	// make, and the one that caught a no-op Forget when the reviewer
+	// mutated it.
+	a.Forget(got...)
+	if left := a.Topics(); len(left) != 0 {
+		t.Errorf("Forget left %v in the index", left)
+	}
+	if _, known := a.Online(got[0]); known {
+		t.Errorf("Forget left a remembered value for %s", got[0])
 	}
 }
 
