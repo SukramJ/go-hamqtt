@@ -3,6 +3,148 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.25.0] - 2026-09-12
+
+The publisher runtime ADR 0070 scoped from the start and phase 2
+left out: "a types-only library would leave the publish loop,
+availability policy and orphan sweep duplicated six times." Four
+pieces, each taken from what the first full consumer already ships
+and each carrying the measurement that decided it.
+
+### Added
+
+- **`publisher.Runtime`** — the retained-discovery state of one
+  consumer process, over a `publisher.Transport` (publish retained,
+  subscribe, unsubscribe) declared here rather than
+  `github.com/SukramJ/go-mqtt` itself.
+
+  The interface is narrow and speaks plain bytes because the
+  consumers wrap their client differently — one publishes through a
+  circuit breaker and subscribes around it — so a concrete client
+  type would fit none of them, and because the whole runtime has to
+  be exercisable without a broker. `publisher/gomqtt` adapts a
+  go-mqtt client in one call; it is the only package in the module
+  that imports the transport.
+
+  Two locks, ordered `sweepMu → mu`, stated on the type the way
+  go-mqtt's `TCPClient` states its own. `mu` is never held across a
+  transport call: a publish blocks on a broker acknowledgement, and
+  holding the claim lock across it would stall every other publisher
+  and the sweep behind one slow PUBACK.
+
+- **Hash-dedup retained publish** — `Runtime.Publish`,
+  `Runtime.PublishBundle`, `Runtime.PublishComponent`, all reporting
+  whether anything reached the broker.
+
+  A steady-state restart re-renders every entity a consumer drives
+  and every payload is byte-identical to the one the broker already
+  holds — on the measured fleet, nine thousand writes that change
+  nothing, each re-read and re-validated by Home Assistant.
+  Comparing the bytes turns that into zero.
+
+  The store keeps the bytes rather than a digest of them, because
+  the birth resync replays them and a digest would force a consumer
+  to re-render its whole fleet to answer a question the runtime
+  already knows. It survives reconnects: it is process state, not
+  connection state. Only what the broker accepted is recorded —
+  caching an attempt that failed would make the next identical
+  payload hit the dedup gate, leaving the entity absent until the
+  operator restarts the daemon.
+
+- **Retract-then-publish, in both directions** —
+  `Runtime.Retract`, `publisher.SupersededTopics`, and the ordering
+  built into the two publish paths.
+
+  Measured against a live Home Assistant 2026.9 instance on
+  2026-09-10: publishing a device bundle while a per-entity config
+  for the same `unique_id` is still retained is refused, and the
+  entire signal is `WARNING [mqtt.entity] Received a conflicting
+  MQTT discovery message`. The bundle sits retained on the broker,
+  the entity keeps its old config, and nothing reports that the
+  migration did not happen. The refusal is symmetric — measured
+  again on 2026-09-11 with the topics named the other way round — so
+  `PublishComponent` retracts the device document first for exactly
+  the same reason. `migrate_discovery: true` was tried and did not
+  lift the conflict.
+
+  A failed retraction aborts before the publish rather than pressing
+  on. Between the two the entity does not exist — absent, not merely
+  unavailable — and having lost the old config and then failed to
+  write the new one is the one outcome worse than not having
+  started.
+
+- **`Runtime.Sweep`** — the orphan pass over the retained discovery
+  tree, with `publisher.ParseConfigTopic`, `ConfigTopic`,
+  `SweepRequest`, `SweepResult` and `ErrSweepUnscoped`.
+
+  A retained config outlives the build that wrote it: drop an entity
+  and the broker keeps handing Home Assistant the old payload
+  forever, which re-creates it as a permanently unavailable phantom
+  on every integration restart. Operators ran a shell script by
+  hand.
+
+  It recognises **both** topic forms — four segments for
+  `<prefix>/<platform>/<node>/<object>/config`, three beginning with
+  the literal `device` for `<prefix>/device/<node>/config`. `device`
+  is not a platform name and the closest ones, `device_automation`
+  and `device_tracker`, produce four segments anyway. Matching only
+  the per-entity form made every device document invisible: never
+  inspected, never cleared, retained by a broker no consumer would
+  ever claim it from again.
+
+  `SweepRequest.Owns` is required, and its absence is
+  `ErrSweepUnscoped` rather than a default. A discovery prefix is
+  shared — a parallel zigbee2mqtt publishes documents into the same
+  tree — and a sweep that guessed would clear every other
+  integration's entities. `SweepResult.Inspected` is reported beside
+  the retractions because zero inspected ("the window saw nothing of
+  ours") and zero retracted ("it saw everything and nothing was
+  orphaned") are different faults that look identical in a log line
+  carrying only the second number.
+
+- **Birth, will and the resync** — `Runtime.Will`,
+  `AnnounceOnline`, `AnnounceOffline`, `WatchBirth`, `Republish`,
+  `Close`, `BirthTopic`, `BirthPayload`/`DeathPayload` and
+  `ErrNoStatusTopic`.
+
+  The will is returned as data, not applied: it belongs to CONNECT
+  and therefore to the client the consumer builds. Handing it over
+  is what makes the two halves agree by construction — the same
+  topic and the same two payloads the announcements use. Two
+  reference bridges configure a will no published entity references,
+  so a hard crash writes "offline" where nothing reads it and every
+  entity stays available forever, showing the last value it ever
+  saw. An empty `Config.StatusTopic` is `ErrNoStatusTopic` and
+  publishes nothing, rather than quietly reproducing that.
+
+  `WatchBirth` replays every declared config on
+  `<prefix>/status: online`, including the retained delivery at
+  subscribe time — Home Assistant publishes its status retained, and
+  a consumer that connects afterwards gets no other signal. The
+  replay runs on a worker, not on the read loop: it is one blocking
+  retained publish per declared topic, each waiting on an
+  acknowledgement only that same read loop could deliver, so inline
+  it is a self-deadlock on the first birth message. A burst
+  collapses onto one pending job, since every replay is idempotent.
+
+### Notes
+
+- Additive throughout. Nothing in `discovery`, `model`, `topic` or
+  `catalog` changed, and no exported signature moved.
+- `github.com/SukramJ/go-mqtt v1.4.0` joins `go-ha-catalog` in
+  `go.mod`, imported by `publisher/gomqtt` only.
+- One deliberate deviation from the reference implementation: a
+  superseded topic is retracted once per process rather than on
+  every change of the document. After the first retraction the
+  broker holds nothing there, so a device rewritten forty times
+  during a boot would otherwise send forty rounds of retractions for
+  nothing.
+- Not included: batching (`BeginBundleBatch`/`FlushBundles`), which
+  is a scheduling policy the consumer owns; the validity counter the
+  reference implementation raises per component, which belongs with
+  its metrics; and any offline queue — a publish on a disconnected
+  client fails, exactly as it does in `go-mqtt`.
+
 ## [0.24.0] - 2026-09-12
 
 The four measured model gaps left after migrating openccu-loom's hub
