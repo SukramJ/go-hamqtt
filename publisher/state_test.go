@@ -849,3 +849,38 @@ func TestEvictPrefixFoldsCase(t *testing.T) {
 		t.Fatalf("EvictPrefix = %d, %v; want the sibling spared", n, err)
 	}
 }
+
+// TestStateResetIsTheSameIdiomAsTheAvailabilityPlanes closes the second half
+// of the two-idioms defect: the availability plane had a Reset and the state
+// plane had only Forget plus Republish, for the identical "the broker came
+// back without its retained store" problem.
+func TestStateResetIsTheSameIdiomAsTheAvailabilityPlanes(t *testing.T) {
+	t.Parallel()
+
+	f := newFake()
+	p := NewStatePublisher(f, StateConfig{})
+	ctx := context.Background()
+	const name = "b/dev/1/state"
+
+	if _, err := p.Publish(ctx, name, []byte("21.5")); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if sent, _ := p.Publish(ctx, name, []byte("21.5")); sent {
+		t.Fatal("the gate did not hold before the reset")
+	}
+
+	p.Reset()
+	if got := p.Published(); len(got) != 1 || got[0] != name {
+		t.Errorf("Reset dropped the index: Published() = %v", got)
+	}
+	if n, err := p.Republish(ctx); err != nil || n != 1 {
+		t.Errorf("Reset then Republish sent %d, %v; want the value re-sent", n, err)
+	}
+	sent, err := p.Publish(ctx, name, []byte("21.5"))
+	if err != nil || !sent {
+		t.Fatalf("the post-reconnect publish was suppressed: %v, %v", sent, err)
+	}
+	if sent, err = p.Publish(ctx, name, []byte("21.5")); err != nil || sent {
+		t.Errorf("the gate stayed open after the reset's one write: %v, %v", sent, err)
+	}
+}

@@ -149,6 +149,32 @@ type StateConfig struct {
 	Logger *slog.Logger
 }
 
+// cachedWrite is one payload a broker accepted, and whether the dedup gate is
+// still entitled to act on it.
+//
+// The two halves are separate because the reconnect case needs exactly one of
+// them dropped. A broker that came back without a persistent retained store
+// holds nothing, so the gate must stop suppressing — but the payload is still
+// the one thing that says what the topic should carry, and the topic's
+// presence in the map is what puts it on a republish worklist, in a topic
+// listing and inside a sweep's ownership set. Clearing the whole map to open
+// the gate is what made [AvailabilityPublisher.Reset] followed by
+// [AvailabilityPublisher.Republish] — the two calls a reader pairs on a
+// reconnect — send nothing at all.
+//
+// Shared by both dedup gates in this file's package half ([StatePublisher]
+// and [AvailabilityPublisher]) so the two cannot drift into different
+// answers, which is the failure mode this package keeps finding.
+type cachedWrite struct {
+	// payload is the exact bytes the broker accepted, for the byte
+	// comparison and for a republish.
+	payload []byte
+	// gated says the comparison may suppress a repeat. A Reset clears it
+	// and keeps the payload, so the next write of the same value goes out
+	// once and the entry is gated again afterwards.
+	gated bool
+}
+
 // StatePublisher writes entity state, as distinct from the retained discovery
 // configs [Runtime] owns.
 //
@@ -199,7 +225,7 @@ type StatePublisher struct {
 	// accepted. It is both halves of the job: the dedup comparison, and the
 	// index [StatePublisher.EvictPrefix] walks to clear a removed device
 	// whose datapoints no longer exist anywhere to be enumerated from.
-	published map[string][]byte
+	published map[string]cachedWrite
 
 	latMu   sync.Mutex
 	samples []time.Duration
@@ -227,7 +253,7 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 		tr:        tr,
 		cfg:       cfg,
 		log:       logger,
-		published: map[string][]byte{},
+		published: map[string]cachedWrite{},
 	}
 }
 
@@ -289,9 +315,9 @@ func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []by
 	}
 
 	p.mu.Lock()
-	previous, known := p.published[topic]
+	previous := p.published[topic]
 	p.mu.Unlock()
-	if known && bytes.Equal(previous, payload) {
+	if previous.gated && bytes.Equal(previous.payload, payload) {
 		return false, nil
 	}
 
@@ -314,7 +340,7 @@ func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []by
 	// on top of that costs index membership, and each of these maps is also
 	// its plane's topic list, republish worklist and ownership set.
 	p.mu.Lock()
-	p.published[topic] = bytes.Clone(payload)
+	p.published[topic] = cachedWrite{payload: bytes.Clone(payload), gated: true}
 	p.mu.Unlock()
 	return true, nil
 }
@@ -537,7 +563,7 @@ func (p *StatePublisher) Republish(ctx context.Context) (int, error) {
 	snapshot := make(map[string][]byte, len(p.published))
 	for t, v := range p.published {
 		topics = append(topics, t)
-		snapshot[t] = v
+		snapshot[t] = v.payload
 	}
 	p.mu.Unlock()
 	sort.Strings(topics)
@@ -578,6 +604,32 @@ func (p *StatePublisher) Forget(topics ...string) {
 	defer p.mu.Unlock()
 	for _, t := range topics {
 		delete(p.published, t)
+	}
+}
+
+// Reset opens the dedup gate for every remembered topic without forgetting
+// what they carry, so the next publish of each goes out once even if its
+// value has not changed.
+//
+// This is the reconnect call, and it is deliberately the same shape and the
+// same name as [AvailabilityPublisher.Reset]: one reconnect handler, one
+// idiom for both planes. A consumer previously had to remember that the
+// availability plane offered a Reset and the state plane only
+// [StatePublisher.Forget] plus [StatePublisher.Republish], for the identical
+// problem — a broker that came back without its retained store.
+//
+// Pair it with the consumer's own snapshot pass, which re-publishes each
+// datapoint's current value: the reset is what stops the gate suppressing
+// those writes as unchanged. A consumer with no such pass wants
+// [StatePublisher.Republish], which re-sends the cached values itself and
+// needs no reset — and the two now compose in either order, because a reset
+// keeps the index a republish walks.
+func (p *StatePublisher) Reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for t, e := range p.published {
+		e.gated = false
+		p.published[t] = e
 	}
 }
 

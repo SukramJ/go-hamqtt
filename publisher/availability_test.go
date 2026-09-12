@@ -375,6 +375,11 @@ func TestRawSelfPayloadIsNotAnEnvelope(t *testing.T) {
 // TestResetMakesTheNextFlipUnconditional is the reconnect contract: a broker
 // that came back without its retained store holds nothing, while the gate
 // still believes every device is online.
+//
+// It also pins the half that used to be wrong. The reset opens the gate and
+// keeps the index, so the two calls the package documents for a reconnect
+// compose in either order: Reset followed by Republish re-sends the fleet
+// instead of finding an empty worklist.
 func TestResetMakesTheNextFlipUnconditional(t *testing.T) {
 	t.Parallel()
 
@@ -391,12 +396,23 @@ func TestResetMakesTheNextFlipUnconditional(t *testing.T) {
 		t.Fatal("the gate did not hold before the reset")
 	}
 	a.Reset()
-	if len(a.Topics()) != 0 {
-		t.Errorf("Reset left %v behind", a.Topics())
+	topicName := mustTopic(t, a, slot)
+	if got := a.Topics(); len(got) != 1 || got[0] != topicName {
+		t.Errorf("Reset dropped the index: Topics() = %v", got)
+	}
+	if online, known := a.Online(topicName); !known || !online {
+		t.Errorf("Reset dropped the last value: Online() = %v, %v", online, known)
+	}
+	if sent, err := a.Republish(ctx); err != nil || sent != 1 {
+		t.Errorf("Reset then Republish sent %d, %v; want the fleet re-sent", sent, err)
 	}
 	changed, err := a.Device(ctx, slot, true)
 	if err != nil || !changed {
 		t.Fatalf("the post-reconnect flip was suppressed: %v, %v", changed, err)
+	}
+	// And the gate closes again behind that one write.
+	if changed, err = a.Device(ctx, slot, true); err != nil || changed {
+		t.Errorf("the gate stayed open after the reset's one write: %v, %v", changed, err)
 	}
 }
 

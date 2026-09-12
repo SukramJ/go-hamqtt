@@ -115,7 +115,13 @@ type AvailabilityPublisher struct {
 	// carries the two-token device form and the true/false self form, and
 	// a bool would have to be interpreted differently per topic by
 	// whichever call site read it next.
-	last map[string][]byte
+	//
+	// The [cachedWrite] wrapper is what lets
+	// [AvailabilityPublisher.Reset] open the gate without dropping the
+	// index: the map is also [AvailabilityPublisher.Topics], the worklist
+	// of [AvailabilityPublisher.Republish] and the ownership set of
+	// [AvailabilityPublisher.Sweep].
+	last map[string]cachedWrite
 }
 
 // NewAvailability builds a publisher over tr.
@@ -142,7 +148,7 @@ func NewAvailability(tr Transport, cfg AvailabilityConfig) *AvailabilityPublishe
 		qos:     cfg.QoS,
 		log:     logger,
 		filters: cfg.CommandFilters,
-		last:    map[string][]byte{},
+		last:    map[string]cachedWrite{},
 	}
 }
 
@@ -314,9 +320,9 @@ func (a *AvailabilityPublisher) write(ctx context.Context, t string, payload []b
 	}
 
 	a.mu.Lock()
-	previous, known := a.last[t]
+	previous := a.last[t]
 	a.mu.Unlock()
-	if known && bytes.Equal(previous, payload) {
+	if previous.gated && bytes.Equal(previous.payload, payload) {
 		return false, nil
 	}
 
@@ -345,7 +351,7 @@ func (a *AvailabilityPublisher) write(ctx context.Context, t string, payload []b
 	}
 
 	a.mu.Lock()
-	a.last[t] = bytes.Clone(payload)
+	a.last[t] = cachedWrite{payload: bytes.Clone(payload), gated: true}
 	a.mu.Unlock()
 	return true, nil
 }
@@ -360,11 +366,11 @@ func (a *AvailabilityPublisher) write(ctx context.Context, t string, payload []b
 func (a *AvailabilityPublisher) Online(t string) (online, known bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	payload, ok := a.last[t]
+	entry, ok := a.last[t]
 	if !ok {
 		return false, false
 	}
-	return string(payload) == discovery.PayloadOnline, true
+	return string(entry.payload) == discovery.PayloadOnline, true
 }
 
 // Topics lists the availability topics this process has written, sorted.
@@ -400,8 +406,9 @@ func (a *AvailabilityPublisher) Forget(topics ...string) {
 	}
 }
 
-// Reset clears the whole gate, so the next flip of every topic publishes
-// unconditionally.
+// Reset opens the gate for every remembered topic, so the next flip of each
+// publishes unconditionally — and keeps what they carry, so the index
+// survives.
 //
 // This is the reconnect call, and the reasoning is worth stating because the
 // obvious answer is the wrong one. A broker replays its retained availability
@@ -421,11 +428,23 @@ func (a *AvailabilityPublisher) Forget(topics ...string) {
 //
 // Pair it with the consumer's own snapshot pass, which re-asserts every
 // device's current reachability. [AvailabilityPublisher.Republish] is the
-// same idea for a consumer that has no such pass.
+// same idea for a consumer that has no such pass — and the two compose in
+// either order, which they did not when this call emptied the map: a reader
+// pairing the documented reconnect calls as Reset-then-Republish sent nothing
+// at all, because the republish had no worklist left. Opening the gate is
+// what a reconnect needs; forgetting the fleet is not, and
+// [AvailabilityPublisher.Forget] is where that is said on purpose.
+//
+// [StatePublisher.Reset] is the same call on the state plane, deliberately
+// the same name and the same semantics, so one reconnect handler needs one
+// idiom rather than two.
 func (a *AvailabilityPublisher) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	clear(a.last)
+	for t, e := range a.last {
+		e.gated = false
+		a.last[t] = e
+	}
 }
 
 // Republish re-sends every remembered availability topic at its last value
@@ -447,8 +466,8 @@ func (a *AvailabilityPublisher) Reset() {
 func (a *AvailabilityPublisher) Republish(ctx context.Context) (int, error) {
 	a.mu.Lock()
 	snapshot := make(map[string][]byte, len(a.last))
-	for t, p := range a.last {
-		snapshot[t] = p
+	for t, e := range a.last {
+		snapshot[t] = e.payload
 	}
 	a.mu.Unlock()
 
