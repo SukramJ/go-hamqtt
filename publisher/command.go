@@ -458,8 +458,9 @@ type route struct {
 //     under the discovery prefix, not in the consumer's command tree, so
 //     they do not; a consumer that adds a broad subscription of its own
 //     should still keep it off the command tree, which is the
-//     subscription-side twin of [CommandRouter.CheckDisjoint], and must on
-//     any go-mqtt before v1.5.1.
+//     subscription-side twin of [CommandRouter.CheckDisjoint]. This
+//     module requires v1.5.1, so that is guidance rather than the only
+//     thing standing between the mistake and a doubled physical action.
 //
 //   - Handlers run off the read loop. See [CommandHandler].
 //

@@ -3,6 +3,26 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.31.0] - 2026-09-13
+
+### Changed
+
+- **`go.mod` requires `go-mqtt` v1.5.1.** v0.30.0 had to leave this
+  open: the fix was on an unmerged pull request, so the release could
+  only document the boundary rather than close it. Until now a consumer
+  whose own client carried a broad subscription matching a command topic
+  could still see a handler run twice per published message — through
+  go-mqtt v1.5.0 an identifier-less delivery was matched by topic
+  against stamped subscriptions as well, so that subscription's copies
+  reached every stamped route.
+
+  v1.5.1 fails closed instead, per MQTT 5.0 §3.3.4: a copy carrying no
+  identifier was forwarded for no stamped subscription, so it reaches
+  none. The guidance on `CommandRouter` stands unchanged — a consumer
+  should still keep a broad subscription off its own command tree, which
+  is the subscription-side twin of `CheckDisjoint` — but it is no longer
+  the only thing between that mistake and a doubled physical action.
+
 ## [0.30.0] - 2026-09-13
 
 An adversarial review of v0.27.0–v0.29.0. Every item below was measured
@@ -141,9 +161,8 @@ the first two.
   v1.5.0 an identifier-less delivery was matched by topic against
   stamped subscriptions too, so that subscription's copies reached every
   stamped route and ran its handler twice per published message. v1.5.1
-  fails closed, per MQTT 5.0 §3.3.4. This module's `go.mod` still
-  requires v1.5.0 — a minimum, not a ceiling — and will move to v1.5.1
-  once that release is tagged. Nothing here relied on the permissive
+  fails closed, per MQTT 5.0 §3.3.4. **Closed in v0.31.0**, whose
+  `go.mod` requires v1.5.1. Nothing here relied on the permissive
   matching, which is pinned by a test.
 
 ## [0.29.0] - 2026-09-12
