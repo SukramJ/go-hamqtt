@@ -192,3 +192,79 @@ func TestAdapterAttributedSubscribeReportsErrors(t *testing.T) {
 		t.Fatalf("attributed subscribe: %v", err)
 	}
 }
+
+// TestV311AdapterWithholdsTheV5Capabilities is the composition-root half of a
+// contradiction the v0.27.0–v0.29.0 review measured: the README said an
+// overlapping pair is "refused at registration with ErrAmbiguousRoutes" on
+// MQTT 3.1.1, while the shipped adapter statically implements
+// AttributingSubscriber whatever the wrapped client is talking — so the
+// overlap was accepted on both dialects and only Start failed.
+//
+// A v3.1.1 link has no property block to carry a Subscription Identifier and
+// no No Local, and both facts are known before the first SUBSCRIBE. This
+// adapter therefore claims neither, which moves the failure from boot to the
+// composition root.
+func TestV311AdapterWithholdsTheV5Capabilities(t *testing.T) {
+	t.Parallel()
+	c := &fakeClient{}
+	tr := TransportV311(c)
+
+	if _, ok := tr.(publisher.AttributingSubscriber); ok {
+		t.Error("the v3.1.1 adapter claims attribution; the overlap is then accepted and Start fails at boot")
+	}
+	if _, ok := tr.(publisher.NoLocalSubscriber); ok {
+		t.Error("the v3.1.1 adapter claims No Local, which a v3.1.1 broker ignores")
+	}
+
+	// And a router over it refuses the overlapping pair where a consumer
+	// can act on it.
+	r := publisher.NewCommandRouter(tr, publisher.CommandConfig{})
+	if err := r.Handle("ccu/+/+/set", func(context.Context, publisher.Command) {}); err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	err := r.Handle("ccu/+/PRESS_SHORT/set", func(context.Context, publisher.Command) {})
+	if !errors.Is(err, publisher.ErrAmbiguousRoutes) {
+		t.Fatalf("Handle = %v, want ErrAmbiguousRoutes at registration", err)
+	}
+	if !errors.Is(err, publisher.ErrAttributionUnavailable) {
+		t.Errorf("the refusal must name the missing capability, got %v", err)
+	}
+
+	// It is still a whole transport: the three methods reach the client.
+	ctx := context.Background()
+	if err := tr.Publish(ctx, "t", []byte("p"), 2, true); err != nil {
+		t.Fatal(err)
+	}
+	if c.topic != "t" || c.qos != mqtt.QoS2 || !c.retain {
+		t.Fatalf("publish arrived as %q qos=%d retain=%v", c.topic, c.qos, c.retain)
+	}
+	if err := tr.Subscribe(ctx, "f/#", 1, func(string, []byte, bool) {}); err != nil {
+		t.Fatal(err)
+	}
+	if c.filter != "f/#" || c.opts != 0 {
+		t.Fatalf("subscribe arrived as %q with %d options, want no v5 options", c.filter, c.opts)
+	}
+	if err := tr.Unsubscribe(ctx, "f/#"); err != nil {
+		t.Fatal(err)
+	}
+	if c.unsubscribed != "f/#" {
+		t.Fatalf("unsubscribed %q", c.unsubscribed)
+	}
+}
+
+// TestSplitV311IsSplitWithoutTheClaims pins the two-value constructor, the
+// shape a consumer publishing through a circuit breaker actually has.
+func TestSplitV311IsSplitWithoutTheClaims(t *testing.T) {
+	t.Parallel()
+	c := &fakeClient{}
+	tr := SplitV311(c, c)
+	if _, ok := tr.(publisher.AttributingSubscriber); ok {
+		t.Error("SplitV311 claims attribution")
+	}
+	if err := tr.Publish(context.Background(), "t", nil, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	if c.topic != "t" {
+		t.Fatalf("publish arrived as %q", c.topic)
+	}
+}

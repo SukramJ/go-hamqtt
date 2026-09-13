@@ -170,12 +170,22 @@ _ = router.Handle("daikin/+/+/+/set", generic)            // the shape
 _ = router.Handle("daikin/+/+/fan_mode/set", fanModeOnly) // wins its topics
 ```
 
-Exactly one handler still runs per message. On MQTT 3.1.1 there is no
-property block to carry an identifier, so the pair is refused at
-registration with `ErrAmbiguousRoutes` — and if the link turns out to be
-v3.1.1 only after the routes were accepted, `Start` fails with
+Exactly one handler still runs per message, and the routes go out most
+specific first so a command delivered while the subscriptions are still
+being registered reaches the route that owns it rather than being dropped.
+
+On MQTT 3.1.1 there is no property block to carry an identifier, and where
+that is reported depends on which constructor the client was wrapped in.
+`gomqtt.Transport` implements `AttributingSubscriber` whatever the wrapped
+client is talking — a Go type cannot carry a value's protocol version — so
+the overlapping pair is accepted at `Handle` on both dialects and a v3.1.1
+link is caught at `router.Start`, which fails with
 `ErrAttributionUnavailable` rather than falling back to a delivery it cannot
-attribute.
+attribute. A consumer that pins `mqtt.ProtocolV311` should wrap its client
+with `gomqtt.TransportV311` (or `gomqtt.SplitV311`) instead: that adapter
+claims neither MQTT 5.0 capability, so the overlap is refused where a
+composition root can act on it, with `ErrAmbiguousRoutes` wrapping
+`ErrAttributionUnavailable`.
 
 Boot, in this order — availability first so nothing is briefly claimed
 available on stale data, discovery before state, the sweep last:
