@@ -77,6 +77,41 @@ type Transport interface {
 	Unsubscribe(ctx context.Context, filter string) error
 }
 
+// Generational is a [Transport] that can name the connection it is currently
+// on, so a [Runtime] need not be told when to forget.
+//
+// Implementing it is optional and additive: a transport that does not is
+// exactly as it was, and a [Runtime] over it keeps its memos for the life of
+// the process — which is wrong across a reconnect, for the reason set out on
+// [Runtime].
+//
+// The contract is narrow on purpose. The value must change on every
+// (re)connect and must not change otherwise; it need not be sequential, only
+// different, and it is read on the publish path, so it must be cheap and must
+// take no lock a publish could be holding. A consumer wrapping
+// [github.com/SukramJ/go-mqtt] has the number already: its lifecycle calls
+// OnConnect once per connection, so an atomic counter incremented there is
+// the whole implementation.
+//
+//	type transport struct {
+//		*hagomqtt.Client
+//		gen atomic.Uint64 // bumped in the lifecycle's OnConnect
+//	}
+//
+//	func (t *transport) ConnectionGeneration() uint64 { return t.gen.Load() }
+//
+// What a [Runtime] then does with it is [Runtime.Reset], automatically, on
+// the first call after the number changes: the retraction memo is dropped so
+// every superseded per-entity config is retracted again on the new
+// connection, and the dedup gate is opened so a config the broker may never
+// have received is written again. Nothing is forgotten that a replay would
+// need — the payloads stay, and so does [Runtime.Claimed].
+type Generational interface {
+	Transport
+	// ConnectionGeneration identifies the connection the transport is on.
+	ConnectionGeneration() uint64
+}
+
 // Config parameterises a [Runtime]. The zero value is usable except for the
 // availability half, which needs a [Config.StatusTopic].
 type Config struct {
@@ -182,6 +217,40 @@ var ErrNoStatusTopic = errors.New("publisher: no status topic configured")
 // has published, what it has superseded, and what it must replay when Home
 // Assistant comes back.
 //
+// # A Runtime is a statement about one connection
+//
+// This is the contract, and it was learned the expensive way. Everything a
+// Runtime remembers — `superseded`, `declared`, `announced` — is a statement
+// about what A BROKER holds, while the memo itself is per PROCESS. At QoS 0
+// those are not the same statement: [Transport.Publish] returns when the
+// bytes have been written and flushed to a socket, which may then die before
+// the broker ever applied them.
+//
+// go-mtec2mqtt shipped the consequence (its PR #54, finding F1, measured on
+// the reviewer's harness): a round of retractions was flushed to a dying
+// connection and memoised as done, so the in-process retry after the
+// reconnect re-sent `retractions re-sent = 0, document published = true,
+// configs still retained = 1`. Home Assistant answers that with one
+// `WARNING [mqtt.entity] Received a conflicting MQTT discovery message` in
+// its own log: no entities, no error, nothing on the wire and nothing in the
+// consumer's log.
+//
+// There are two ways to honour the contract and both are supported:
+//
+//   - Rebuild the Runtime on every (re)connect. This is what three consumers
+//     arrived at independently — a `func() *publisher.Runtime` factory called
+//     from the connect hook rather than a long-lived instance — and it is the
+//     recommended shape, because it covers every field this type may grow
+//     later without anyone having to enumerate them.
+//   - Implement [Generational] on the transport, and the Runtime drops the
+//     per-connection half of its memory itself, on the first call after the
+//     connection changed. [Runtime.Reset] is the same thing by hand, for a
+//     consumer whose transport cannot say.
+//
+// What must NOT be done is the thing that looks like the fix:
+// [Runtime.Republish] re-sends cached bytes and skips the supersede step
+// entirely, and per-connection completeness of that step is the whole point.
+//
 // # Locking
 //
 // Two locks, and the order between them is fixed:
@@ -213,7 +282,7 @@ type Runtime struct {
 	// replays this map, and a digest would force the consumer to re-render
 	// its whole fleet to answer a question the runtime already knows the
 	// answer to.
-	declared map[string][]byte
+	declared map[string]cachedWrite
 	// announced marks a topic whose publish is in flight. The broker fans a
 	// message out to its subscribers — the sweep's own snapshot
 	// subscription included — before Publish returns, so a claim taken only
@@ -223,6 +292,16 @@ type Runtime struct {
 	// superseded records the topics retracted to clear the way for the
 	// other discovery form. See [Runtime.PublishBundle].
 	superseded map[string]bool
+	// claimed is every config topic this process has published since it
+	// started, and it only ever grows — a topic retracted afterwards stays
+	// in it. It is not a dedup structure; it is the ownership evidence
+	// [SweepRequest.SelfClaimed] reads. See [Runtime.Claimed].
+	claimed map[string]bool
+	// gen is the connection generation the memos above describe, and
+	// genSeen whether one has ever been read. Both are meaningless unless
+	// the transport implements [Generational].
+	gen     uint64
+	genSeen bool
 
 	birth *dispatcher
 }
@@ -275,9 +354,10 @@ func New(tr Transport, cfg Config) *Runtime {
 		cfg:        cfg,
 		qos:        resolveQoS("publisher.Config.QoS", cfg.QoS, QoSAtLeastOnce),
 		log:        logger,
-		declared:   map[string][]byte{},
+		declared:   map[string]cachedWrite{},
 		announced:  map[string]bool{},
 		superseded: map[string]bool{},
+		claimed:    map[string]bool{},
 	}
 }
 
@@ -333,12 +413,13 @@ func (r *Runtime) Publish(ctx context.Context, topic string, payload []byte) (bo
 	if topic == "" {
 		return false, errors.New("publisher: empty topic")
 	}
+	r.checkGeneration()
 	retraction := len(payload) == 0
 
 	r.mu.Lock()
 	previous, declared := r.declared[topic]
 	r.mu.Unlock()
-	if declared && bytes.Equal(previous, payload) {
+	if declared && previous.gated && bytes.Equal(previous.payload, payload) {
 		return false, nil
 	}
 	if retraction && !declared {
@@ -377,7 +458,12 @@ func (r *Runtime) Publish(ctx context.Context, topic string, payload []byte) (bo
 		delete(r.declared, topic)
 		delete(r.announced, topic)
 	} else {
-		r.declared[topic] = bytes.Clone(payload)
+		r.declared[topic] = cachedWrite{payload: bytes.Clone(payload), gated: true}
+		// Grow-only, and deliberately not cleared by the retraction branch
+		// above: having published a topic is a fact about this process that
+		// a later retraction does not undo, and a retraction that did not
+		// stick is exactly what [SweepRequest.SelfClaimed] exists to retry.
+		r.claimed[topic] = true
 	}
 	r.mu.Unlock()
 	return true, nil
@@ -422,6 +508,7 @@ func (r *Runtime) PublishBundle(ctx context.Context, b *discovery.Bundle) (bool,
 	if b == nil {
 		return false, errors.New("publisher: nil bundle")
 	}
+	r.checkGeneration()
 	payload, err := json.Marshal(b)
 	if err != nil {
 		return false, fmt.Errorf("publisher: marshal bundle %s: %w", b.NodeID, err)
@@ -436,7 +523,7 @@ func (r *Runtime) PublishBundle(ctx context.Context, b *discovery.Bundle) (bool,
 	r.mu.Lock()
 	previous, declared := r.declared[topic]
 	r.mu.Unlock()
-	if declared && bytes.Equal(previous, payload) {
+	if declared && previous.gated && bytes.Equal(previous.payload, payload) {
 		return false, nil
 	}
 
@@ -471,6 +558,7 @@ func (r *Runtime) PublishComponent(
 	if comp.Platform == "" {
 		return false, errors.New("publisher: component has no platform")
 	}
+	r.checkGeneration()
 	payload, err := comp.EntityJSON()
 	if err != nil {
 		return false, fmt.Errorf("publisher: encode component %s/%s: %w", nodeID, objectID, err)
@@ -480,7 +568,7 @@ func (r *Runtime) PublishComponent(
 	r.mu.Lock()
 	previous, declared := r.declared[topic]
 	r.mu.Unlock()
-	if declared && bytes.Equal(previous, payload) {
+	if declared && previous.gated && bytes.Equal(previous.payload, payload) {
 		return false, nil
 	}
 
@@ -568,6 +656,102 @@ func (r *Runtime) Declared() []string {
 	return out
 }
 
+// Reset drops the half of this runtime's memory that describes a connection
+// rather than a process, and it is what a consumer calls from its connect
+// hook when its transport cannot implement [Generational].
+//
+// Two things happen. The superseded set is emptied, so the per-entity configs
+// a device document replaces are retracted again on the new connection —
+// which is the measured defect in full: a retraction flushed to a dying
+// socket is not a retraction the broker applied, and the memo said otherwise.
+// And the dedup gate is opened without dropping the payloads, so the next
+// publish of an unchanged config goes out once more and [Runtime.Republish]
+// and [Runtime.Declared] still know what this process drives.
+//
+// What it does not drop is [Runtime.Claimed], which is a statement about this
+// process and stays true across any number of connections.
+//
+// Rebuilding the whole Runtime instead is still the better shape — it covers
+// a field added here later, which this method does not — and it is why this
+// is a method rather than the only answer. See the contract on [Runtime].
+func (r *Runtime) Reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resetLocked()
+}
+
+// resetLocked is [Runtime.Reset]'s body, for the callers that already hold mu.
+func (r *Runtime) resetLocked() {
+	for t, e := range r.declared {
+		e.gated = false
+		r.declared[t] = e
+	}
+	r.superseded = map[string]bool{}
+}
+
+// Claimed lists every config topic this process has published since it
+// started, sorted — including the ones it has since retracted.
+//
+// It is deliberately not [Runtime.Declared]. Declared is what this process
+// drives right now; Claimed is what it has ever written, which is the one
+// ownership fact about a retained config that no sibling instance can forge
+// and no payload can be made to carry. [SweepRequest.SelfClaimed] is what
+// reads it, and the note there says what that does and does not buy.
+func (r *Runtime) Claimed() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.claimed))
+	for t := range r.claimed {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// checkGeneration forgets the per-connection memos when the transport says
+// the connection has changed, and does nothing at all when it cannot say.
+//
+// Called at the head of every path that consults a memo. The generation is
+// read outside mu — the interface's contract is that it is cheap and takes no
+// lock a publish could hold — and the comparison plus the invalidation happen
+// under it, so two publishes racing a reconnect cannot both decide they are
+// the first and re-run the reset between each other's writes.
+func (r *Runtime) checkGeneration() {
+	g, ok := r.tr.(Generational)
+	if !ok {
+		return
+	}
+	current := g.ConnectionGeneration()
+
+	r.mu.Lock()
+	if !r.genSeen {
+		// The first sighting records the connection and forgets nothing.
+		// Resetting here would clear the memo of the very call that is
+		// taking it — a PublishBundle's own supersede step runs before its
+		// document publish — and the retraction round would then repeat on
+		// every boot instead of once.
+		r.gen, r.genSeen = current, true
+		r.mu.Unlock()
+		return
+	}
+	if r.gen == current {
+		r.mu.Unlock()
+		return
+	}
+	superseded := len(r.superseded)
+	r.gen = current
+	r.resetLocked()
+	r.mu.Unlock()
+
+	// Said out loud, because the retractions this un-memoises are the only
+	// evidence that the reconnect was handled at all — the failure it
+	// prevents produces one WARNING in Home Assistant's log and nothing in
+	// this one.
+	r.log.Info("publisher.runtime.connection_changed",
+		slog.Uint64("generation", current),
+		slog.Int("superseded_forgotten", superseded))
+}
+
 // Republish re-sends every declared config and reports how many went out.
 //
 // It bypasses the dedup gate by construction — it publishes the cached bytes
@@ -581,10 +765,11 @@ func (r *Runtime) Declared() []string {
 // after a broker restart. A cancelled context stops the walk rather than
 // turning every remaining topic into an error.
 func (r *Runtime) Republish(ctx context.Context) (int, error) {
+	r.checkGeneration()
 	r.mu.Lock()
 	snapshot := make(map[string][]byte, len(r.declared))
-	for t, p := range r.declared {
-		snapshot[t] = p
+	for t, e := range r.declared {
+		snapshot[t] = e.payload
 	}
 	r.mu.Unlock()
 

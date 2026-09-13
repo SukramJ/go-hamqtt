@@ -3,6 +3,143 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.34.0] - 2026-09-13
+
+### Added
+
+Four guards, one per trap the ADR 0070 fan-out measured across five
+consumers. Every one is additive, every one is off unless a consumer
+reaches for it, and **no consumer's pinned bytes move**: nothing here
+changes what is rendered or what is published.
+
+- **`discovery.CheckAvailability` / `CheckBundleAvailability` /
+  `AvailabilityTopics` — say which availability topics you publish, and
+  the library refuses the ones you do not.** The zero
+  `model.Availability` resolves to `{LevelBridge, LevelDevice}` under
+  mode `all`, and `LevelDevice` names a per-device availability topic.
+  Two consumers publish no such topic: adopting the default would have
+  left **100 entities (go-mtec2mqtt) and 264 (go-daikin2mqtt)
+  permanently unavailable**, because under `all` Home Assistant requires
+  every listed source to say `online` and a source nobody publishes is
+  not neutral. There is nothing on the wire and nothing in any log; both
+  caught it only because their migration had a measurement step. A third
+  consumer (go-homeconnect2mqtt) is the exact inverse — it publishes
+  both topics and the default is the fix there — and a fourth
+  (go-unifi2mqtt) needs a per-entity split whose device level is a state
+  topic plus a template. So the default cannot be narrowed and a
+  required field would break five consumers at once.
+
+  What can be done is make the consumer state it once, in the one form
+  that is checkable: the topics it publishes. This generalises
+  go-daikin2mqtt's own entity builder, which "refuses anything that is
+  not one plain bridge-level source ... so dropping `model.BridgeOnly`
+  produces two entries and **fails the render** instead of silently
+  publishing a second, never-written topic that would grey out all 264
+  entities."
+
+- **`Validate` now refuses an availability entry with an empty topic.**
+  The half of the same trap this module can see unaided: a level the
+  consumer's `topic.Layout` could not render at all. Home Assistant
+  declares `topic` required inside the object, so such an entity waits
+  forever on a string that is not one. No correctly rendered fleet
+  trips it.
+
+- **`publisher.Generational` and `Runtime.Reset` — a `Runtime`'s memos
+  no longer have to outlive the connection they describe.** Everything a
+  `Runtime` remembers (`superseded`, `declared`, `announced`) is a
+  statement about what a BROKER holds, while the memo is per PROCESS. At
+  QoS 0 those differ: `Transport.Publish` returns when the bytes are
+  written and flushed to a socket that may then die. go-mtec2mqtt
+  shipped the consequence (its PR #54, F1): a round of retractions
+  flushed to a dying connection was memoised as done, and the retry
+  after the reconnect measured **`retractions re-sent = 0, document
+  published = true, configs still retained = 1`** — Home Assistant
+  answers that with one `WARNING [mqtt.entity] Received a conflicting
+  MQTT discovery message`, no entities, no error.
+
+  Three consumers independently arrived at the same fix, a factory
+  rebuilt per `OnConnect` rather than an instance, and that remains the
+  recommended shape — it covers a field this type may grow later. What
+  is added here is the contract, written on `Runtime` where the
+  composition root meets it, and two ways to honour it without a
+  factory: a transport that implements `Generational` (one atomic
+  counter bumped in the connect hook) has its runtime drop the
+  per-connection half of its memory by itself, and `Runtime.Reset` is
+  the same thing by hand. Neither forgets a payload: `Republish` and
+  `Declared` are unaffected, and the retraction set is re-sent on the
+  new connection instead of being skipped.
+
+- **`SweepRequest.SelfClaimed` — the ownership rule that is safe by
+  construction**, with `Runtime.Claimed` behind it (every config topic
+  this process has published, grow-only, a retraction does not undo it).
+  Consumers keyed "is this retained config mine?" on a payload field,
+  usually `state_topic` under their own root — but **`button` and
+  `climate` payloads carry no `state_topic`**: 24 of 264 configs for
+  go-daikin2mqtt (14 climate, 10 button), 20 of 687 for
+  go-homeconnect2mqtt, 39 of 9996 for openccu-loom. Where the missing
+  field let the rule collapse to a shared namespace prefix, a sibling
+  instance's entities were **deleted from a live Home Assistant**,
+  proven by driving the sweep and invisible to every test that asked the
+  predicate instead. The rule the audit derived is that when the keyed
+  field is absent, what remains must still be instance-specific; having
+  published a topic is the one such fact no sibling can forge and no
+  payload can be made to carry. Modelled on go-unifi2mqtt's
+  `Claims{Published, Announced}`, which replaced its predicate outright
+  because two UniFi consoles under one root publish byte-identical
+  topics, unique ids, availability topics AND state topics.
+
+  The cost is stated rather than hidden, on the field: a claim list
+  cannot clear a config left behind by an EARLIER run of the daemon,
+  which from the wire is indistinguishable from a sibling's live entity.
+  A consumer that can prove ownership from the topic still states
+  `Owns`; one that cannot reports `SweepResult.Unclaimed` and leaves the
+  retraction to an operator. Stating both means both must agree, which
+  only narrows a pass.
+
+- **`publisher.QoSFromWire` — an operator's `MQTT_QOS: 0` stops becoming
+  QoS 1.** `QoS(cfg.MQTT.QoS)` compiles, reads correctly and is wrong
+  for exactly one input: 0 is `QoSUnset`, which every constructor
+  resolves to QoS 1. Every consumer was warned about this in its brief
+  and two still had to be told twice; go-homeconnect2mqtt recorded it as
+  finding F9, "`MQTT_QOS: 0` becomes QoS 1 on migration", and
+  go-mtec2mqtt noted omitting the field "would have tripled this
+  bridge's broker traffic and changed the delivery guarantee of an
+  installed base". Both wrote this three-line conversion by hand; it is
+  now one call that cannot produce `QoSUnset` at all. The sentinel
+  design is unchanged and still correct — `QoSUnset` must be
+  distinguishable — and `AvailabilityConfig.QoS` does have a
+  construction site here (`resolveQoS` in `NewAvailability`); what
+  go-daikin2mqtt found is that its own wiring has none, because it
+  builds no `AvailabilityPublisher`.
+
+- **`NewStatePublisher` warns when one state QoS is stated and the other
+  is not** (`publisher.state.pulse_qos_unstated`). `StateConfig.PulseQoS`
+  is the only field in the package whose default is QoS 0, so a plane
+  that states `StateConfig.QoS` and forgets it publishes pulses at a
+  level nobody chose — and only when the operator did not choose 0,
+  which is why a single-configuration test never sees it.
+  go-homeconnect2mqtt's load-bearing catch, now said at construction. A
+  warning and not a refusal: a consumer that publishes no pulses is
+  entitled to leave the field alone.
+
+### Consumers
+
+Nothing to do to keep compiling; each item is opt-in.
+
+- go-mtec2mqtt, go-homeconnect2mqtt, go-daikin2mqtt: pin the
+  availability statement with `CheckAvailability` (bridge-only for the
+  first and third, both levels for the second) — it replaces the
+  hand-rolled builder guard.
+- go-zendure2mqtt still holds a process-lifetime `publisher.Runtime`
+  while publishing bundles, which is go-mtec2mqtt's F1 shape: rebuild it
+  per connect, call `Reset` in `PublishOnline`, or implement
+  `Generational`.
+- Consumers whose sweep predicate reads a payload field (all but
+  openccu-loom, whose predicate takes a `ConfigTopic` and cannot see a
+  payload) should weigh `SelfClaimed` against what they need cleared
+  from earlier runs.
+- Anywhere an operator-configured QoS is converted, use `QoSFromWire`.
+
 ## [0.33.0] - 2026-09-13
 
 ### Documentation

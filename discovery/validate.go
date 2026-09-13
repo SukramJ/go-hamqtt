@@ -247,6 +247,19 @@ func validateComponent(
 	seenUnique map[identityKey]string,
 	ignore map[string]bool,
 ) {
+	// An availability entry with no topic is a level the consumer's
+	// [topic.Layout] could not render, and it is the one half of the
+	// unpublished-availability trap this module can see on its own: HA
+	// declares `topic` required inside the object, so the entity waits
+	// forever on a string that is not one. The other half — a perfectly
+	// well-formed topic that nothing publishes — is invisible from here and
+	// needs [CheckAvailability], where the consumer says what it publishes.
+	for i, a := range comp.Availability {
+		if a.Topic == "" {
+			issues.add("%s: availability[%d] has no topic, so nothing can ever mark this entity available", key, i)
+		}
+	}
+
 	body, err := componentBody(comp)
 	if err != nil {
 		issues.add("%s: cannot encode component: %v", key, err)
