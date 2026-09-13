@@ -12,6 +12,41 @@ import (
 	"time"
 )
 
+// TestWillResolvesTheConfiguredQoS pins the one line of [Runtime.Will] a test
+// using a configured level that equals its own wire byte cannot reach. The
+// v0.27.0–v0.29.0 review measured the gap: replacing `r.qos` with
+// `byte(r.cfg.QoS)` survived the suite, because the case in hand was QoS 2,
+// where the raw cast is accidentally right.
+//
+// QoSAtMostOnce is 0x80 precisely so a deliberate QoS 0 cannot be spelled by
+// omission, and it is the level go-zendure2mqtt's whole installed base runs
+// at — so the raw cast would hand that consumer's client a will at QoS 128,
+// which is not a QoS at all.
+func TestWillResolvesTheConfiguredQoS(t *testing.T) {
+	t.Parallel()
+	for name, tc := range map[string]struct {
+		cfg  QoS
+		want byte
+	}{
+		"deliberate at most once":   {QoSAtMostOnce, 0},
+		"unset means at least once": {QoSUnset, 1},
+		"exactly once":              {QoSExactlyOnce, 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			r := New(newFake(), Config{StatusTopic: "bridge/status", QoS: tc.cfg})
+			will, err := r.Will()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if will.QoS != tc.want {
+				t.Fatalf("Will().QoS = %d, want the wire byte %d — a client takes a byte",
+					will.QoS, tc.want)
+			}
+		})
+	}
+}
+
 // TestWillMatchesTheAnnouncements pins the agreement the whole availability
 // policy rests on: the will the consumer configures on CONNECT, the marker
 // the runtime sets on connect, and the marker it sets on a clean shutdown

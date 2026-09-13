@@ -1330,6 +1330,22 @@ func TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails(t *testing.T
 		t.Fatalf("a handler ran %d times after Start failed; the gate must be closed, "+
 			"because a command now runs against half-initialised dependencies", got)
 	}
+
+	// And the router is closed for good, not merely un-started. Asserted
+	// separately because the two are told apart only here: the nil pool
+	// independently stops deliveries, so `stopped` being left false —
+	// measured to survive the suite in the v0.27.0–v0.29.0 review — is
+	// invisible to the assertion above. A retryable Start is exactly what
+	// must not be offered while a subscription the rollback could not take
+	// down is still live on the broker.
+	b.failSubscribe = nil
+	if err := r.Start(context.Background()); !errors.Is(err, ErrRouterStarted) {
+		t.Fatalf("Start after a failed rollback = %v, want ErrRouterStarted — "+
+			"a live subscription plus a re-startable router is the hazard Stop forbids", err)
+	}
+	if live := b.filters(); len(live) != 1 {
+		t.Fatalf("the refused Start went to the broker anyway: %v", live)
+	}
 }
 
 // TestCommandRouterOwnsNoGoroutinesUntilStarted is the regression for the
