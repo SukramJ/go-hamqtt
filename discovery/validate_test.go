@@ -88,8 +88,11 @@ func TestValidateRequiresUniqueIDs(t *testing.T) {
 	requireIssue(t, b, "unique_id is required")
 }
 
-// TestValidateCatchesDuplicateUniqueIDs is the collision Home Assistant
-// resolves by dropping one entity without saying which.
+// TestValidateCatchesDuplicateUniqueIDs is the genuine collision: the same
+// platform twice with the same unique id indexes to one
+// (domain, platform, unique_id) key in Home Assistant's registry, so the second
+// entity is what `entity_platform.py` refuses with "Platform mqtt does not
+// generate unique IDs".
 func TestValidateCatchesDuplicateUniqueIDs(t *testing.T) {
 	t.Parallel()
 	b := validBundle()
@@ -97,6 +100,75 @@ func TestValidateCatchesDuplicateUniqueIDs(t *testing.T) {
 	dup.Name = "Power again"
 	b.Components["power_2"] = dup
 	requireIssue(t, b, "already used by")
+}
+
+// TestValidateAllowsOneUniqueIDAcrossTwoPlatforms is the other half of the same
+// rule, and the one this validator got wrong through v0.31.0.
+//
+// Home Assistant's entity registry indexes on (domain, platform, unique_id) —
+// the entity component, the integration, and the id — so an `mqtt` sensor and
+// an `mqtt` number sharing a unique id are two distinct keys and both register.
+// Refusing the pair made the validator stricter than the platform it models,
+// and on a measured consumer that publishes nine such pairs it turned one
+// blocking bundle into a device with none of its 100 entities.
+func TestValidateAllowsOneUniqueIDAcrossTwoPlatforms(t *testing.T) {
+	t.Parallel()
+	b := validBundle()
+	twin := b.Components["power"]
+	twin.Platform = hacatalog.PlatformNumber
+	twin.Name = "Power limit"
+	twin.DeviceClass = "power"
+	twin.StateClass = ""
+	twin.CommandTopic = "daikin/serial:AC-1/set/power"
+	b.Components["power_setpoint"] = twin
+
+	if err := discovery.Validate(b); err != nil {
+		t.Fatalf("Validate refused a unique_id shared across two platforms: %v", err)
+	}
+}
+
+// TestValidateAllowsTwoUniqueIDsOnOnePlatform pins the other half of the key.
+//
+// Without it a validator that keyed on the platform alone — the mirror-image
+// mistake of the one being fixed — would pass every other test here, and refuse
+// the second sensor of every bundle ever built.
+func TestValidateAllowsTwoUniqueIDsOnOnePlatform(t *testing.T) {
+	t.Parallel()
+	b := validBundle()
+	sibling := b.Components["power"]
+	sibling.UniqueID = "daikin_serial_ac_1_energy"
+	sibling.Name = "Energy"
+	sibling.DeviceClass = "energy"
+	sibling.StateClass = hacatalog.StateClassTotalIncreasing
+	b.Components["energy"] = sibling
+
+	if err := discovery.Validate(b); err != nil {
+		t.Fatalf("Validate refused two sensors with distinct unique_ids: %v", err)
+	}
+}
+
+// TestValidateStillCatchesADuplicateWithinOnePlatform keeps the narrowing
+// honest: it is the pair above with the platform put back, so a validator that
+// dropped the check entirely rather than narrowing it fails here.
+func TestValidateStillCatchesADuplicateWithinOnePlatform(t *testing.T) {
+	t.Parallel()
+	b := validBundle()
+	twin := b.Components["power"]
+	twin.Name = "Power limit"
+	b.Components["power_setpoint"] = twin
+
+	err := discovery.Validate(b)
+	if err == nil {
+		t.Fatal("Validate accepted two sensors sharing a unique_id")
+	}
+	if !errors.Is(err, discovery.ErrInvalidBundle) {
+		t.Errorf("err does not match ErrInvalidBundle: %v", err)
+	}
+	for _, want := range []string{"already used by", `platform "sensor"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %v\nwant it to mention %q", err, want)
+		}
+	}
 }
 
 // TestValidateRejectsAnUnknownPlatform stops a typo that would otherwise

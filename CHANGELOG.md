@@ -3,6 +3,86 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.32.0] - 2026-09-13
+
+### Fixed
+
+- **A `unique_id` shared by two platforms is no longer refused.**
+  `Validate` keyed its duplicate check on the `unique_id` alone. Home
+  Assistant does not: its entity registry indexes on a three-part key,
+  `(domain, platform, unique_id)` — the entity component, the
+  integration, and the id. `entity_registry.py` builds it literally,
+
+      self._index[(entry.domain, entry.platform, entry.unique_id)] = entry.entity_id
+
+  and `async_get_entity_id`, `async_get_or_create`, the
+  `deleted_entities` index, the unique-id-change guard that raises
+  `Unique id '%s' is already in use by '%s'`, and `entity_platform.py`'s
+  runtime check behind `Platform %s does not generate unique IDs` all
+  consult that same triple. The developer documentation says it in
+  prose: *"An entity is looked up in the registry based on a combination
+  of the platform type (for example, `light`), and the integration name
+  (domain) (for example, hue) and the unique ID of the entity."*
+
+  Every component in a bundle comes from the one `mqtt` integration, so
+  a bundle can only vary the other two. A `sensor` and a `number`
+  carrying the same `unique_id` are two distinct registry keys and both
+  register. Refusing the pair made this validator stricter than the
+  platform it models.
+
+  Nothing in the MQTT integration narrows it further for the
+  device-bundle form, which is the newer path and the one that could
+  have: `components/mqtt/discovery.py` never mentions `unique_id`;
+  `DEVICE_DISCOVERY_SCHEMA`'s validation over `cmps` is `check_unique_id`,
+  a presence requirement and nothing more; and the conflict behind
+  `Received a conflicting MQTT discovery message` is keyed on
+  `(component, discovery_id)` and the discovery topic. The bundled path
+  fans `cmps` out into per-component configs that then travel the
+  identical per-entity machinery.
+
+  The measured cost of the old rule: one consumer publishes nine
+  `unique_id`s under two platforms each — five `number`+`sensor`, three
+  `binary_sensor`+`switch`, one `select`+`sensor` — and has done so in
+  the per-entity form, in production, for years. Its bundle came back
+  with nine blocking issues, `ErrInvalidBundle`, and a runtime that
+  validates before publishing would have withheld the whole device: all
+  100 entities, not the nine.
+
+  **Two components sharing a platform *and* a `unique_id` are still
+  refused blockingly**, because that pair really does collide on the
+  registry's own terms. The issue text now names the platform.
+
+### Documentation
+
+- **`Render` and `Validate` disagree on purpose, and now say so.**
+  `Render` refuses one thing — two entities with the same
+  `model.Entity.Key`, which the components map would otherwise swallow —
+  and that is a losslessness guard on the document, not a judgement
+  about what Home Assistant accepts. It will build a bundle `Validate`
+  then refuses. Folding the check into `Render` was considered and
+  rejected: validation is fail-closed, so an invalid bundle publishes
+  nothing at all, and making that automatic would cost a device every
+  entity over one bad component without the consumer ever asking. The
+  choice of what to do with a finding stays with the caller.
+
+- **`Component.UnitOfMeasure` cannot express `"unit_of_measurement": ""`,
+  and should not.** A measured consumer publishes the empty string on
+  five sensors, reachable today only through `Description.Extra`, which
+  raised the question of a `*string` or a sentinel. The answer is no:
+  unlike `NameNull`, a blank unit is not a distinction MQTT discovery
+  can carry. `components/mqtt/sensor.py` pops it during schema
+  validation, before the entity is constructed, and the validator
+  wrapping both `PLATFORM_SCHEMA_MODERN` and `DISCOVERY_SCHEMA` —
+
+      if (
+          unit_of_measurement := config.get(CONF_UNIT_OF_MEASUREMENT)
+      ) is not None and not unit_of_measurement.strip():
+          config.pop(CONF_UNIT_OF_MEASUREMENT)
+
+  so publishing it is exactly equivalent to omitting the key. `Extra`
+  remains the right route where byte-equality with an already-published
+  payload is the goal; the model stays clean. Recorded on the field.
+
 ## [0.31.0] - 2026-09-13
 
 ### Changed
