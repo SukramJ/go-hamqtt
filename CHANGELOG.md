@@ -3,6 +3,149 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.30.0] - 2026-09-13
+
+An adversarial review of v0.27.0–v0.29.0. Every item below was measured
+against the shipped code, and the two that reach a consumer's broker are
+the first two.
+
+### Fixed
+
+- **A removed entity kept its old per-entity config forever** when the
+  consumer's fleet is on the node-id-less legacy form — which is
+  go-zendure2mqtt's wiring, the fleet that form was added for in
+  v0.27.0.
+
+  Home Assistant deletes a component from a device document when the
+  component's entry carries a platform and nothing else, so
+  `discovery.Bundle.Remove` writes exactly that — and a tombstone
+  therefore has no `unique_id`. `publisher.LegacyTopicByUniqueID` has
+  nothing to key on without one and returned no topic at all, so the
+  retained config of the entity being deleted was never retracted. The
+  deleted entity goes on being discovered from it: a permanently
+  unavailable phantom that returns on every MQTT-integration restart.
+  `Runtime.Sweep` cannot reach it either, because the node-id-less form
+  parses with an empty `NodeID` and a node-id-scoped `Owns` declines it
+  by design. The doc comment on `SupersededTopics` claimed tombstones
+  were covered; they were covered for two of the three forms.
+
+  The identity cannot go back into the payload — that would un-remove
+  the entity — so it is remembered beside it.
+  **`discovery.Bundle.Tombstones`** holds what a removed component was,
+  and **`discovery.Bundle.RemoveComponents`** is the call to use when
+  the component has left the catalogue and the document being published
+  never held it, which is the ordinary case. `Bundle.Remove` fills it
+  too, from the entry it overwrites.
+
+  **A consumer that wires `LegacyTopicByUniqueID` and calls `Remove`
+  should switch to `RemoveComponents`.** For go-zendure2mqtt the defect
+  is latent today — it wires the form and removes nothing yet — and goes
+  live the first time an entry leaves its catalogue.
+
+- **A command delivered while the routes were still being subscribed was
+  dropped.** The router drops a copy that arrived for a route a more
+  specific one outranks, judged against the registered route set — which
+  is not the set the broker holds until the last SUBSCRIBE is
+  acknowledged. With the general shape registered first, the only
+  subscription that existed inside that window was the one whose copies
+  get dropped: measured as `generic ran 0, specific ran 0`, one command
+  lost, one `Debug` line. That window is the ordinary state of the wire
+  during `Start` and during a sequential resubscribe replay, so a button
+  pressed in the second after a reconnect did nothing.
+
+  Routes are now subscribed most specific first. That closes the window
+  without per-connection liveness bookkeeping, and closes it in the
+  direction that cannot double: a copy can only arrive for an outranked
+  route once the route that outranks it is already subscribed on the
+  same connection. It rests on a transport that replays subscriptions of
+  its own replaying them in registration order, which go-mqtt does.
+
+- **A sweep whose context ended discarded everything the window saw.**
+  The snapshot reports the caller's context ending as an error even
+  after a full window, and the pass mapped any error to a zero
+  `SweepResult` — so for a `ReportOnly` pass, whose only output is the
+  result, a boot context expiring on the window boundary lost the lot.
+  The result now comes back alongside the error.
+
+- **The subscription-identifier counter no longer runs past its
+  ceiling.** It reported the range error correctly and kept counting,
+  which is harmless until 2³² allocations wrap it back to values that
+  pass the range check again. Unreachable in practice; impossible to
+  notice if it ever were reached.
+
+### Added
+
+- **`publisher.SweepResult.Unclaimed`** — the owned topics this process
+  does not claim, which is what a retracting pass would clear.
+
+  `ReportOnly` could not report: the pass computed exactly this list,
+  logged its length at `Debug` and threw it away. The only list it
+  handed back was `Owned`, which includes the configs the consumer is
+  publishing right now — and `Retract(res.Owned...)` is the composition
+  that cleared 29 live configs in a sibling repo. `Owned`'s doc now says
+  what it is and what it is not, and drops the claim that a retracting
+  pass's `Owned` minus `Retracted` is the claim set: a failed retraction
+  warns and the pass continues, so the difference also holds whatever
+  the broker refused.
+
+- **`gomqtt.TransportV311` and `gomqtt.SplitV311`** — an adapter for a
+  client pinned to `mqtt.ProtocolV311` that claims neither MQTT 5.0
+  capability.
+
+  `gomqtt.Transport` implements `AttributingSubscriber` whatever the
+  wrapped client is talking, because a Go type cannot carry a value's
+  protocol version — so an overlapping route pair was accepted at
+  `Handle` on both dialects and a v3.1.1 link was caught only at
+  `Start`, as `ErrAttributionUnavailable`. That is correct and it is
+  visible, but it is a boot failure where a composition-root error was
+  available: a v3.1.1 link has no property block to carry a Subscription
+  Identifier, and that is known before the first SUBSCRIBE. A router
+  over the new adapter refuses the pair at registration with
+  `ErrAmbiguousRoutes`. The README described the refusal that did not
+  happen; it now says which constructor reports where.
+
+- **`publisher.Runtime.LegacyForms`**, and a `publisher.legacy_forms`
+  line logged once per runtime built. `Config.LegacyEntityTopics`
+  replaces the default rather than extending it, so stating one form
+  silently stops retracting the other — and nothing anywhere said which
+  forms were active. For a fleet spanning releases that line is the
+  cheapest evidence there is.
+
+### Changed
+
+- Doc comments corrected where they described behaviour the code does
+  not have: `SupersededTopics` on tombstones, `SweepResult.Owned` on
+  what the list is for, `ValidateFilter` on a SUBACK failure being
+  "deliberately dropped by the transport interface" (the shipped adapter
+  surfaces it — go-mqtt returns a `*ReasonError`, and only the granted
+  QoS is dropped), and `payload.ParamInt32` on truncation: an
+  out-of-**range** integer is an error, while a **fractional** `float64`
+  — Home Assistant sends `2.7` for a stepped field — is truncated toward
+  zero. Both are now stated, and the fraction is pinned by a test.
+
+### Upgrading
+
+- **Re-read a `SweepRequest.Owns` that does not look at `NodeID`.**
+  v0.29.0 widened `ParseConfigTopic` to the three-segment node-id-less
+  form, and a widened parser widens what a predicate is asked about: one
+  deciding on the platform or the object id alone now judges a class of
+  topics it was never shown, and it is a populated class — Tasmota
+  publishes exactly that shape into a shared discovery tree. A predicate
+  that scopes on the node id is unaffected, because that form parses
+  with an empty one and such a predicate declines it. The hazard arrived
+  in v0.29.0, whose entry documented the widening without saying what to
+  re-check.
+
+- A consumer whose own client carries a broad subscription that also
+  matches a command topic wants **go-mqtt v1.5.1 or later**. Through
+  v1.5.0 an identifier-less delivery was matched by topic against
+  stamped subscriptions too, so that subscription's copies reached every
+  stamped route and ran its handler twice per published message. v1.5.1
+  fails closed, per MQTT 5.0 §3.3.4. This module's `go.mod` still
+  requires v1.5.0 — a minimum, not a ceiling — and will move to v1.5.1
+  once that release is tagged. Nothing here relied on the permissive
+  matching, which is pinned by a test.
+
 ## [0.29.0] - 2026-09-12
 
 The inbound half of the payload package: the coercions every consumer

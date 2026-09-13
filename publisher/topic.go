@@ -87,6 +87,13 @@ func BundleConfigTopic(prefix, nodeID string) string {
 // zigbee2mqtt publishes documents of its own — produces topics that parse
 // perfectly well and must not be touched, so scoping the node id is the
 // caller's job and [SweepRequest.Owns] is where it happens.
+//
+// Widening a parser widens what a predicate is asked about, and that is the
+// upgrade hazard of v0.29.0: an [SweepRequest.Owns] that does not read
+// [ConfigTopic.NodeID] now judges the three-segment form as well, a shape
+// Tasmota publishes into a shared discovery tree. Re-read such a predicate
+// before upgrading. One that scopes on the node id is unaffected — the
+// node-id-less form parses with an empty one, and it declines.
 func ParseConfigTopic(prefix, topic string) (ConfigTopic, bool) {
 	p := topicPrefix(prefix)
 	if !strings.HasPrefix(topic, p) || !strings.HasSuffix(topic, "/config") {

@@ -31,6 +31,16 @@ type SweepRequest struct {
 	// in practice a node-id namespace check. Required; see
 	// [ErrSweepUnscoped].
 	//
+	// An Owns written before v0.29.0 is worth re-reading, and especially
+	// one that does not look at [ConfigTopic.NodeID]. Since v0.29.0
+	// [ParseConfigTopic] also accepts the node-id-less three-segment form,
+	// so a predicate that decides on the platform or the object id alone
+	// now judges a class of topics it was never shown — and it is a
+	// populated class: Tasmota publishes exactly that shape into a shared
+	// discovery tree. A predicate that scopes on the node id is unaffected,
+	// because that form parses with an empty one and such a predicate
+	// declines it.
+	//
 	// It is called from the transport's read loop, so it must be cheap and
 	// must not publish.
 	Owns func(t ConfigTopic) bool
