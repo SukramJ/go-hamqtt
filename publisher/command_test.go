@@ -1652,6 +1652,21 @@ type attrBroker struct {
 	stamps bool
 
 	failSubscribe func(filter string) error
+	// failsClosed models go-mqtt v1.5.1 and later, where an
+	// identifier-less PUBLISH reaches ONLY subscriptions that carry no
+	// identifier.
+	//
+	// MQTT 5.0 §3.3.4 makes a server include the identifier of every
+	// subscription it forwarded a message for, so a message arriving with
+	// none was forwarded for no stamped subscription — matching it by
+	// topic against one delivers a copy the broker never sent. v1.5.0 did
+	// exactly that, which restored the doubled handler that
+	// WithSubscriptionID was added to remove: one stamped overlapping
+	// route plus one unstamped broad subscription on the same client, and
+	// a single published message ran the stamped handler twice. The zero
+	// value keeps the permissive routing, which is what the fixture's
+	// other tests describe.
+	failsClosed bool
 	// onSubscribe runs after a subscription is installed and before the
 	// next one is asked for. It is the only place a test can stand inside
 	// the subscribe window — the ordinary state of the wire during Start
@@ -1755,8 +1770,18 @@ func (b *attrBroker) fanout(topic string, payload []byte, retained bool) (copies
 		// is re-matched against every filter, which is all a v3.1.1 link
 		// or an identifier-less subscription offers.
 		targets := match
-		if m.id != 0 {
+		switch {
+		case m.id != 0:
 			targets = []attrSub{m}
+		case b.failsClosed:
+			// go-mqtt v1.5.1 and later: an identifier-less copy reaches
+			// only the subscriptions that carry no identifier.
+			targets = nil
+			for _, s := range match {
+				if s.id == 0 {
+					targets = append(targets, s)
+				}
+			}
 		}
 		for _, t := range targets {
 			t.h(topic, payload, retained)
@@ -2287,5 +2312,65 @@ func TestCompareSpecificity(t *testing.T) {
 			t.Errorf("compareSpecificity(%q, %q) = %d, %v; want %d, %v",
 				tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
 		}
+	}
+}
+
+// TestCommandRouterSurvivesFailClosedUnstampedRouting is the consumer-side
+// half of go-mqtt v1.5.1, and it is a "nothing here depended on the old
+// behaviour" test.
+//
+// Through v1.5.0 the client matched an identifier-less PUBLISH by topic
+// against STAMPED subscriptions too, so a consumer's own broad subscription
+// on the same client handed every one of its copies to the router's stamped
+// routes as well — one published message, one stamped handler run twice, the
+// exact multiplication the identifiers were taken out for. MQTT 5.0 §3.3.4
+// makes that impossible on a compliant server: a message forwarded for a
+// stamped subscription carries that identifier. v1.5.1 therefore fails
+// closed, and this pins that the router is correct under the stricter
+// routing: every route keeps its own copies and the consumer's own
+// subscription keeps its own.
+//
+// The router's promise is unchanged either way — the CommandRouter doc
+// already warns that a second subscription on the same client re-multiplies
+// — but the promise now holds without the consumer having to keep its own
+// subscriptions off the command tree.
+func TestCommandRouterSurvivesFailClosedUnstampedRouting(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	b.failsClosed = true
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/PRESS_SHORT/set", specific.handle); err != nil {
+		t.Fatalf("handle specific: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	// The consumer's own broad, unstamped subscription on the same client.
+	var mine atomic.Int64
+	if err := b.Subscribe(context.Background(), "gh/#", 0, func(string, []byte, bool) {
+		mine.Add(1)
+	}); err != nil {
+		t.Fatalf("the consumer's own subscribe: %v", err)
+	}
+
+	if n := b.deliver("gh/ccu/PRESS_SHORT/set", []byte("1"), false); n != 3 {
+		t.Fatalf("broker fanned out to %d subscriptions, want 3 — one copy per matching subscription", n)
+	}
+	r.WaitIdle()
+
+	if got := len(specific.snapshot()); got != 1 {
+		t.Fatalf("the specific route ran %d times, want exactly 1", got)
+	}
+	if got := len(generic.snapshot()); got != 0 {
+		t.Fatalf("the outranked route ran %d times, want 0", got)
+	}
+	if got := mine.Load(); got != 1 {
+		t.Fatalf("the consumer's own subscription saw %d copies, want 1 — fail-closed must not starve it", got)
 	}
 }

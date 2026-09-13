@@ -422,12 +422,18 @@ type route struct {
 //     One overlap remains outside the router's reach and is worth naming:
 //     the local fan-out is the whole go-mqtt client's, so a SECOND
 //     subscription on the same client whose filter also matches a command
-//     topic reintroduces the multiplication. This module's own other
+//     topic reintroduces the multiplication — on go-mqtt through v1.5.0,
+//     which matched an identifier-less delivery by topic against stamped
+//     subscriptions as well and so handed that subscription's copies to
+//     every stamped route. go-mqtt v1.5.1 fails closed there, per MQTT 5.0
+//     §3.3.4: a copy carrying no identifier was forwarded for no stamped
+//     subscription, so it reaches none. This module's own other
 //     subscriptions (the discovery-tree snapshot and the birth topic) live
 //     under the discovery prefix, not in the consumer's command tree, so
 //     they do not; a consumer that adds a broad subscription of its own
-//     must keep it off the command tree, which is the subscription-side
-//     twin of [CommandRouter.CheckDisjoint].
+//     should still keep it off the command tree, which is the
+//     subscription-side twin of [CommandRouter.CheckDisjoint], and must on
+//     any go-mqtt before v1.5.1.
 //
 //   - Handlers run off the read loop. See [CommandHandler].
 //
