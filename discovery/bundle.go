@@ -56,6 +56,25 @@ type DeviceInfo struct {
 }
 
 // AvailabilityEntry is one entry of an `availability` list.
+//
+// The list is per component, not per device: it comes from
+// [model.Description.Availability], which every entity carries and which
+// [Context.Availability] resolves entity by entity. A fleet whose entities
+// disagree — some gated on the bridge alone, some on the bridge and the
+// object — expresses that with [model.BridgeOnly] beside the zero
+// [model.Availability] and needs no second bundle and no escape hatch.
+//
+// ValueTemplate is what lets an entry point at a topic that was not published
+// as an availability signal: it maps whatever that topic carries onto
+// `payload_available`/`payload_not_available`. [StdContext] emits one for
+// [model.LevelSelf]; a consumer whose entries are spelled in its own
+// vocabulary — its object's state topic, its own words for online — overrides
+// [Context.Availability], which is an interface method for that reason.
+//
+// Topic deliberately has no `omitempty`, unlike every other key this package
+// emits: Home Assistant's MQTT_AVAILABILITY_SCHEMA declares it
+// `vol.Required(CONF_TOPIC): valid_subscribe_topic`, so an entry without one
+// is refused either way and the empty string is the more legible diagnostic.
 type AvailabilityEntry struct {
 	Topic               string `json:"topic"`
 	ValueTemplate       string `json:"value_template,omitempty"`
@@ -69,6 +88,35 @@ type AvailabilityEntry struct {
 // Extra is the last resort. All three are flattened into one JSON object on
 // marshal, in that order, later winning — the same single precedence rule the
 // whole render pipeline uses.
+//
+// # Every key here is absent until it is set
+//
+// Two rules hold across this struct, every [FieldsIndex] struct and
+// [AvailabilityEntry], and [TestNoComponentKeySerialisesAZeroValue] enforces
+// both:
+//
+//   - every key carries `omitempty`, so a field nobody set emits nothing; and
+//   - every scalar is a pointer — see [Ptr] — so a field somebody set to
+//     `false` or `0` emits that.
+//
+// The first rule is not cosmetic. Home Assistant's discovery schemas are
+// `extra=REMOVE_EXTRA`: a key the platform does not declare is dropped during
+// validation with nothing on the wire and no line in any log, and the entity
+// comes up looking correct. A single missing `omitempty` on a key shared by
+// most platforms therefore puts a silently-dropped key on every entity of the
+// platforms that lack it — measured on one consumer's own payload builder,
+// where `state_topic` and `optimistic` without `omitempty` made all six of its
+// `button` configs carry `"state_topic": ""` and `"optimistic": false`.
+//
+// The second rule is why `omitempty` is not a blanket good. A bare `bool` with
+// `omitempty` cannot say `false` at all, and for `optimistic`, `retain`,
+// `enabled_by_default` and `force_update` that is the interesting value.
+//
+// The two rules together are also why a key whose *empty* value is meaningful
+// gets neither, and needs a decision of its own rather than a tag: see
+// UnitOfMeasure below, where the empty string is a no-op Home Assistant pops
+// during schema validation, and NameNull, where an explicit JSON null is read
+// differently from an absent key and so is carried by a separate bool.
 type Component struct {
 	// Platform is the bundle's discriminator: a component inside a document
 	// has no topic to say what it is. `omitempty` is what lets
