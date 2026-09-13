@@ -106,6 +106,17 @@ lets six projects with six topic schemas share one model. A change that makes
   // Copyright (C) 2026 go-hamqtt authors.
   ```
 - gofumpt; `golangci-lint` v2 with the shared config.
+- **No build artefacts in the tree.** `cmd/` is built with `make tools`
+  into the ignored `bin/`. A compiled binary committed at the root ships in
+  every `go get` of this module, on every platform, and a 3.6 MB one did
+  until it was untracked — see the Unreleased CHANGELOG entry.
+- **A CHANGELOG note about a consumer states a capability, not a
+  diagnosis.** Never "repository X has defect Y at file F line L" in the
+  present tense: this module cannot observe a consumer's tree, so such a
+  claim ages the moment they fix it, and two already had to be corrected.
+  Say what the guard is, what trap it closes, and how a reader tells whether
+  it applies to them; keep measurement evidence in the past tense, dated and
+  attributed to the measurement. Full rule at the top of `CHANGELOG.md`.
 - Tests are table-free where a table would obscure the point, stdlib-only, and
   each pins *a fact* with a comment saying why it matters. The composite
   climate entity in `discovery/climate_test.go` is the design's litmus test:

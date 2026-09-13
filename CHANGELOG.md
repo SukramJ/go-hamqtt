@@ -3,6 +3,63 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## How this file talks about consumers
+
+A released entry is history and is not silently rewritten. Where one has
+since become false, a dated **Correction** is added in place, under the
+claim it corrects.
+
+Two of them were needed, which is a defect in the *shape* of the claim and
+not only in its content. Both were **diagnoses** — "repository X currently
+has defect Y at file F line L" — and a diagnosis of somebody else's code
+starts ageing the moment they fix it, which is exactly what the consumer
+reading its own name in these notes is about to do. This module cannot
+observe a consumer's tree, so it cannot keep such a claim true, and
+nothing here fails when it goes stale.
+
+So from v0.34.1 a consumer-facing note states a **capability**: here is
+the guard, here is the trap it closes, here is how to tell whether it
+applies to you — a condition a reader can evaluate against their own tree,
+with no assertion about what that tree currently contains. Evidence from
+the ADR 0070 measurements stays, because it is what justifies the guard,
+but it is written in the past tense, dated, and attributed to the
+measurement rather than to the repository's present state ("go-mtec2mqtt's
+PR #54 measured …", not "go-mtec2mqtt still …"). File-and-line references
+into another repository are out; references into *this* module's code are
+fine, because a change here moves them.
+
+## [0.34.1] - 2026-09-13
+
+### Removed
+
+- **The compiled `hacheck` binary is no longer tracked.** A 3.6 MB
+  statically linked, unstripped x86-64 ELF sat at the repository root
+  and was therefore part of every `go get` of a module whose charter is
+  zero dependencies and a small data artefact — on every platform,
+  including the ones that cannot run it. It was committed once, in
+  `4b683ac` ("feat(cmd): hadoctor reads a whole capture…"), and nothing
+  referenced the committed file: the Makefile has no build target for
+  it, CI builds from source, and README's `hacheck < capture.ndjson`
+  assumes a binary on `PATH`. `bin/` and the two tool names are now
+  ignored, and `make tools` builds both into `bin/`.
+
+  **Untracking it does not shrink the repository's history.** The blob
+  stays in every existing clone and in every fetch of the commits that
+  contain it; only new checkouts of `main` stop materialising the file.
+  Removing it from history would require a rewrite of every commit since
+  `4b683ac` and is deliberately not done.
+
+### Documentation
+
+- **How this file talks about consumers**, at the top: a consumer-facing
+  note states a capability and a condition the reader can evaluate
+  against their own tree, never a present-tense diagnosis of another
+  repository's code at a file and line. Two released claims had already
+  gone stale under that defect and now carry dated corrections in place
+  (v0.34.0's go-zendure2mqtt `Runtime` bullet, v0.33.0's go-unifi2mqtt
+  `omitempty` bullet). Released entries are not rewritten.
+- **README says how to get the tools** rather than assuming them.
+
 ## [0.34.0] - 2026-09-13
 
 ### Added
@@ -134,6 +191,21 @@ Nothing to do to keep compiling; each item is opt-in.
   while publishing bundles, which is go-mtec2mqtt's F1 shape: rebuild it
   per connect, call `Reset` in `PublishOnline`, or implement
   `Generational`.
+
+  > **Correction (2026-09-13).** False as published, and it names the
+  > function that already does it: go-zendure2mqtt calls
+  > `HARuntime.Reset()` in `PublishOnline`, with the choice of `Reset`
+  > over a rebuilt runtime reasoned on the spot — `Declared()` is
+  > load-bearing for its orphan sweep and a rebuilt runtime starts with
+  > that set empty — and the trap measured at 22 of 29 entities not
+  > appearing (`TestRetractionsAreReSentAfterAReconnect`). The bullet
+  > was written from a snapshot of that repository, which is a claim
+  > this module cannot keep true; see *How this file talks about
+  > consumers* at the top. Read as capability: a `Runtime` that outlives
+  > the connection it describes memoises a QoS 0 retraction as done when
+  > only `Write`+`Flush` succeeded — if yours does, `Reset` in the
+  > connect hook, a `Generational` transport, or a per-connect rebuild
+  > each close it.
 - Consumers whose sweep predicate reads a payload field (all but
   openccu-loom, whose predicate takes a `ConfigTopic` and cannot see a
   payload) should weigh `SelfClaimed` against what they need cleared
@@ -156,6 +228,21 @@ Nothing to do to keep compiling; each item is opt-in.
   neither with `omitempty`, plus an explicit `StateTopic: ""` at
   `control.go:151`. That bridge does not depend on this module; it ran
   `ValidateBody` over payloads this module never built.
+
+  > **Correction (2026-09-13).** The three file-and-line references
+  > describe a tree that no longer exists: go-unifi2mqtt fixed all of it
+  > in its PR #23, and reached the conclusion before this entry was
+  > written — `state_topic` and `optimistic` now both carry `omitempty`,
+  > `optimistic` is a `*bool` so a deliberate `false` survives, and the
+  > explicit empty `StateTopic` is gone. The diagnosis was accurate when
+  > measured and is kept as the evidence for the guard below; it should
+  > never have been phrased in the present tense against another
+  > repository's line numbers. See *How this file talks about consumers*
+  > at the top. What does not age is the rule the guard pins: a key that
+  > serialises a zero value onto a platform that does not declare it
+  > makes Home Assistant refuse the config, so every key is `omitempty`
+  > or `json:"-"`, and no bare `bool`/`int`/`float64` sits behind an
+  > `omitempty`.
 
   Rendered through this package's own path, the same entity — a `button`
   whose description asks for `optimistic: false` *and* whose entity binds

@@ -65,6 +65,10 @@ fmt-check: ## fail when sources are not gofumpt-clean
 lint: ## run golangci-lint
 	$(GOLANGCI_LINT) run ./...
 
+.PHONY: tools
+tools: ## build hacheck + hadoctor into bin/ (never committed)
+	$(GO) build -o bin/ ./cmd/...
+
 .PHONY: tidy
 tidy: ## sync go.mod
 	$(GO) mod tidy
@@ -86,3 +90,4 @@ cover-check: ## fail when a package drops below COVER_MIN (script/ is build tool
 .PHONY: clean
 clean: ## remove build artefacts
 	rm -f coverage.out
+	rm -rf bin

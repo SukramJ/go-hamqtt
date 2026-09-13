@@ -1,2 +1,7 @@
 coverage.out
 .idea/
+
+# compiled tools — build with `make tools` (never commit the binaries)
+/bin/
+/hacheck
+/hadoctor
