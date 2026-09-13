@@ -2374,3 +2374,36 @@ func TestCommandRouterSurvivesFailClosedUnstampedRouting(t *testing.T) {
 		t.Fatalf("the consumer's own subscription saw %d copies, want 1 — fail-closed must not starve it", got)
 	}
 }
+
+// TestSubscriptionIDAllocationStopsAtTheCeiling pins that exhaustion is
+// permanent.
+//
+// The counter used to keep incrementing past MaxSubscriptionID and report the
+// range error each time — correct until 2^32 allocations wrap it back to
+// small values that pass the range check again, at which point the router
+// hands out identifiers it has already used. That is the collision a
+// process-wide counter exists to prevent, arriving by the one route the range
+// guard does not cover. Unreachable in practice, cheap to close, and
+// impossible to notice afterwards if it ever were reached.
+func TestSubscriptionIDAllocationStopsAtTheCeiling(t *testing.T) {
+	t.Parallel()
+	var c atomic.Uint32
+
+	id, ok := allocateSubscriptionID(&c)
+	if !ok || id != 1 {
+		t.Fatalf("first identifier = %d, ok=%v, want 1 — the router allocates upward from 1", id, ok)
+	}
+
+	c.Store(MaxSubscriptionID - 1)
+	if id, ok := allocateSubscriptionID(&c); !ok || id != MaxSubscriptionID {
+		t.Fatalf("last identifier = %d, ok=%v, want %d", id, ok, MaxSubscriptionID)
+	}
+	for range 3 {
+		if id, ok := allocateSubscriptionID(&c); ok || id != 0 {
+			t.Fatalf("allocation past the ceiling returned %d, ok=%v, want exhausted", id, ok)
+		}
+	}
+	if got := c.Load(); got != MaxSubscriptionID {
+		t.Fatalf("counter ran on to %d; it wraps at 2^32 and starts handing out live identifiers again", got)
+	}
+}

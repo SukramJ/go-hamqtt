@@ -269,6 +269,32 @@ const MaxSubscriptionID = 268435455
 // collision this counter exists to prevent.
 var nextSubscriptionID atomic.Uint32
 
+// allocateSubscriptionID hands out the next identifier from c, or reports
+// exhaustion.
+//
+// It stops the counter at [MaxSubscriptionID] instead of letting it run past
+// and reporting the range error each time. The unbounded version was
+// unreachable in practice and wrong anyway: after 2^32 allocations the
+// counter wraps to small values that pass the range check again, and the
+// router would hand out identifiers it has already used — the collision the
+// process-wide counter exists to prevent, arriving by the one route the
+// range guard does not cover.
+//
+// Taking the counter as an argument is what makes that testable without a
+// test reaching into a process-wide variable every parallel test in this
+// package allocates from.
+func allocateSubscriptionID(c *atomic.Uint32) (uint32, bool) {
+	for {
+		cur := c.Load()
+		if cur >= MaxSubscriptionID {
+			return 0, false
+		}
+		if c.CompareAndSwap(cur, cur+1) {
+			return cur + 1, true
+		}
+	}
+}
+
 // AttributingSubscriber is the optional [Transport] capability that makes
 // overlapping command routes safe: it subscribes with an MQTT 5.0
 // Subscription Identifier (§3.8.2.1.2), so the broker stamps every message
@@ -1019,8 +1045,8 @@ func (r *CommandRouter) assignSubscriptionIDsLocked() ([]routeSub, error) {
 		if r.routes[i].subID != 0 {
 			continue
 		}
-		id := nextSubscriptionID.Add(1)
-		if id > MaxSubscriptionID {
+		id, ok := allocateSubscriptionID(&nextSubscriptionID)
+		if !ok {
 			return nil, fmt.Errorf("%w: the process has allocated all %d MQTT 5.0 subscription identifiers",
 				ErrAttributionUnavailable, MaxSubscriptionID)
 		}
@@ -1377,10 +1403,15 @@ func filterParts(filter string) []string {
 
 // ValidateFilter reports whether filter is a topic filter MQTT permits.
 //
-// Checked at registration rather than left to the broker, because a broker
-// answers a malformed filter with a SUBACK failure code that the transport
-// interface deliberately drops — so the only symptom would be a route that
-// never fires. The rules are §4.7: a filter is non-empty, no longer than
+// Checked at registration rather than left to the broker, because a broker's
+// answer to a malformed filter is a SUBACK failure code and where that
+// surfaces is the transport's business, not this package's. The shipped
+// go-mqtt adapter does surface it — go-mqtt returns a *ReasonError for a
+// rejected SUBACK, and only the GRANTED QoS is dropped, so
+// [CommandRouter.Start] fails visibly — but a [Transport] is free to swallow
+// it, and then the only symptom is a route that never fires. Checking here
+// makes the answer the same on every transport, and makes it an error at the
+// composition root rather than at boot. The rules are §4.7: a filter is non-empty, no longer than
 // 65535 bytes, valid UTF-8 without U+0000 (§1.5.4), `+` occupies a whole
 // level, and `#` occupies a whole level and is the last one.
 //
