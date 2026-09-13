@@ -3,6 +3,88 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.33.0] - 2026-09-13
+
+### Documentation
+
+- **A measured `button` refusal was a consumer defect, not this
+  module's — and the class it belongs to is now guarded here.** A
+  Phase 9 measurement of `go-unifi2mqtt` reported `discovery.Validate`
+  refusing 18 of 315 configs: every `button`, for `state_topic` and
+  `optimistic`. Reproduced before deciding. The refusal is real and the
+  cause is that bridge's own hand-rolled payload structs —
+  `StateTopic string \`json:"state_topic"\`` at
+  `internal/hass/discovery.go:160` and
+  `Optimistic bool \`json:"optimistic"\`` at `internal/hass/control.go:46`,
+  neither with `omitempty`, plus an explicit `StateTopic: ""` at
+  `control.go:151`. That bridge does not depend on this module; it ran
+  `ValidateBody` over payloads this module never built.
+
+  Rendered through this package's own path, the same entity — a `button`
+  whose description asks for `optimistic: false` *and* whose entity binds
+  a readable datapoint, the worst case for both keys — comes out clean:
+
+      {"availability":[…],"availability_mode":"all",
+       "command_topic":"daikin/serial:AC-1/values/RESTART/set",
+       "default_entity_id":"button.serial_ac-1_restart",
+       "device":{…},"name":"Restart","origin":{"name":"x"},
+       "unique_id":"daikin_serial_ac-1_restart"}
+
+  No `state_topic`, no `optimistic`, and `ValidateBody` passes. Both keys
+  are gated twice over — `RenderComponent` projects them only where the
+  catalog says the platform declares them, and `Component` carries both
+  with `omitempty` behind that — which is why removing either gate alone
+  still leaves the payload clean and why the new pin asserts on the
+  encoded bytes rather than on a struct field.
+
+  **No production behaviour changed and no published byte moves.** What
+  is added is the guard for the whole class rather than the two fields:
+  a survey of every JSON tag this module can put on the wire turned up
+  no field that serialises a zero value onto a platform that does not
+  declare the key. The five tags without `omitempty` are all
+  `vol.Required` on their enclosing object — `availability[].topic`,
+  `origin.name`, and the bundle's `device`/`origin`/`components` — where
+  an absent key is the defect and the empty value is the diagnostic.
+  Every generated `*Fields` struct already satisfies the rule by
+  construction: `script/genfields` writes `omitempty` on every key and a
+  pointer for every scalar.
+
+  `TestNoComponentKeySerialisesAZeroValue` now enforces both halves of
+  that across `Component`, `DeviceInfo`, `AvailabilityEntry`, `Origin`,
+  `Bundle` and all 31 `FieldsIndex` structs: every key `omitempty` or
+  `json:"-"`, and no bare `bool`/`int`/`float64` behind an `omitempty`
+  — because that second shape is the opposite defect, a deliberate
+  `false` or `0` that can never be published. The `Component` doc
+  comment states the two rules and why "add `omitempty` everywhere" is
+  not one of them, pointing at `UnitOfMeasure` (an empty unit is a no-op
+  Home Assistant pops during schema validation) and `NameNull` (an
+  explicit null reads differently from an absent key) as the two places
+  this model already distinguishes "unset" from "deliberately zero".
+
+- **What availability can express, pinned.** The same measurement
+  reported a two-level, list-form, `availability_mode: all` availability
+  whose split is *per entity* — 128 configs gated on the bridge alone,
+  187 on the bridge and the object — and whose second level is the
+  object's own state topic read through a `value_template` rather than a
+  dedicated availability topic. Both halves are expressible today and
+  now have tests saying so, so a design step has measured ground:
+
+  - Availability is per-component vocabulary, not per-device. It lives
+    on `model.Description`, which every entity carries, and
+    `Context.Availability` resolves it entity by entity, so
+    `model.BridgeOnly()` beside the zero `model.Availability` renders a
+    one-entry list and a two-entry list in the same bundle. No second
+    bundle and no escape hatch.
+  - `value_template` is on `AvailabilityEntry` and reaches the wire.
+    `StdContext` already emits one for `model.LevelSelf`.
+  - `StdContext`'s own spelling of that second level is a dedicated
+    availability topic with `online`/`offline` payloads, and for
+    `LevelSelf` a template reading the envelope. A consumer whose
+    entries must be spelled some other way — its object's state topic,
+    its own words for online — overrides `Context.Availability`, which
+    is an interface method for exactly that reason. Nothing needs to be
+    added to the model.
+
 ## [0.32.0] - 2026-09-13
 
 ### Fixed
