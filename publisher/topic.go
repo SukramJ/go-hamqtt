@@ -4,6 +4,8 @@
 package publisher
 
 import (
+	"reflect"
+	"runtime"
 	"strings"
 
 	"github.com/SukramJ/go-hamqtt/discovery"
@@ -85,6 +87,13 @@ func BundleConfigTopic(prefix, nodeID string) string {
 // zigbee2mqtt publishes documents of its own — produces topics that parse
 // perfectly well and must not be touched, so scoping the node id is the
 // caller's job and [SweepRequest.Owns] is where it happens.
+//
+// Widening a parser widens what a predicate is asked about, and that is the
+// upgrade hazard of v0.29.0: an [SweepRequest.Owns] that does not read
+// [ConfigTopic.NodeID] now judges the three-segment form as well, a shape
+// Tasmota publishes into a shared discovery tree. Re-read such a predicate
+// before upgrading. One that scopes on the node id is unaffected — the
+// node-id-less form parses with an empty one, and it declines.
 func ParseConfigTopic(prefix, topic string) (ConfigTopic, bool) {
 	p := topicPrefix(prefix)
 	if !strings.HasPrefix(topic, p) || !strings.HasSuffix(topic, "/config") {
@@ -169,6 +178,46 @@ type LegacyEntity struct {
 // clean, and the entities keep their old configs."
 type LegacyTopicFunc func(e LegacyEntity) string
 
+// legacyFormNames names the forms a runtime will retract under, for the boot
+// log and [Runtime.LegacyForms].
+//
+// The measured need is a fleet that spans releases: [Config.LegacyEntityTopics]
+// REPLACES the default rather than adding to it, so stating one form silently
+// stops retracting the other, and nothing anywhere said which forms were
+// active. An operator reading a migration that quietly retracted nothing had
+// no line to look at. An empty list names the default explicitly, because
+// "unset" and "the five-segment form" are the same behaviour and only one of
+// them is useful in a log.
+func legacyFormNames(forms []LegacyTopicFunc) []string {
+	if len(forms) == 0 {
+		return []string{legacyFormName(LegacyTopicWithNodeID) + " (default)"}
+	}
+	out := make([]string, 0, len(forms))
+	for _, f := range forms {
+		if f == nil {
+			continue
+		}
+		out = append(out, legacyFormName(f))
+	}
+	return out
+}
+
+// legacyFormName is the best name a func value has: the exported helper's own
+// name for the three this package ships, and the enclosing function plus a
+// counter for a consumer's closure — which is still enough to tell an
+// operator that a form is there and how many.
+func legacyFormName(f LegacyTopicFunc) string {
+	fn := runtime.FuncForPC(reflect.ValueOf(f).Pointer())
+	if fn == nil {
+		return "func"
+	}
+	name := fn.Name()
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
 // LegacyTopicWithNodeID renders `<prefix>/<platform>/<node_id>/<object_id>/
 // config` — the five-segment form, which is what [SupersededTopics] uses when
 // a consumer states nothing, and therefore the behaviour of every release
@@ -194,6 +243,14 @@ func LegacyTopicWithNodeID(e LegacyEntity) string {
 // evidence. A component with no `unique_id` yields "" and is skipped, because
 // there is nothing to key on and a topic built from a blank segment belongs to
 // nobody.
+//
+// A tombstone is the case to watch, and it is the one that reaches a
+// consumer: the entry [discovery.Bundle.Remove] writes carries a platform and
+// nothing else, so this form has nothing to key on unless the removed
+// component's identity was remembered outside the payload. It is remembered,
+// by [discovery.Bundle.RemoveComponents] and by [discovery.Bundle.Remove] on
+// a key that was still declared — see [SupersededTopics] for what a tombstone
+// with neither costs.
 func LegacyTopicByUniqueID(e LegacyEntity) string {
 	if e.Platform == "" || e.UniqueID == "" {
 		return ""

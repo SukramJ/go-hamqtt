@@ -269,6 +269,32 @@ const MaxSubscriptionID = 268435455
 // collision this counter exists to prevent.
 var nextSubscriptionID atomic.Uint32
 
+// allocateSubscriptionID hands out the next identifier from c, or reports
+// exhaustion.
+//
+// It stops the counter at [MaxSubscriptionID] instead of letting it run past
+// and reporting the range error each time. The unbounded version was
+// unreachable in practice and wrong anyway: after 2^32 allocations the
+// counter wraps to small values that pass the range check again, and the
+// router would hand out identifiers it has already used — the collision the
+// process-wide counter exists to prevent, arriving by the one route the
+// range guard does not cover.
+//
+// Taking the counter as an argument is what makes that testable without a
+// test reaching into a process-wide variable every parallel test in this
+// package allocates from.
+func allocateSubscriptionID(c *atomic.Uint32) (uint32, bool) {
+	for {
+		cur := c.Load()
+		if cur >= MaxSubscriptionID {
+			return 0, false
+		}
+		if c.CompareAndSwap(cur, cur+1) {
+			return cur + 1, true
+		}
+	}
+}
+
 // AttributingSubscriber is the optional [Transport] capability that makes
 // overlapping command routes safe: it subscribes with an MQTT 5.0
 // Subscription Identifier (§3.8.2.1.2), so the broker stamps every message
@@ -422,12 +448,18 @@ type route struct {
 //     One overlap remains outside the router's reach and is worth naming:
 //     the local fan-out is the whole go-mqtt client's, so a SECOND
 //     subscription on the same client whose filter also matches a command
-//     topic reintroduces the multiplication. This module's own other
+//     topic reintroduces the multiplication — on go-mqtt through v1.5.0,
+//     which matched an identifier-less delivery by topic against stamped
+//     subscriptions as well and so handed that subscription's copies to
+//     every stamped route. go-mqtt v1.5.1 fails closed there, per MQTT 5.0
+//     §3.3.4: a copy carrying no identifier was forwarded for no stamped
+//     subscription, so it reaches none. This module's own other
 //     subscriptions (the discovery-tree snapshot and the birth topic) live
 //     under the discovery prefix, not in the consumer's command tree, so
 //     they do not; a consumer that adds a broad subscription of its own
-//     must keep it off the command tree, which is the subscription-side
-//     twin of [CommandRouter.CheckDisjoint].
+//     should still keep it off the command tree, which is the
+//     subscription-side twin of [CommandRouter.CheckDisjoint], and must on
+//     any go-mqtt before v1.5.1.
 //
 //   - Handlers run off the read loop. See [CommandHandler].
 //
@@ -725,6 +757,11 @@ func (r *CommandRouter) Filters() []string {
 // can be retried once the broker recovers — a partial start that could
 // never be retried would be the worse of the two failure modes.
 //
+// Routes go out most specific first, which matters only when an overlapping
+// pair was accepted and then matters a great deal: it is what keeps a command
+// delivered inside the subscribe window from being dropped. See
+// [CommandRouter.routeSubsLocked].
+//
 // Starting a router with no routes is not an error — a consumer whose
 // entities are all read-only has nothing to subscribe, and making that the
 // caller's special case buys nothing.
@@ -1008,8 +1045,8 @@ func (r *CommandRouter) assignSubscriptionIDsLocked() ([]routeSub, error) {
 		if r.routes[i].subID != 0 {
 			continue
 		}
-		id := nextSubscriptionID.Add(1)
-		if id > MaxSubscriptionID {
+		id, ok := allocateSubscriptionID(&nextSubscriptionID)
+		if !ok {
 			return nil, fmt.Errorf("%w: the process has allocated all %d MQTT 5.0 subscription identifiers",
 				ErrAttributionUnavailable, MaxSubscriptionID)
 		}
@@ -1074,6 +1111,12 @@ func (r *CommandRouter) deliver(filter, topic string, payload []byte, retained b
 		// "exactly one handler per message" true while letting the
 		// overlap exist at all. Only reachable when the delivery is
 		// attributable, which is why accepting the overlap required it.
+		//
+		// The winner's subscription is known to exist by the time this
+		// copy can arrive, because the routes are registered most specific
+		// first — see [CommandRouter.routeSubsLocked], which is where the
+		// command this used to swallow during the subscribe window is
+		// accounted for.
 		r.mu.Unlock()
 		r.log.Debug("publisher.command.superseded",
 			slog.String("topic", topic), slog.String("filter", filter),
@@ -1165,12 +1208,79 @@ func (r *CommandRouter) routeFiltersLocked() []string {
 	return out
 }
 
+// routeSubsLocked lists the subscriptions to register, MOST SPECIFIC FIRST.
+// Callers hold r.mu.
+//
+// The order is load-bearing and it is the fix for a measured loss. A copy is
+// dropped when it arrived for a route that a more specific one outranks (see
+// [CommandRouter.deliver]), and that verdict is taken against the REGISTERED
+// route set — which, while the subscriptions are still going out one at a
+// time, is not the set that exists on the broker. Registering the general
+// shape first therefore opened a window in which the only subscription that
+// existed was the one whose copies get dropped: a command published inside it
+// ran no handler at all and left one Debug line. Measured with a transport
+// that delivers after the first SUBSCRIBE and before the second — the
+// ordinary state of the wire during [CommandRouter.Start], and during a
+// sequential [CommandRouter.Resubscribe] after a reconnect, which is a second
+// in which a button press does nothing.
+//
+// Subscribing the winner first closes that window without any per-connection
+// liveness bookkeeping, and closes it in the direction that cannot double: a
+// copy can only arrive for an outranked route once that route's subscription
+// exists, and by then the route that outranks it has been subscribed on the
+// same connection and in the same order. The reverse window — the winner
+// subscribed and the outranked route not yet — loses nothing, because the
+// winner is the route that would have run anyway.
+//
+// It rests on one property of a transport that replays subscriptions of its
+// own: the replay must follow the order they were registered in. go-mqtt's
+// does — it walks its subscription slice in registration order and writes
+// every SUBSCRIBE without waiting for the SUBACKs, so the broker sees them in
+// that order on one stream.
+//
+// The ordering key is the sum of a filter's per-level ranks over a width that
+// covers every route, which is a total order consistent with the partial one
+// [compareSpecificity] decides: a filter that dominates another is at least
+// as strict at every level and stricter at one, so its sum is strictly
+// greater. Ties keep registration order, which is what a router with disjoint
+// routes — the majority, where the question is moot — has always had.
 func (r *CommandRouter) routeSubsLocked() []routeSub {
-	out := make([]routeSub, 0, len(r.routes))
+	width := 1
 	for i := range r.routes {
+		if n := len(r.routes[i].parts); n >= width {
+			width = n + 1
+		}
+	}
+	order := make([]int, len(r.routes))
+	score := make([]int, len(r.routes))
+	for i := range r.routes {
+		order[i] = i
+		score[i] = specificityScore(r.routes[i].parts, width)
+	}
+	sort.SliceStable(order, func(a, b int) bool { return score[order[a]] > score[order[b]] })
+
+	out := make([]routeSub, 0, len(r.routes))
+	for _, i := range order {
 		out = append(out, routeSub{filter: r.routes[i].filter, subID: r.routes[i].subID})
 	}
 	return out
+}
+
+// specificityScore totals a pre-split filter's per-level ranks across width
+// levels, which must cover the longest filter being compared.
+//
+// A total order that agrees with [compareSpecificity]'s dominance test, and
+// only useful because of that agreement: dominance is what registration
+// enforces and what delivery resolves by, while a sort needs a key. Past its
+// own last level a filter still has a rank — [rankEnd], or [rankRemainder]
+// once a `#` has been seen — so the levels beyond the shorter filter are
+// counted rather than skipped, which is exactly where `a/b` beats `a/b/#`.
+func specificityScore(parts []string, width int) int {
+	total := 0
+	for i := range width {
+		total += levelRank(parts, i)
+	}
+	return total
 }
 
 // Level ranks, loosest to strictest. They are the whole specificity rule:
@@ -1293,10 +1403,15 @@ func filterParts(filter string) []string {
 
 // ValidateFilter reports whether filter is a topic filter MQTT permits.
 //
-// Checked at registration rather than left to the broker, because a broker
-// answers a malformed filter with a SUBACK failure code that the transport
-// interface deliberately drops — so the only symptom would be a route that
-// never fires. The rules are §4.7: a filter is non-empty, no longer than
+// Checked at registration rather than left to the broker, because a broker's
+// answer to a malformed filter is a SUBACK failure code and where that
+// surfaces is the transport's business, not this package's. The shipped
+// go-mqtt adapter does surface it — go-mqtt returns a *ReasonError for a
+// rejected SUBACK, and only the GRANTED QoS is dropped, so
+// [CommandRouter.Start] fails visibly — but a [Transport] is free to swallow
+// it, and then the only symptom is a route that never fires. Checking here
+// makes the answer the same on every transport, and makes it an error at the
+// composition root rather than at boot. The rules are §4.7: a filter is non-empty, no longer than
 // 65535 bytes, valid UTF-8 without U+0000 (§1.5.4), `+` occupies a whole
 // level, and `#` occupies a whole level and is the last one.
 //

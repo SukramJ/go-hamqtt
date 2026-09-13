@@ -157,6 +157,25 @@ func TestParamInt32Types(t *testing.T) {
 	}
 }
 
+// TestParamInt32TruncatesAFraction pins the behaviour the doc used to read as
+// a guarantee against: out of RANGE is an error, but a fractional JSON number
+// — every number Home Assistant sends is a float64, and `2.7` on a stepped
+// field is ordinary — is truncated toward zero rather than refused. Refusing
+// would turn every slider landing between two steps into a failed command;
+// the doc now says which of the two surprises a caller gets.
+func TestParamInt32TruncatesAFraction(t *testing.T) {
+	for raw, want := range map[float64]int32{2.7: 2, -2.7: -2, 0.9: 0} {
+		got, err := ParamInt32(map[string]any{"k": raw}, "k")
+		if err != nil {
+			t.Errorf("raw=%v: unexpected error %v", raw, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("raw=%v: got %d, want %d (truncation toward zero)", raw, got, want)
+		}
+	}
+}
+
 func TestParamInt32OverflowInt(t *testing.T) {
 	// The value is built at run time rather than written as a constant. As
 	// `int(1 << 32)` it does not compile where int is 32 bits wide — a test

@@ -109,11 +109,19 @@ func ParamFloat64(params map[string]any, key string) (float64, error) {
 
 // ParamInt32 decodes a required int32 param.
 //
-// An out-of-range input is an error rather than a truncation. Silent
+// An out-of-RANGE input is an error rather than a truncation. Silent
 // truncation would surprise a caller supplying a 64-bit index, and the
 // surprise would arrive as a write to the wrong thing rather than as a
 // rejected command. Numeric strings go through [strconv.ParseInt] for the
 // trailing-garbage reason given on [ParamFloat64].
+//
+// A FRACTIONAL input is a different question and gets a different answer: a
+// JSON number is a float64, Home Assistant sends `2.7` for a field a
+// consumer declared as a step count, and that value is truncated toward zero
+// to 2 rather than refused. Refusing would turn every slider that lands
+// between two steps into a failed command, which is the worse of the two
+// surprises — but it IS a truncation, so a consumer that needs rounding must
+// read [ParamFloat64] and round it itself.
 func ParamInt32(params map[string]any, key string) (int32, error) {
 	raw, ok := params[key]
 	if !ok {

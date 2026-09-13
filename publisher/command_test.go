@@ -1330,6 +1330,22 @@ func TestCommandRouterFailedStartRunsNoHandlerEvenWhenRollbackFails(t *testing.T
 		t.Fatalf("a handler ran %d times after Start failed; the gate must be closed, "+
 			"because a command now runs against half-initialised dependencies", got)
 	}
+
+	// And the router is closed for good, not merely un-started. Asserted
+	// separately because the two are told apart only here: the nil pool
+	// independently stops deliveries, so `stopped` being left false —
+	// measured to survive the suite in the v0.27.0–v0.29.0 review — is
+	// invisible to the assertion above. A retryable Start is exactly what
+	// must not be offered while a subscription the rollback could not take
+	// down is still live on the broker.
+	b.failSubscribe = nil
+	if err := r.Start(context.Background()); !errors.Is(err, ErrRouterStarted) {
+		t.Fatalf("Start after a failed rollback = %v, want ErrRouterStarted — "+
+			"a live subscription plus a re-startable router is the hazard Stop forbids", err)
+	}
+	if live := b.filters(); len(live) != 1 {
+		t.Fatalf("the refused Start went to the broker anyway: %v", live)
+	}
 }
 
 // TestCommandRouterOwnsNoGoroutinesUntilStarted is the regression for the
@@ -1636,6 +1652,26 @@ type attrBroker struct {
 	stamps bool
 
 	failSubscribe func(filter string) error
+	// failsClosed models go-mqtt v1.5.1 and later, where an
+	// identifier-less PUBLISH reaches ONLY subscriptions that carry no
+	// identifier.
+	//
+	// MQTT 5.0 §3.3.4 makes a server include the identifier of every
+	// subscription it forwarded a message for, so a message arriving with
+	// none was forwarded for no stamped subscription — matching it by
+	// topic against one delivers a copy the broker never sent. v1.5.0 did
+	// exactly that, which restored the doubled handler that
+	// WithSubscriptionID was added to remove: one stamped overlapping
+	// route plus one unstamped broad subscription on the same client, and
+	// a single published message ran the stamped handler twice. The zero
+	// value keeps the permissive routing, which is what the fixture's
+	// other tests describe.
+	failsClosed bool
+	// onSubscribe runs after a subscription is installed and before the
+	// next one is asked for. It is the only place a test can stand inside
+	// the subscribe window — the ordinary state of the wire during Start
+	// and during a sequential resubscribe replay after a reconnect.
+	onSubscribe func(filter string)
 }
 
 type attrSub struct {
@@ -1668,6 +1704,19 @@ func (b *attrBroker) SubscribeAttributed(
 }
 
 func (b *attrBroker) add(filter string, id uint32, h Handler) error {
+	if err := b.install(filter, id, h); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	hook := b.onSubscribe
+	b.mu.Unlock()
+	if hook != nil {
+		hook(filter)
+	}
+	return nil
+}
+
+func (b *attrBroker) install(filter string, id uint32, h Handler) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.failSubscribe != nil {
@@ -1721,8 +1770,18 @@ func (b *attrBroker) fanout(topic string, payload []byte, retained bool) (copies
 		// is re-matched against every filter, which is all a v3.1.1 link
 		// or an identifier-less subscription offers.
 		targets := match
-		if m.id != 0 {
+		switch {
+		case m.id != 0:
 			targets = []attrSub{m}
+		case b.failsClosed:
+			// go-mqtt v1.5.1 and later: an identifier-less copy reaches
+			// only the subscriptions that carry no identifier.
+			targets = nil
+			for _, s := range match {
+				if s.id == 0 {
+					targets = append(targets, s)
+				}
+			}
 		}
 		for _, t := range targets {
 			t.h(topic, payload, retained)
@@ -1812,6 +1871,119 @@ func TestCommandRouterAcceptsAnOrderedOverlapWhenDeliveriesAreAttributable(t *te
 	if gen[0].Wildcards[3] != "LEVEL" {
 		t.Errorf("the general route was handed %q, want the topic the specific route does not claim",
 			gen[0].Topic)
+	}
+}
+
+// TestCommandRouterDeliversInsideTheSubscribeWindow is the measured loss of
+// the v0.27.0–v0.29.0 review: a command that arrives while the routes are
+// still going out one at a time.
+//
+// The router drops a copy that arrived for a route a more specific one
+// outranks, judged against the REGISTERED route set — which is not the set
+// the broker holds until the last SUBSCRIBE is acknowledged. With the general
+// shape subscribed first, the only subscription that existed inside that
+// window was the one whose copies get dropped: the command ran no handler at
+// all and left one Debug line. That window is the ordinary state of the wire
+// during Start, and during a sequential resubscribe replay after a reconnect
+// — a button pressed in the second after a reconnect did nothing.
+//
+// The routes are therefore registered most specific first, so a copy can only
+// arrive for an outranked route once the route that outranks it is already
+// subscribed on the same connection.
+func TestCommandRouterDeliversInsideTheSubscribeWindow(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/PRESS_SHORT/set", specific.handle); err != nil {
+		t.Fatalf("handle specific: %v", err)
+	}
+
+	// Deliver after the FIRST subscription is installed and before the
+	// second is asked for. A real broker does this without being asked.
+	var once sync.Once
+	inWindow := func() {
+		b.mu.Lock()
+		live := len(b.subs)
+		b.mu.Unlock()
+		if live != 1 {
+			t.Errorf("the fixture delivered with %d subscriptions live, want exactly 1", live)
+		}
+		b.deliver("gh/ccu/PRESS_SHORT/set", []byte("1"), false)
+	}
+	b.mu.Lock()
+	b.onSubscribe = func(string) { once.Do(inWindow) }
+	b.mu.Unlock()
+
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+	r.WaitIdle()
+
+	ran := len(generic.snapshot()) + len(specific.snapshot())
+	if ran != 1 {
+		t.Fatalf("a command delivered inside the subscribe window ran %d handlers, want exactly 1 "+
+			"(0 is the measured loss, 2 would be the doubling the drop exists to prevent)", ran)
+	}
+	if got := len(specific.snapshot()); got != 1 {
+		t.Errorf("the specific route ran %d times, want 1 — it is the route that owns the topic", got)
+	}
+
+	// The same window again, this time as a reconnect replay against a
+	// broker that did not keep the session.
+	b.drop()
+	var twice sync.Once
+	b.mu.Lock()
+	b.onSubscribe = func(string) { twice.Do(inWindow) }
+	b.mu.Unlock()
+	if err := r.Resubscribe(context.Background()); err != nil {
+		t.Fatalf("resubscribe: %v", err)
+	}
+	r.WaitIdle()
+
+	if ran := len(generic.snapshot()) + len(specific.snapshot()); ran != 2 {
+		t.Fatalf("after the replay %d handler runs, want 2 — the command in the reconnect window is lost", ran)
+	}
+}
+
+// TestSpecificityScoreAgreesWithDominance pins the one property that lets a
+// sort key stand in for the dominance test: whenever compareSpecificity says
+// one filter is strictly more specific, its score must be strictly greater.
+// The subscribe order is built from the score and the delivery verdict from
+// the dominance test, so a disagreement would put the outranked route on the
+// wire first again — the window TestCommandRouterDeliversInsideTheSubscribeWindow
+// measures.
+func TestSpecificityScoreAgreesWithDominance(t *testing.T) {
+	t.Parallel()
+	filters := []string{
+		"gh/+/+/set", "gh/+/PRESS_SHORT/set", "gh/ccu/PRESS_SHORT/set",
+		"base/dev/set", "base/dev/set/#", "base/#", "base/dev/#",
+		"a/+/c", "a/b/+", "a/b", "a/b/#", "$share/g/a/b/+",
+	}
+	width := 1
+	parts := make([][]string, len(filters))
+	for i, f := range filters {
+		parts[i] = filterParts(f)
+		if n := len(parts[i]); n >= width {
+			width = n + 1
+		}
+	}
+	for i := range filters {
+		for j := range filters {
+			cmp, ok := compareSpecificity(parts[i], parts[j])
+			if !ok || cmp <= 0 {
+				continue
+			}
+			si, sj := specificityScore(parts[i], width), specificityScore(parts[j], width)
+			if si <= sj {
+				t.Errorf("%q dominates %q but scores %d <= %d — the subscribe order would invert them",
+					filters[i], filters[j], si, sj)
+			}
+		}
 	}
 }
 
@@ -2140,5 +2312,98 @@ func TestCompareSpecificity(t *testing.T) {
 			t.Errorf("compareSpecificity(%q, %q) = %d, %v; want %d, %v",
 				tc.a, tc.b, cmp, ok, tc.cmp, tc.ok)
 		}
+	}
+}
+
+// TestCommandRouterSurvivesFailClosedUnstampedRouting is the consumer-side
+// half of go-mqtt v1.5.1, and it is a "nothing here depended on the old
+// behaviour" test.
+//
+// Through v1.5.0 the client matched an identifier-less PUBLISH by topic
+// against STAMPED subscriptions too, so a consumer's own broad subscription
+// on the same client handed every one of its copies to the router's stamped
+// routes as well — one published message, one stamped handler run twice, the
+// exact multiplication the identifiers were taken out for. MQTT 5.0 §3.3.4
+// makes that impossible on a compliant server: a message forwarded for a
+// stamped subscription carries that identifier. v1.5.1 therefore fails
+// closed, and this pins that the router is correct under the stricter
+// routing: every route keeps its own copies and the consumer's own
+// subscription keeps its own.
+//
+// The router's promise is unchanged either way — the CommandRouter doc
+// already warns that a second subscription on the same client re-multiplies
+// — but the promise now holds without the consumer having to keep its own
+// subscriptions off the command tree.
+func TestCommandRouterSurvivesFailClosedUnstampedRouting(t *testing.T) {
+	t.Parallel()
+	b := newAttrBroker()
+	b.failsClosed = true
+	r := quietRouter(t, b, CommandConfig{})
+	generic, specific := &recorder{}, &recorder{}
+	if err := r.Handle("gh/+/+/set", generic.handle); err != nil {
+		t.Fatalf("handle generic: %v", err)
+	}
+	if err := r.Handle("gh/+/PRESS_SHORT/set", specific.handle); err != nil {
+		t.Fatalf("handle specific: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background()) })
+
+	// The consumer's own broad, unstamped subscription on the same client.
+	var mine atomic.Int64
+	if err := b.Subscribe(context.Background(), "gh/#", 0, func(string, []byte, bool) {
+		mine.Add(1)
+	}); err != nil {
+		t.Fatalf("the consumer's own subscribe: %v", err)
+	}
+
+	if n := b.deliver("gh/ccu/PRESS_SHORT/set", []byte("1"), false); n != 3 {
+		t.Fatalf("broker fanned out to %d subscriptions, want 3 — one copy per matching subscription", n)
+	}
+	r.WaitIdle()
+
+	if got := len(specific.snapshot()); got != 1 {
+		t.Fatalf("the specific route ran %d times, want exactly 1", got)
+	}
+	if got := len(generic.snapshot()); got != 0 {
+		t.Fatalf("the outranked route ran %d times, want 0", got)
+	}
+	if got := mine.Load(); got != 1 {
+		t.Fatalf("the consumer's own subscription saw %d copies, want 1 — fail-closed must not starve it", got)
+	}
+}
+
+// TestSubscriptionIDAllocationStopsAtTheCeiling pins that exhaustion is
+// permanent.
+//
+// The counter used to keep incrementing past MaxSubscriptionID and report the
+// range error each time — correct until 2^32 allocations wrap it back to
+// small values that pass the range check again, at which point the router
+// hands out identifiers it has already used. That is the collision a
+// process-wide counter exists to prevent, arriving by the one route the range
+// guard does not cover. Unreachable in practice, cheap to close, and
+// impossible to notice afterwards if it ever were reached.
+func TestSubscriptionIDAllocationStopsAtTheCeiling(t *testing.T) {
+	t.Parallel()
+	var c atomic.Uint32
+
+	id, ok := allocateSubscriptionID(&c)
+	if !ok || id != 1 {
+		t.Fatalf("first identifier = %d, ok=%v, want 1 — the router allocates upward from 1", id, ok)
+	}
+
+	c.Store(MaxSubscriptionID - 1)
+	if id, ok := allocateSubscriptionID(&c); !ok || id != MaxSubscriptionID {
+		t.Fatalf("last identifier = %d, ok=%v, want %d", id, ok, MaxSubscriptionID)
+	}
+	for range 3 {
+		if id, ok := allocateSubscriptionID(&c); ok || id != 0 {
+			t.Fatalf("allocation past the ceiling returned %d, ok=%v, want exhausted", id, ok)
+		}
+	}
+	if got := c.Load(); got != MaxSubscriptionID {
+		t.Fatalf("counter ran on to %d; it wraps at 2^32 and starts handing out live identifiers again", got)
 	}
 }

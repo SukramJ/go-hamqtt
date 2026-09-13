@@ -236,6 +236,26 @@ type Bundle struct {
 	Origin     Origin               `json:"origin"`
 	Components map[string]Component `json:"components"`
 
+	// Tombstones remembers what a removed component was, keyed the same way
+	// [Bundle.Components] is. Not part of the payload, and it must not be:
+	// Home Assistant deletes a component when its entry carries a platform
+	// and nothing else, so putting the `unique_id` back into the entry would
+	// un-remove the entity this field exists to finish removing.
+	//
+	// The measured need is the retraction of the removed entity's OLD
+	// per-entity config. [Bundle.Remove] writes `Component{Platform: …}`,
+	// which has no `unique_id` — so a consumer on the node-id-less legacy
+	// form ([github.com/SukramJ/go-hamqtt/publisher.LegacyTopicByUniqueID],
+	// go-zendure2mqtt's fleet, measured 2026-09-12) got no legacy topic for
+	// a tombstone at all, and the deleted entity kept being rediscovered
+	// from its stale retained config on every MQTT-integration restart. The
+	// identity is not in the payload any more, so it lives here.
+	//
+	// Populated by [Bundle.Remove] from the entry it overwrites and by
+	// [Bundle.RemoveComponents] from the components handed to it; a consumer
+	// that fills it directly is doing the same thing by hand.
+	Tombstones map[string]Component `json:"-"`
+
 	// QoS, if set, applies to every component that does not set its own.
 	QoS *int `json:"qos,omitempty"`
 }
@@ -267,6 +287,14 @@ func (b *Bundle) Keys() []string {
 // omitting the key entirely leaves the entity in place. Getting this wrong is
 // how a device that switched from separate entities to a composite ends up
 // showing both forever.
+//
+// The entry it overwrites is remembered in [Bundle.Tombstones], so a removal
+// performed on a bundle that still declared the component keeps the
+// component's `unique_id` available to the legacy-topic retraction. A key
+// that was never in the document has no such entry to remember —
+// [Bundle.RemoveComponents] is the call for that case, and it is the common
+// one: an entity that left the catalogue is not rendered any more, so the
+// bundle being published never had it.
 func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string) {
 	if b.Components == nil {
 		b.Components = map[string]Component{}
@@ -282,8 +310,58 @@ func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string
 		if !known || platform == "" {
 			continue
 		}
+		was := b.Components[k]
+		was.Platform = platform
+		b.rememberTombstone(k, was)
 		b.Components[k] = Component{Platform: platform}
 	}
+}
+
+// RemoveComponents marks components as deleted and remembers what they were.
+//
+// It is [Bundle.Remove] for the case that actually occurs: an entity that
+// left the consumer's catalogue is not rendered into the new document at all,
+// so the bundle being published never held it and there is nothing for
+// [Bundle.Remove] to remember. was is the component as it was published —
+// typically the previous document's [Bundle.Components] — and the platform is
+// taken from it, so no separate platform map is needed.
+//
+// The measured need is the legacy retraction a tombstone alone cannot
+// express. Its payload entry carries a platform and nothing else, by Home
+// Assistant's rule; a consumer whose installed fleet keys its per-entity
+// configs on the `unique_id`
+// ([github.com/SukramJ/go-hamqtt/publisher.LegacyTopicByUniqueID],
+// go-zendure2mqtt, measured 2026-09-12) therefore had no topic to retract for
+// a removed entity, and its stale retained config went on re-creating the
+// entity as a permanently unavailable phantom on every MQTT-integration
+// restart. A key whose component carries no platform is skipped, for the
+// reason [Bundle.Remove] gives.
+func (b *Bundle) RemoveComponents(was map[string]Component, keys ...string) {
+	if b.Components == nil {
+		b.Components = map[string]Component{}
+	}
+	for _, k := range keys {
+		prev, known := was[k]
+		if !known || prev.Platform == "" {
+			continue
+		}
+		b.rememberTombstone(k, prev)
+		b.Components[k] = Component{Platform: prev.Platform}
+	}
+}
+
+// rememberTombstone records a removed component's identity outside the
+// payload. A record that carries a `unique_id` is never replaced by one that
+// does not: removing the same key twice, once with the component in hand and
+// once without, must not throw away the identity the first call captured.
+func (b *Bundle) rememberTombstone(key string, was Component) {
+	if b.Tombstones == nil {
+		b.Tombstones = map[string]Component{}
+	}
+	if prev, ok := b.Tombstones[key]; ok && prev.UniqueID != "" && was.UniqueID == "" {
+		return
+	}
+	b.Tombstones[key] = was
 }
 
 // Ptr returns a pointer to v.

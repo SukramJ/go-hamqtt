@@ -35,12 +35,74 @@ func Split(p mqtt.Publisher, s mqtt.Subscriber) publisher.Transport {
 	return adapter{pub: p, sub: s}
 }
 
+// TransportV311 wraps a whole client pinned to MQTT 3.1.1, and is the
+// constructor to use when [mqtt.TCPConfig].ProtocolVersion is
+// [mqtt.ProtocolV311].
+//
+// It exists because the capability the ordinary adapter advertises cannot be
+// honoured on that dialect, and the difference decides WHERE a consumer finds
+// out. [Transport] statically implements [publisher.AttributingSubscriber]
+// whatever the wrapped client is talking — a Go type cannot carry a value's
+// protocol version — so a v3.1.1 consumer's overlapping command routes are
+// accepted at [publisher.CommandRouter.Handle] and the refusal lands at
+// [publisher.CommandRouter.Start] instead, as
+// [publisher.ErrAttributionUnavailable]. That refusal is correct and it is
+// visible, but it is a boot failure where a composition-root error was
+// available: an MQTT 3.1.1 link has no property block to carry a Subscription
+// Identifier, and that is known before the first SUBSCRIBE.
+//
+// This adapter therefore does not claim the capability. A router over it
+// refuses an overlapping pair at registration with
+// [publisher.ErrAmbiguousRoutes] wrapping
+// [publisher.ErrAttributionUnavailable] — which is what the README described
+// and the shipped adapter did not do.
+//
+// It does not offer [publisher.NoLocalSubscriber] either, for the same
+// reason: No Local is MQTT 5.0 §3.8.3.1 and a v3.1.1 broker ignores the
+// option, so claiming it would describe a protection that is not there.
+// [publisher.CommandRouter.CheckDisjoint] is the guard that works on both
+// dialects, and on this one it is the only one.
+func TransportV311(c mqtt.Client) publisher.Transport { return SplitV311(c, c) }
+
+// SplitV311 is [Split] for a client pinned to MQTT 3.1.1. See [TransportV311]
+// for what it withholds and why withholding it is the point.
+func SplitV311(p mqtt.Publisher, s mqtt.Subscriber) publisher.Transport {
+	return v311Adapter{inner: adapter{pub: p, sub: s}}
+}
+
+// v311Adapter is [adapter] with the two MQTT 5.0-only capabilities withheld.
+//
+// A wrapper rather than a flag on adapter, because the capabilities are
+// interfaces: the router resolves them with a type assertion at construction,
+// so the only way to withhold one is to be a type that does not have the
+// method. Embedding would promote them and defeat the purpose, so the inner
+// adapter is a named field and the three [publisher.Transport] methods are
+// forwarded explicitly.
+type v311Adapter struct{ inner adapter }
+
+// Publish implements [publisher.Transport].
+func (v v311Adapter) Publish(ctx context.Context, topic string, payload []byte, qos byte, retain bool) error {
+	return v.inner.Publish(ctx, topic, payload, qos, retain)
+}
+
+// Subscribe implements [publisher.Transport], without No Local and without a
+// Subscription Identifier — neither exists on this dialect.
+func (v v311Adapter) Subscribe(ctx context.Context, filter string, qos byte, h publisher.Handler) error {
+	return v.inner.Subscribe(ctx, filter, qos, h)
+}
+
+// Unsubscribe implements [publisher.Transport].
+func (v v311Adapter) Unsubscribe(ctx context.Context, filter string) error {
+	return v.inner.Unsubscribe(ctx, filter)
+}
+
 // Compile-time assertions that the adapter carries both optional
 // capabilities, so the command router takes its safe paths rather than
 // falling back silently.
 var (
 	_ publisher.NoLocalSubscriber     = adapter{}
 	_ publisher.AttributingSubscriber = adapter{}
+	_ publisher.Transport             = v311Adapter{}
 )
 
 // adapter is a value type: it holds two interfaces and no mutable state of
