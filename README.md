@@ -295,10 +295,17 @@ Seven more facts it encodes, each measured:
 Two tools read a capture rather than a broker — subscribing needs credentials,
 a network path and a transport dependency this module does not have.
 
+Build them first — they are not committed, and neither is any other binary:
+
+```sh
+make tools                   # -> bin/hacheck, bin/hadoctor
+# or: go install github.com/SukramJ/go-hamqtt/cmd/hacheck@latest
+```
+
 ```sh
 mosquitto_sub -h broker -t '#' -v -W 5 | <to-ndjson> > capture.ndjson
-hacheck  < capture.ndjson    # one payload at a time, against the platform schemas
-hadoctor < capture.ndjson    # the whole capture at once
+bin/hacheck  < capture.ndjson    # one payload at a time, against the platform schemas
+bin/hadoctor < capture.ndjson    # the whole capture at once
 ```
 
 `hacheck` answers "is this payload legal", plus two wiring questions a single
