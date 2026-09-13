@@ -84,9 +84,35 @@ type Component struct {
 	// discovery key on any platform as of Home Assistant 2026.9 — it was
 	// replaced by this one — and Home Assistant drops unknown keys in
 	// silence, so publishing it does nothing at all.
-	DefaultEntityID  string                   `json:"default_entity_id,omitempty"`
-	DeviceClass      string                   `json:"device_class,omitempty"`
-	StateClass       hacatalog.StateClass     `json:"state_class,omitempty"`
+	DefaultEntityID string               `json:"default_entity_id,omitempty"`
+	DeviceClass     string               `json:"device_class,omitempty"`
+	StateClass      hacatalog.StateClass `json:"state_class,omitempty"`
+	// UnitOfMeasure is `omitempty`, so an empty string is an absent key and
+	// there is deliberately no second field — no `*string`, no sentinel — to
+	// publish `"unit_of_measurement": ""`.
+	//
+	// Unlike NameNull below, which exists because Home Assistant reads an
+	// explicit null differently from an absent key, a blank unit is not a
+	// distinction MQTT discovery can carry. The MQTT sensor platform strips it
+	// during schema validation, before the entity is ever constructed —
+	// `components/mqtt/sensor.py`:
+	//
+	//	if (
+	//	    unit_of_measurement := config.get(CONF_UNIT_OF_MEASUREMENT)
+	//	) is not None and not unit_of_measurement.strip():
+	//	    config.pop(CONF_UNIT_OF_MEASUREMENT)
+	//
+	// and that validator wraps both PLATFORM_SCHEMA_MODERN and
+	// DISCOVERY_SCHEMA, so it covers the discovery path this package feeds.
+	// (Core's generic helpers/entity.py guards the state attribute with
+	// `is not None` and would show an empty unit, but no MQTT payload can
+	// reach that branch.)
+	//
+	// So publishing the empty string is exactly equivalent to omitting the
+	// key, and a consumer migrating a fleet that emits it is reproducing a
+	// no-op. Where byte-equality against an already-published payload is the
+	// goal, Extra is the right and sufficient route — it is validated like any
+	// other key. Where it is not, the key is better dropped.
 	UnitOfMeasure    string                   `json:"unit_of_measurement,omitempty"`
 	Icon             string                   `json:"icon,omitempty"`
 	EntityCategory   hacatalog.EntityCategory `json:"entity_category,omitempty"`

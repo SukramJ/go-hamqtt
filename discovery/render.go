@@ -163,6 +163,29 @@ type Dynamic interface {
 // Suppression is applied here: entities named by a [model.Suppressor] are left
 // out of the bundle. Their datapoints keep publishing, because the suppressing
 // entity's own topics point at them.
+//
+// # What Render refuses, and what it leaves to Validate
+//
+// Render refuses exactly one thing: two entities with the same
+// [model.Entity.Key], which the components map would otherwise swallow in
+// silence. That is a losslessness guard on the document — a bundle must contain
+// every entity it was handed — not a judgement about what Home Assistant will
+// accept. Every such judgement lives in [Validate], which the caller invokes
+// deliberately.
+//
+// The division is on purpose and it is worth stating, because the two do
+// disagree: Render will happily build a bundle that Validate then refuses. The
+// most obvious case is two components sharing a platform and a `unique_id`
+// (see [identityKey]) — distinct keys, so Render passes them through, and a
+// real registry collision, so Validate reports it.
+//
+// Folding Validate into Render would make that failure automatic, and the
+// failure is fail-closed: an invalid bundle publishes nothing at all, so one
+// bad component costs a device all of its entities. [ValidateIgnoring]
+// documents what that cost measured on a real fleet. A consumer that wants the
+// check on its publish path is one call away from it and keeps the choice of
+// what to do with the answer — publish anyway, drop the component, or withhold
+// the device — which is a choice this package should not be making for it.
 func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Origin) (*Bundle, error) {
 	if dev == nil {
 		return nil, fmt.Errorf("discovery: no device")

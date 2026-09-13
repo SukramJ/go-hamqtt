@@ -133,7 +133,7 @@ func ValidateIgnoring(b *Bundle, ignore map[string]bool) error {
 		return err
 	}
 
-	seenUnique := map[string]string{}
+	seenUnique := map[identityKey]string{}
 	for _, key := range b.Keys() {
 		comp := b.Components[key]
 		validateComponent(issues, key, comp, mqtt, relations, deviceClasses, seenUnique, ignore)
@@ -188,6 +188,55 @@ func componentBody(comp Component) (map[string]any, error) {
 	return body, nil
 }
 
+// identityKey is what Home Assistant actually keys entity uniqueness on, as
+// far as a bundle can observe it: the pair (platform, unique_id).
+//
+// The registry's index is a three-part key, not the `unique_id` alone.
+// `homeassistant/helpers/entity_registry.py` declares it as
+//
+//	self._index: dict[tuple[str, str, str], str] = {}
+//	...
+//	self._index[(entry.domain, entry.platform, entry.unique_id)] = entry.entity_id
+//
+// where — in the registry's vocabulary, which inverts the developer docs' —
+// `domain` is the entity component (`sensor`, `number`) and `platform` is the
+// integration (`mqtt`). `async_get_entity_id(domain, platform, unique_id)`,
+// `async_get_or_create`, the `deleted_entities` index and the unique-id-change
+// guard that raises "Unique id '%s' is already in use by '%s'" all consult that
+// same triple, as does `entity_platform.py`'s runtime check behind the familiar
+// "Platform %s does not generate unique IDs" error. The developer documentation
+// says the same thing in prose: "An entity is looked up in the registry based
+// on a combination of the platform type (for example, `light`), and the
+// integration name (domain) (for example, hue) and the unique ID of the
+// entity."
+//
+//   - https://github.com/home-assistant/core/blob/dev/homeassistant/helpers/entity_registry.py
+//   - https://github.com/home-assistant/core/blob/dev/homeassistant/helpers/entity_platform.py
+//   - https://developers.home-assistant.io/docs/entity_registry_index/
+//
+// Every component in a bundle is published by the one `mqtt` integration, so
+// the integration half of the triple is constant and a bundle can only vary the
+// other two. A `sensor` and a `number` carrying the same `unique_id` therefore
+// index to two distinct keys and both register: that is not a collision, and
+// refusing it — as this validator did through v0.31.0 — is stricter than the
+// platform being modelled. One measured consumer publishes nine such pairs and
+// has done so in production for years.
+//
+// Two components sharing a platform *and* a `unique_id` really do collide, on
+// the registry's own terms, so that stays a blocking issue.
+//
+// Nothing in the MQTT integration narrows this further for the device-bundle
+// form. `components/mqtt/discovery.py` never mentions `unique_id` at all;
+// `DEVICE_DISCOVERY_SCHEMA`'s validation over `cmps` is `check_unique_id`, a
+// presence requirement; and the conflict behind "Received a conflicting MQTT
+// discovery message" is keyed on `(component, discovery_id)` and the discovery
+// topic, never on `unique_id`. The bundled path fans `cmps` out into per-
+// component configs that then travel the identical per-entity machinery.
+type identityKey struct {
+	platform string
+	uniqueID string
+}
+
 func validateComponent(
 	issues *issueList,
 	key string,
@@ -195,7 +244,7 @@ func validateComponent(
 	mqtt hacatalog.MQTT,
 	relations hacatalog.Relations,
 	deviceClasses map[string][]string,
-	seenUnique map[string]string,
+	seenUnique map[identityKey]string,
 	ignore map[string]bool,
 ) {
 	body, err := componentBody(comp)
@@ -214,7 +263,7 @@ func validateBody(
 	mqtt hacatalog.MQTT,
 	relations hacatalog.Relations,
 	deviceClasses map[string][]string,
-	seenUnique map[string]string,
+	seenUnique map[identityKey]string,
 	ignore map[string]bool,
 ) {
 	if platform == "" {
@@ -236,10 +285,12 @@ func validateBody(
 		return
 	}
 	if seenUnique != nil {
-		if prev, dup := seenUnique[uniqueID]; dup {
-			issues.add("%s: unique_id %q already used by %q", key, uniqueID, prev)
+		id := identityKey{platform: platform, uniqueID: uniqueID}
+		if prev, dup := seenUnique[id]; dup {
+			issues.add("%s: unique_id %q already used by %q on platform %q",
+				key, uniqueID, prev, platform)
 		}
-		seenUnique[uniqueID] = key
+		seenUnique[id] = key
 	}
 
 	// Unknown keys: Home Assistant drops them silently (its discovery schema
