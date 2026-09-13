@@ -3,6 +3,11 @@
 
 package publisher
 
+import (
+	"errors"
+	"fmt"
+)
+
 // QoS is a configured MQTT quality-of-service level, as distinct from the
 // byte that goes on the wire.
 //
@@ -34,6 +39,12 @@ const (
 	// default applies. Every runtime type in this package defaults to
 	// [QoSAtLeastOnce] except [StateConfig.PulseQoS], which defaults to
 	// [QoSAtMostOnce].
+	//
+	// A level that came from a configuration file is never this. Convert it
+	// with [QoSFromWire], which maps the operator's 0 to [QoSAtMostOnce]
+	// and cannot produce QoSUnset at all: `QoS(cfg.QoS)` compiles, reads
+	// correctly, and turns a configured `MQTT_QOS: 0` into QoS 1 with
+	// nothing anywhere saying so.
 	QoSUnset QoS = 0
 
 	// QoSAtLeastOnce is MQTT QoS 1, and is the wire value so that a config
@@ -113,4 +124,55 @@ func resolveQoS(field string, q, def QoS) byte {
 			" is not a QoS level; use QoSAtMostOnce, QoSAtLeastOnce or QoSExactlyOnce")
 	}
 	return wire
+}
+
+// ErrQoSOutOfRange is returned by [QoSFromWire] for a byte that is not an
+// MQTT quality-of-service level.
+var ErrQoSOutOfRange = errors.New("publisher: qos must be 0, 1 or 2")
+
+// QoSFromWire turns an operator-supplied 0, 1 or 2 into the [QoS] that means
+// it, and refuses anything else.
+//
+// This is the one conversion every consumer in the family has to write, and
+// it is where the trap this type exists to create actually catches people.
+// `QoS(cfg.MQTT.QoS)` compiles, reads correctly and is wrong for exactly one
+// input: an operator who configured `MQTT_QOS: 0` gets [QoSUnset], which
+// every constructor here resolves to QoS 1. Nothing on the wire says so and
+// nothing in a log does either — the bridge simply publishes at a level its
+// own documentation promises it does not. It was recorded as a finding in
+// two separate consumer migrations (go-homeconnect2mqtt phase 7 F9,
+// "`MQTT_QOS: 0` becomes QoS 1 on migration"; go-mtec2mqtt steps 4+5, where
+// omitting the field "would have tripled this bridge's broker traffic and
+// changed the delivery guarantee of an installed base"), and both wrote this
+// function by hand to close it.
+//
+// The mapping is the only one that is not a guess: 0 is [QoSAtMostOnce] —
+// deliberate at most once, never "unset" — 1 is [QoSAtLeastOnce] and 2 is
+// [QoSExactlyOnce]. There is no input that produces [QoSUnset], which is the
+// point: a value that came from a configuration file is a statement, and
+// silence is the only thing that may resolve to a default.
+//
+// A consumer whose configuration is validated elsewhere usually wants this at
+// wiring time rather than on a publish path:
+//
+//	qos, err := publisher.QoSFromWire(cfg.MQTT.QoS)
+//	if err != nil {
+//		panic(err) // a composition-root mistake, like a nil transport
+//	}
+//
+// Pin the result off the transport call rather than off this constant: both
+// consumers that verify it assert on the QoS byte a stub was actually handed,
+// which is what kept the pin honest across three layers of plane migration
+// underneath it.
+func QoSFromWire(b byte) (QoS, error) {
+	switch b {
+	case 0:
+		return QoSAtMostOnce, nil
+	case 1:
+		return QoSAtLeastOnce, nil
+	case 2:
+		return QoSExactlyOnce, nil
+	default:
+		return QoSUnset, fmt.Errorf("%w, got %d", ErrQoSOutOfRange, b)
+	}
 }

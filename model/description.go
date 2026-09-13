@@ -35,7 +35,21 @@ const (
 	// LevelBridge is the bridge process itself, via its LWT. Every entity
 	// wants this: if the daemon dies, nothing it publishes is current.
 	LevelBridge AvailabilityLevel = iota + 1
-	// LevelDevice is the owning device's own reachability.
+	// LevelDevice is the owning device's own reachability, published to the
+	// topic the consumer's [topic.Layout] renders for the device's slot.
+	//
+	// It is half of the zero [Availability], and therefore the level a
+	// consumer acquires by saying nothing — which is the trap. A bridge
+	// that publishes no per-device availability topic still gets this
+	// entry, and under the default mode `all` Home Assistant requires every
+	// listed source to say `online`: a source nobody publishes is not
+	// neutral, it is the entity unavailable forever. Measured twice in the
+	// ADR 0070 fan-out, in bridges that would have taken the default: 100
+	// entities for one, 264 for another, with nothing on the wire and
+	// nothing in any log to say why. A consumer in that position states
+	// [BridgeOnly]; one that does publish the topic takes the default and
+	// is right to. discovery.CheckAvailability is how a consumer pins which
+	// of the two it is, once, instead of finding out from a broker capture.
 	LevelDevice
 	// LevelParent is the device named by [Device.Via]. A switch behind an
 	// unreachable gateway is unreachable whatever it last said.
@@ -93,12 +107,23 @@ const (
 // [NoAvailability].
 type Availability struct {
 	// Levels are the sources. Empty means the default: bridge and device.
+	//
+	// Empty is a real statement with a real cost, not a blank. See
+	// [LevelDevice]: a consumer that publishes no per-device availability
+	// topic and leaves this empty greys out its whole fleet, silently.
 	Levels []AvailabilityLevel
 	// Mode combines them. Empty means [AvailabilityAll].
 	Mode AvailabilityMode
 }
 
 // Resolved returns the effective levels and mode, applying the defaults.
+//
+// The default is {[LevelBridge], [LevelDevice]} with mode [AvailabilityAll],
+// and it is right for a consumer that publishes both topics and catastrophic
+// for one that does not — see [LevelDevice]. It cannot be narrowed without
+// breaking the consumers it is right for, which is why the check that a
+// declared level names a topic somebody publishes lives in
+// discovery.CheckAvailability, where the consumer can state the answer.
 //
 // [LevelNone] resolves to no levels AND no mode, which is what suppresses
 // `availability_mode` along with the list — a mode beside an absent list is

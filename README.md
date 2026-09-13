@@ -68,8 +68,23 @@ if err != nil {
 if err := discovery.Validate(bundle); err != nil {
     return err // nothing is published for this device
 }
+// Say which availability topics this bridge actually publishes. The zero
+// model.Availability resolves to {LevelBridge, LevelDevice}, and a source
+// nobody publishes is not neutral under availability_mode: all — it is every
+// entity unavailable forever, with nothing on the wire and nothing in a log.
+if err := discovery.CheckBundleAvailability(bundle, func(t string) bool {
+    return t == ctx.Layout.Bridge() // bridge-only: state model.BridgeOnly()
+}); err != nil {
+    return err
+}
 // publish bundle at bundle.Topic(prefix), retained
 ```
+
+That check is the one thing this module cannot decide for a consumer. The
+default is exactly right for a bridge that publishes a per-device availability
+topic and catastrophic for one that does not — measured at 100 and 264
+permanently unavailable entities in two bridges that would have taken it — so
+the library asks rather than guesses.
 
 ## Publishing
 
@@ -103,8 +118,9 @@ Four facts it encodes, each measured rather than chosen:
   while a per-entity config for the same `unique_id` is still retained, and
   the refusal is a `WARNING` in its log and nothing else. It is symmetric, so
   the rollback needs the same care.
-- **The dedup store survives reconnects** and holds the bytes, not a digest —
-  the birth resync replays them.
+- **The dedup store holds the bytes, not a digest** — the birth resync
+  replays them. The gate over them is per connection, not per process: see
+  `Runtime.Reset` and `publisher.Generational` below.
 - **The sweep recognises both topic forms.** Matching only
   `<prefix>/<platform>/<node>/<object>/config` makes every
   `<prefix>/device/<node>/config` invisible, and a broker keeps those forever.
@@ -206,8 +222,9 @@ if err := router.CheckDisjoint(append(readable, layout.Bridge())...); err != nil
     return err
 }
 
-// AFTER the boot snapshot, never before it.
-_, _ = run.Sweep(ctx, publisher.SweepRequest{Owns: mine})
+// AFTER the boot snapshot, never before it. SelfClaimed scopes the pass to
+// what this process published, which no sibling instance can forge.
+_, _ = run.Sweep(ctx, publisher.SweepRequest{SelfClaimed: true})
 ```
 
 Reconnect restores all four, and they are not interchangeable:
@@ -215,6 +232,7 @@ Reconnect restores all four, and they are not interchangeable:
 ```go
 lc.OnConnect(func(ctx context.Context) {
     _ = run.AnnounceOnline(ctx)
+    run.Reset()                 // its memos describe the connection that just died
     _, _ = run.Republish(ctx)   // cached bytes: HA does not always re-read retained configs
     avail.Reset()               // the gate still believes every device is online
     _, _ = avail.Device(ctx, publisher.DeviceSlot(dev, power), true)
@@ -231,8 +249,27 @@ _ = avail.RetractDevice(ctx, publisher.DeviceSlot(dev, power))
 _, _ = state.EvictPrefix(ctx, layout.State(model.Slot{Address: dev.UID()}))
 ```
 
-Five more facts it encodes, each measured:
+Seven more facts it encodes, each measured:
 
+- **A `Runtime` is a statement about one connection.** Everything it remembers
+  is about what a broker holds, and at QoS 0 a successful publish only means
+  the bytes reached a socket. One bridge shipped the consequence: a round of
+  retractions was flushed to a dying connection and memoised as done, so the
+  retry after the reconnect re-sent `retractions re-sent = 0, document
+  published = true, configs still retained = 1` — and Home Assistant answers
+  that with one `WARNING [mqtt.entity] Received a conflicting MQTT discovery
+  message` and no entities. Rebuild the runtime per connection (a
+  `func() *publisher.Runtime` factory called from the connect hook), or call
+  `run.Reset()` there, or implement `publisher.Generational` on the transport
+  and it happens by itself.
+- **A sweep's ownership rule can be safe by construction.**
+  `SweepRequest.SelfClaimed` scopes a pass to the topics this process has
+  itself published. Every consumer that instead keyed ownership on a payload
+  field keyed it on `state_topic` — and `button` and `climate` payloads carry
+  none, 24 of 264 configs for one bridge, so the rule collapsed to a shared
+  prefix and a sibling instance's entities were deleted from a live Home
+  Assistant. The cost is stated rather than hidden: a claim list cannot clear
+  what an *earlier* process left behind.
 - **`Reset` before the availability republish, or the fleet is lost.** The
   gate suppresses a flip it thinks the broker already has. A broker back
   without a persistent retained store holds nothing, and every entity then

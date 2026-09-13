@@ -22,6 +22,11 @@ import (
 // consumer's declared set would clear every entity of every other
 // integration on the broker. There is no sane default for "mine", so the
 // sweep will not guess one.
+//
+// Two answers satisfy it: [SweepRequest.Owns], a predicate over the parsed
+// topic, and [SweepRequest.SelfClaimed], which scopes the pass to what this
+// process has itself published. The second is the one that cannot be got
+// wrong.
 var ErrSweepUnscoped = errors.New("publisher: sweep needs an ownership predicate")
 
 // SweepRequest parameterises one orphan pass.
@@ -43,7 +48,52 @@ type SweepRequest struct {
 	//
 	// It is called from the transport's read loop, so it must be cheap and
 	// must not publish.
+	//
+	// A predicate is the wider of the two ownership rules this type offers
+	// and the only one that can clear an orphan left by an EARLIER process.
+	// It is also the one that has to be got right: see [SweepRequest.SelfClaimed]
+	// for the rule that cannot be got wrong, and for the measured cost of
+	// getting this one wrong.
 	Owns func(t ConfigTopic) bool
+
+	// SelfClaimed scopes the pass to the retained config topics THIS
+	// process has published — [Runtime.Claimed] — and it satisfies
+	// [ErrSweepUnscoped] on its own.
+	//
+	// It is the ownership rule that is safe by construction rather than by
+	// a predicate being written correctly, and the difference is measured
+	// in deleted entities. Every consumer that keyed ownership on a payload
+	// field keyed it on `state_topic` under its own root, and `button` and
+	// `climate` payloads carry no `state_topic` at all: 24 of 264 configs
+	// for one consumer (14 climate, 10 button), 20 of 687 for another, 39
+	// of 9996 for a third. Where the missing field let the rule collapse to
+	// a shared namespace prefix, a sibling instance's entities were deleted
+	// from a live Home Assistant — proven by driving the sweep, and
+	// invisible to every test that asked the predicate instead. The rule
+	// the audit derived is that when the keyed field is absent, what
+	// remains must still be instance-specific; a claim list is the only
+	// shape where that holds by construction, because having published a
+	// topic is the one fact about it no sibling can forge and no payload
+	// can be made to carry.
+	//
+	// What it buys, precisely: a topic is owned when this process published
+	// it, and a retracting pass clears the owned topics it no longer
+	// declares — an entity dropped at runtime, or a retraction the broker
+	// never applied. What it does NOT buy, and this is not a gap to work
+	// around: a config left behind by an EARLIER run of this daemon is not
+	// cleared, because from the wire it is indistinguishable from a sibling
+	// instance's live entity. A consumer that needs those cleared and can
+	// prove ownership from the topic — a node-id namespace no other writer
+	// shares — states [SweepRequest.Owns] instead and accepts that it is
+	// then responsible for the proof. A consumer that cannot prove it, like
+	// one whose second console publishes byte-identical topics, unique ids,
+	// availability topics AND state topics, reports the leftovers rather
+	// than clearing them: run [SweepRequest.ReportOnly] with a wide Owns,
+	// log [SweepResult.Unclaimed], and leave the retraction to an operator.
+	//
+	// Setting both is legal and means both must agree, which only ever
+	// narrows the pass.
+	SelfClaimed bool
 
 	// Window overrides [Config.SweepWindow] for this pass.
 	Window time.Duration
@@ -158,8 +208,9 @@ type SweepResult struct {
 //
 // The mechanism is a short snapshot subscription over `<prefix>/#`: every
 // retained config the broker replays is parsed, scoped by
-// [SweepRequest.Owns], and compared against what this process has claimed.
-// Anything owned and unclaimed is a leftover and gets retracted.
+// [SweepRequest.Owns] or [SweepRequest.SelfClaimed], and compared against
+// what this process has claimed. Anything owned and unclaimed is a leftover
+// and gets retracted.
 //
 // Ordering matters twice, and both are measured rather than chosen:
 //
@@ -184,9 +235,10 @@ type SweepResult struct {
 // that is the version which may run before the first publish. This one may
 // not.
 func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, error) {
-	if req.Owns == nil {
+	if req.Owns == nil && !req.SelfClaimed {
 		return SweepResult{}, ErrSweepUnscoped
 	}
+	r.checkGeneration()
 	window := req.Window
 	if window <= 0 {
 		window = r.cfg.SweepWindow
@@ -218,7 +270,7 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 			return
 		}
 		parsed, ok := ParseConfigTopic(r.cfg.Prefix, topic)
-		if !ok || !req.Owns(parsed) {
+		if !ok || !r.ownsForSweep(req, topic, parsed) {
 			return
 		}
 		mu.Lock()
@@ -306,6 +358,26 @@ func (r *Runtime) Sweep(ctx context.Context, req SweepRequest) (SweepResult, err
 		slog.Int("inspected", result.Inspected),
 		slog.Int("retracted", len(result.Retracted)))
 	return result, nil
+}
+
+// ownsForSweep applies the pass's ownership rule, which is a conjunction
+// rather than a choice: a claim list and a predicate stated together both
+// have to agree, so adding either one can only ever narrow a pass.
+func (r *Runtime) ownsForSweep(req SweepRequest, topic string, parsed ConfigTopic) bool {
+	if req.SelfClaimed && !r.hasClaimed(topic) {
+		return false
+	}
+	if req.Owns != nil && !req.Owns(parsed) {
+		return false
+	}
+	return true
+}
+
+// hasClaimed reports whether this process has ever published topic.
+func (r *Runtime) hasClaimed(topic string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.claimed[topic]
 }
 
 // claims reports whether this process is responsible for topic.

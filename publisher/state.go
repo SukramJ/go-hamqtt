@@ -150,6 +150,15 @@ type StateConfig struct {
 	// This is the one field in the package whose default is
 	// [QoSAtMostOnce], so here [QoSUnset] and [QoSAtMostOnce] resolve to
 	// the same wire byte.
+	//
+	// That equality is exactly why stating it anyway is worth the line. A
+	// plane that states [StateConfig.QoS] and leaves this one alone
+	// publishes its pulses at QoS 0 whatever the operator configured, and
+	// the two only differ when the operator did not choose 0 — so a
+	// single-configuration test never sees it. Leaving them unequal is a
+	// warning at construction, `publisher.state.pulse_qos_unstated`, and
+	// [QoSFromWire] is how an operator's byte reaches either field without
+	// a deliberate 0 becoming an accidental 1.
 	PulseQoS QoS
 
 	// Encoding selects the payload shape [StatePublisher.PublishValue]
@@ -281,6 +290,26 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if cfg.QoS != QoSUnset && cfg.PulseQoS == QoSUnset {
+		// Said out loud rather than refused, because a consumer that
+		// publishes no pulses at all is entitled to leave the field alone
+		// and a refusal would break it. It is nevertheless the one
+		// asymmetry in the package worth a line at boot: PulseQoS is the
+		// only field here whose default is QoS 0, so a plane that stated
+		// its state QoS and forgot this one publishes its pulses at a
+		// level nobody chose — and only when the two differ, which is why
+		// a single-configuration test never sees it. Measured as
+		// go-homeconnect2mqtt phase 7's load-bearing catch: "a plane that
+		// stated StateConfig.QoS and forgot it would publish a whole
+		// MQTT_RETAIN: false fleet at a level nobody chose, and only at
+		// MQTT_QOS: 1".
+		logger.Warn("publisher.state.pulse_qos_unstated",
+			slog.String("state_qos", cfg.QoS.String()),
+			slog.String("pulse_qos", QoSAtMostOnce.String()),
+			slog.String("effect",
+				"StateConfig.QoS is stated and StateConfig.PulseQoS is not, so pulses publish at QoS 0; "+
+					"state it with QoSAtMostOnce to say so deliberately"))
 	}
 	return &StatePublisher{
 		tr:        tr,

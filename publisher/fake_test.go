@@ -171,6 +171,14 @@ func (f *fakeTransport) count(kind string) int {
 	return n
 }
 
+// reset forgets the recorded calls without touching what the broker
+// retains, which is how a test says "a new connection starts here".
+func (f *fakeTransport) reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = nil
+}
+
 func (f *fakeTransport) seed(topic string, payload []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
