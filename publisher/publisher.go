@@ -259,6 +259,17 @@ func New(tr Transport, cfg Config) *Runtime {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// Said once, at boot, because nothing else says it. LegacyEntityTopics
+	// REPLACES the default rather than adding to it, so a consumer that
+	// states one form silently stops retracting the other — and the
+	// symptom of retracting the wrong form is a migration that looks clean
+	// and changes nothing: the bundle publishes, the log is quiet, and Home
+	// Assistant refuses the document with one WARNING of its own. For a
+	// fleet spanning releases this line is the cheapest evidence there is.
+	logger.Info("publisher.legacy_forms",
+		slog.Any("forms", legacyFormNames(cfg.LegacyEntityTopics)),
+		slog.Bool("stated", len(cfg.LegacyEntityTopics) > 0))
+
 	return &Runtime{
 		tr:         tr,
 		cfg:        cfg,
@@ -268,6 +279,25 @@ func New(tr Transport, cfg Config) *Runtime {
 		announced:  map[string]bool{},
 		superseded: map[string]bool{},
 	}
+}
+
+// LegacyForms names the per-entity topic forms [Runtime.PublishBundle]
+// retracts under, in the order they were stated.
+//
+// Exported for the boot log and for a consumer's own assertion, and it
+// answers a question that had no answer: [Config.LegacyEntityTopics] replaces
+// the default rather than extending it, so naming one form silently stops
+// retracting the other, and the failure that follows is a migration that
+// looks entirely clean — the bundle publishes, this module logs nothing, and
+// the only evidence is one WARNING from Home Assistant and a fleet of
+// entities that kept their old configs. The measured fleet is
+// go-zendure2mqtt's 29 configs, ADR 0070 phase 5, 2026-09-12.
+//
+// A consumer that stated nothing sees the default named explicitly, because
+// "unset" and "the five-segment form" are one behaviour and only one of the
+// two spellings helps an operator.
+func (r *Runtime) LegacyForms() []string {
+	return legacyFormNames(r.cfg.LegacyEntityTopics)
 }
 
 // BridgeTopic is the consumer's own availability topic, after
