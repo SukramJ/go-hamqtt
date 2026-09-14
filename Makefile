@@ -21,10 +21,22 @@ export CGO_ENABLED := 0
 help: ## show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
+# Tool versions, pinned to match .github/workflows/ci.yml. A local gate is
+# only usable if it reports what CI reports, so the two lists must be bumped
+# together — raise both, run `make check`, and fix or justify whatever the
+# new release finds in the same change.
+#
+# gofumpt is the sharpest case, twice over. It is a formatter, so an upstream
+# release rewraps untouched code; and `make generate` runs it over
+# discovery/gen_fields.go, which CI then diffs — so a developer on a
+# different gofumpt regenerates a file CI rejects.
+GOFUMPT_VERSION       ?= v0.11.0
+GOLANGCI_LINT_VERSION ?= v2.12.2
+
 .PHONY: setup
 setup: ## install developer tooling (gofumpt, golangci-lint)
-	$(GO) install mvdan.cc/gofumpt@latest
-	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	$(GO) install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 .PHONY: test
 test: ## run the full test suite with race detector
