@@ -17,6 +17,7 @@ package catalog
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 
@@ -430,12 +431,7 @@ func (s *Static) Entities(_ context.Context, dev *model.Device) ([]model.Entity,
 }
 
 func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 func containsFoldString(haystack []string, needle string) bool {
@@ -467,21 +463,11 @@ func containsFold(haystack, needle string) bool {
 }
 
 func containsPlatform(haystack []hacatalog.Platform, needle hacatalog.Platform) bool {
-	for _, p := range haystack {
-		if p == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 func containsBucket(haystack []model.Bucket, needle model.Bucket) bool {
-	for _, b := range haystack {
-		if b == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 func hasModelPrefix(prefixes []string, dev *model.Device) bool {

@@ -24,12 +24,10 @@ func (r *runButton) Methods() []string { return r.methods }
 
 func newRunButton(methods ...string) *runButton {
 	return &runButton{
-		Basic: model.Basic{
-			EntityKey:      "execute",
-			EntityPlatform: hacatalog.PlatformButton,
-			Description:    model.Description{Name: model.L("Execute")},
-		},
-		methods: methods,
+		EntityKey:      "execute",
+		EntityPlatform: hacatalog.PlatformButton,
+		Description:    model.Description{Name: model.L("Execute")},
+		methods:        methods,
 	}
 }
 

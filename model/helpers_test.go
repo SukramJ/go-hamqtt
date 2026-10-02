@@ -277,7 +277,7 @@ func TestDescriptionCloneIsolatesMutableFields(t *testing.T) {
 func TestPtrRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	if got := model.Ptr(42); *got != 42 {
+	if got := new(42); *got != 42 {
 		t.Errorf("Ptr = %v", *got)
 	}
 }

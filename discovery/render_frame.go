@@ -4,6 +4,7 @@
 package discovery
 
 import (
+	"maps"
 	"reflect"
 
 	"github.com/SukramJ/go-hamqtt/model"
@@ -97,11 +98,7 @@ func mergeExtraUnder(own, frame map[string]any) map[string]any {
 		return nil
 	}
 	out := make(map[string]any, len(own)+len(frame))
-	for k, v := range frame {
-		out[k] = v
-	}
-	for k, v := range own {
-		out[k] = v
-	}
+	maps.Copy(out, frame)
+	maps.Copy(out, own)
 	return out
 }

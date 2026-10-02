@@ -3,7 +3,10 @@
 
 package model
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // Bucket says what kind of datapoint a slot addresses. It exists because the
 // same device exposes values with different lifecycles and different Home
@@ -129,19 +132,12 @@ func (s Slot) Valid() bool {
 	if s.Address == "" || !s.Bucket.Valid() || len(s.Path) == 0 {
 		return false
 	}
-	for _, p := range s.Path {
-		if p == "" {
-			return false
-		}
+	if slices.Contains(s.Path, "") {
+		return false
 	}
 	// An empty scope segment would silently vanish from the rendered topic and
 	// move the datapoint one level up, into another device's tree.
-	for _, sc := range s.Scope {
-		if sc == "" {
-			return false
-		}
-	}
-	return true
+	return !slices.Contains(s.Scope, "")
 }
 
 // Key is a stable, comparable rendering of the slot, for use as a map key.

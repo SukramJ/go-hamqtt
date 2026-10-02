@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,7 +60,7 @@ type Envelope struct {
 // cache and two call sites marshalling the same value differently would each
 // think the other's payload was a change.
 func (e Envelope) JSON() ([]byte, error) {
-	b, err := json.Marshal(e)
+	b, err := json.Marshal(&e)
 	if err != nil {
 		return nil, fmt.Errorf("publisher: marshal state envelope: %w", err)
 	}
@@ -861,7 +862,7 @@ func (p *StatePublisher) Latency() StateLatency {
 	}
 	sorted := make([]time.Duration, len(p.samples))
 	copy(sorted, p.samples)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	ms := func(d time.Duration) float64 {
 		return float64(d.Nanoseconds()) / float64(time.Millisecond)
 	}

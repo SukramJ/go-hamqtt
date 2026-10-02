@@ -31,7 +31,7 @@ help: ## show this help
 # discovery/gen_fields.go, which CI then diffs — so a developer on a
 # different gofumpt regenerates a file CI rejects.
 GOFUMPT_VERSION       ?= v0.11.0
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.13.0
 
 .PHONY: setup
 setup: ## install developer tooling (gofumpt, golangci-lint)

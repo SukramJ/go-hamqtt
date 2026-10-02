@@ -28,6 +28,19 @@ PR #54 measured …", not "go-mtec2mqtt still …"). File-and-line references
 into another repository are out; references into *this* module's code are
 fine, because a change here moves them.
 
+## [Unreleased]
+
+## [0.35.0] - 2026-10-02
+
+### Changed
+
+- **Requires Go 1.27 or newer.** The `go` directive moved from 1.26 to
+  1.27, so a consumer building this module needs a Go 1.27 toolchain.
+  No exported API changed.
+- Requires go-mqtt v1.6.0 and go-ha-catalog v0.3.0 (both on Go 1.27). The
+  discovery field table is regenerated from catalog snapshot 2026.9.4; only
+  its provenance line changes, no field.
+
 ## [0.34.1] - 2026-09-13
 
 ### Removed

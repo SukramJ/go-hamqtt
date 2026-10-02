@@ -307,9 +307,9 @@ func newFleet(t *testing.T) *fleet {
 		EntityPlatform: hacatalog.PlatformNumber,
 		Description: model.Description{
 			Name: model.L("Target temperature"),
-			Min:  model.Ptr(16.0),
-			Max:  model.Ptr(30.0),
-			Step: model.Ptr(0.5),
+			Min:  new(16.0),
+			Max:  new(30.0),
+			Step: new(0.5),
 		},
 		Binds: []model.Binding{
 			{

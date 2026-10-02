@@ -65,19 +65,18 @@ func TestNoComponentKeySerialisesAZeroValue(t *testing.T) {
 	}
 
 	types := map[string]reflect.Type{
-		"Component":         reflect.TypeOf(discovery.Component{}),
-		"DeviceInfo":        reflect.TypeOf(discovery.DeviceInfo{}),
-		"AvailabilityEntry": reflect.TypeOf(discovery.AvailabilityEntry{}),
-		"Origin":            reflect.TypeOf(discovery.Origin{}),
-		"Bundle":            reflect.TypeOf(discovery.Bundle{}),
+		"Component":         reflect.TypeFor[discovery.Component](),
+		"DeviceInfo":        reflect.TypeFor[discovery.DeviceInfo](),
+		"AvailabilityEntry": reflect.TypeFor[discovery.AvailabilityEntry](),
+		"Origin":            reflect.TypeFor[discovery.Origin](),
+		"Bundle":            reflect.TypeFor[discovery.Bundle](),
 	}
 	for platform, zero := range discovery.FieldsIndex {
 		types[platform] = reflect.TypeOf(zero)
 	}
 
 	for owner, typ := range types {
-		for i := range typ.NumField() {
-			field := typ.Field(i)
+		for field := range typ.Fields() {
 			tag := field.Tag.Get("json")
 			name, opts, _ := strings.Cut(tag, ",")
 			if name == "" || name == "-" {
@@ -126,17 +125,15 @@ func TestButtonRendersNeitherStateTopicNorOptimistic(t *testing.T) {
 	dev := testDevice()
 	no := false
 	e := &pressButton{
-		Basic: model.Basic{
-			EntityKey:      "restart",
-			EntityPlatform: hacatalog.PlatformButton,
-			Description: model.Description{
-				Name:       model.L("Restart"),
-				Optimistic: &no,
-			},
-			Binds: []model.Binding{
-				{Role: model.RoleState, Slot: model.S(dev.UID(), "", model.BucketValues, "RESTART"), Mode: model.Read},
-				{Role: model.RoleCommand, Slot: model.S(dev.UID(), "", model.BucketValues, "RESTART"), Mode: model.Write},
-			},
+		EntityKey:      "restart",
+		EntityPlatform: hacatalog.PlatformButton,
+		Description: model.Description{
+			Name:       model.L("Restart"),
+			Optimistic: &no,
+		},
+		Binds: []model.Binding{
+			{Role: model.RoleState, Slot: model.S(dev.UID(), "", model.BucketValues, "RESTART"), Mode: model.Read},
+			{Role: model.RoleCommand, Slot: model.S(dev.UID(), "", model.BucketValues, "RESTART"), Mode: model.Write},
 		},
 		methods: []string{"run"},
 	}
