@@ -143,9 +143,9 @@ func TestBoundsLandOnLegalKeys(t *testing.T) {
 	dev := testDevice()
 	desc := model.Description{
 		Name: model.L("Setpoint"),
-		Min:  model.Ptr(5.0),
-		Max:  model.Ptr(30.0),
-		Step: model.Ptr(0.5),
+		Min:  new(5.0),
+		Max:  new(30.0),
+		Step: new(0.5),
 	}
 
 	slot := model.S(dev.UID(), "", model.BucketValues, "setpoint")

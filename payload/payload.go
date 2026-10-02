@@ -27,7 +27,9 @@
 package payload
 
 import (
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -157,9 +159,7 @@ func ForWith(obj any, k Kind, opts Options) map[string]any {
 	}
 
 	if extra, ok := obj.(Extra); ok {
-		for key, value := range extra.ExtraPayload(k, opts) {
-			out[key] = value
-		}
+		maps.Copy(out, extra.ExtraPayload(k, opts))
 	}
 	return out
 }
@@ -171,9 +171,7 @@ func Merge(dst, src map[string]any) map[string]any {
 	if dst == nil {
 		dst = make(map[string]any, len(src))
 	}
-	for k, v := range src {
-		dst[k] = v
-	}
+	maps.Copy(dst, src)
 	return dst
 }
 
@@ -274,12 +272,7 @@ func parseTag(tag string) (kinds []string, alt string) {
 }
 
 func containsString(haystack []string, needle string) bool {
-	for _, s := range haystack {
-		if s == needle {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(haystack, needle)
 }
 
 // snake converts a Go field name to the snake_case a payload key uses.

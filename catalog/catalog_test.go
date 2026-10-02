@@ -42,12 +42,12 @@ func TestPriorityDecidesTheWinner(t *testing.T) {
 		{
 			Priority: 100,
 			Match:    catalog.Match{Models: []string{"FTXM"}},
-			Set:      catalog.Overlay{Icon: model.Ptr("mdi:specific")},
+			Set:      catalog.Overlay{Icon: new("mdi:specific")},
 		},
 		{
 			Priority: 10,
 			Match:    catalog.Match{Leaves: []string{"power"}},
-			Set:      catalog.Overlay{Icon: model.Ptr("mdi:general"), DeviceClass: model.Ptr(model.DeviceClass("power"))},
+			Set:      catalog.Overlay{Icon: new("mdi:general"), DeviceClass: model.Ptr(model.DeviceClass("power"))},
 		},
 	}
 
@@ -81,7 +81,7 @@ func TestUnsetIsNotZero(t *testing.T) {
 		t.Errorf("Icon = %q — a rule that never mentioned icons cleared one", e.Description.Icon)
 	}
 
-	clearing := catalog.Rules{{Set: catalog.Overlay{Icon: model.Ptr("")}}}
+	clearing := catalog.Rules{{Set: catalog.Overlay{Icon: new("")}}}
 	if err := clearing.Enrich(device("x"), e); err != nil {
 		t.Fatalf("Enrich: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestMatchCriteriaAreANDed(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Models: []string{"FTXM"}, Leaves: []string{"power"}},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:hit")},
+		Set:   catalog.Overlay{Icon: new("mdi:hit")},
 	}}
 
 	hit := entity("power", "power")
@@ -124,7 +124,7 @@ func TestModelMatchIsCaseInsensitivePrefix(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Models: []string{"hmip-"}},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:hit")},
+		Set:   catalog.Overlay{Icon: new("mdi:hit")},
 	}}
 	e := entity("x", "x")
 	if err := rules.Enrich(device("HmIP-BWTH"), e); err != nil {
@@ -142,7 +142,7 @@ func TestSuppressionIsTheSameMechanism(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Keys: []string{"noisy"}},
-		Set:   catalog.Overlay{Suppress: model.Ptr(true)},
+		Set:   catalog.Overlay{Suppress: new(true)},
 	}}
 
 	noisy := entity("noisy", "noisy")
@@ -260,7 +260,7 @@ func TestPlatformAndBucketCriteria(t *testing.T) {
 	rules := catalog.Rules{
 		{
 			Match: catalog.Match{Platforms: []hacatalog.Platform{hacatalog.PlatformSelect}},
-			Set:   catalog.Overlay{Icon: model.Ptr("mdi:select")},
+			Set:   catalog.Overlay{Icon: new("mdi:select")},
 		},
 		{
 			Match: catalog.Match{Buckets: []model.Bucket{model.BucketMaster}},
@@ -301,17 +301,17 @@ func TestOverlayAppliesEveryField(t *testing.T) {
 
 	opts := &model.Enum{Codes: []string{"a"}}
 	rules := catalog.Rules{{Set: catalog.Overlay{
-		Name:        model.Ptr(model.L("Renamed")),
+		Name:        new(model.L("Renamed")),
 		DeviceClass: model.Ptr(model.DeviceClass("energy")),
 		StateClass:  model.Ptr(hacatalog.StateClassTotalIncreasing),
 		Unit:        model.Ptr(model.Unit("kWh")),
-		Icon:        model.Ptr("mdi:flash"),
+		Icon:        new("mdi:flash"),
 		Category:    model.Ptr(hacatalog.EntityCategoryDiagnostic),
-		Enabled:     model.Ptr(false),
-		Precision:   model.Ptr(2),
-		Min:         model.Ptr(0.0),
-		Max:         model.Ptr(100.0),
-		Step:        model.Ptr(0.5),
+		Enabled:     new(false),
+		Precision:   new(2),
+		Min:         new(0.0),
+		Max:         new(100.0),
+		Step:        new(0.5),
 		Options:     opts,
 		Extra:       map[string]any{"custom": "value"},
 	}}}
@@ -358,7 +358,7 @@ func TestMatchOnAnEntityWithoutBindings(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Leaves: []string{"mode"}},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:hit")},
+		Set:   catalog.Overlay{Icon: new("mdi:hit")},
 	}}
 
 	// No state role, but a first binding the rule can fall back to.
@@ -394,7 +394,7 @@ func TestKeyContainsCoversTheLongTail(t *testing.T) {
 	t.Parallel()
 
 	rules := catalog.Rules{{
-		Match: catalog.Match{KeyContains: model.Ptr("temperature")},
+		Match: catalog.Match{KeyContains: new("temperature")},
 		Set:   catalog.Overlay{DeviceClass: model.Ptr(model.DeviceClass("temperature"))},
 	}}
 	hit := entity("outdoor_temperature", "x")
@@ -449,7 +449,7 @@ func TestLeafMatchIsCaseInsensitive(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Leaves: []string{"ACTUAL_TEMPERATURE"}},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:hit")},
+		Set:   catalog.Overlay{Icon: new("mdi:hit")},
 	}}
 	e := entity("actual_temperature", "actual_temperature")
 	if err := rules.Enrich(device("HmIP-BWTH"), e); err != nil {
@@ -467,11 +467,11 @@ func TestKeyContainsIsCaseInsensitiveButKeysAreNot(t *testing.T) {
 	t.Parallel()
 
 	rules := catalog.Rules{{
-		Match: catalog.Match{KeyContains: model.Ptr("TEMPERATURE")},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:substring")},
+		Match: catalog.Match{KeyContains: new("TEMPERATURE")},
+		Set:   catalog.Overlay{Icon: new("mdi:substring")},
 	}, {
 		Match: catalog.Match{Keys: []string{"ACTUAL_TEMPERATURE"}},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:exact")},
+		Set:   catalog.Overlay{Icon: new("mdi:exact")},
 	}}
 
 	e := entity("actual_temperature", "x")
@@ -491,7 +491,7 @@ func TestNameKeyIsHowARuleTableNamesAnEntity(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Leaves: []string{"level"}},
-		Set:   catalog.Overlay{NameKey: model.Ptr("pipe_level")},
+		Set:   catalog.Overlay{NameKey: new("pipe_level")},
 	}}
 	e := entity("level", "level")
 	if err := rules.Enrich(device("HmIP-eTRV"), e); err != nil {

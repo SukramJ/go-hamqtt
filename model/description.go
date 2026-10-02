@@ -3,7 +3,12 @@
 
 package model
 
-import hacatalog "github.com/SukramJ/go-ha-catalog"
+import (
+	"maps"
+	"slices"
+
+	hacatalog "github.com/SukramJ/go-ha-catalog"
+)
 
 // DeviceClass is Home Assistant's device class as a plain string.
 //
@@ -130,10 +135,8 @@ type Availability struct {
 // the one combination Home Assistant reads as a contradiction and the reason
 // the measured consumer had to clear both by hand.
 func (a Availability) Resolved() ([]AvailabilityLevel, AvailabilityMode) {
-	for _, l := range a.Levels {
-		if l == LevelNone {
-			return nil, ""
-		}
+	if slices.Contains(a.Levels, LevelNone) {
+		return nil, ""
 	}
 	levels := a.Levels
 	if len(levels) == 0 {
@@ -149,12 +152,7 @@ func (a Availability) Resolved() ([]AvailabilityLevel, AvailabilityMode) {
 // Has reports whether the resolved levels include l.
 func (a Availability) Has(l AvailabilityLevel) bool {
 	levels, _ := a.Resolved()
-	for _, have := range levels {
-		if have == l {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(levels, l)
 }
 
 // NoAvailability is the daemon-status case: an entity that must stay visible
@@ -378,33 +376,25 @@ func (d *Description) Clone() *Description {
 	out := *d
 	if d.Name.Lang != nil {
 		out.Name.Lang = make(map[string]string, len(d.Name.Lang))
-		for k, v := range d.Name.Lang {
-			out.Name.Lang[k] = v
-		}
+		maps.Copy(out.Name.Lang, d.Name.Lang)
 	}
 	if d.NameArgs != nil {
 		out.NameArgs = make(map[string]string, len(d.NameArgs))
-		for k, v := range d.NameArgs {
-			out.NameArgs[k] = v
-		}
+		maps.Copy(out.NameArgs, d.NameArgs)
 	}
 	if d.Availability.Levels != nil {
 		out.Availability.Levels = append([]AvailabilityLevel(nil), d.Availability.Levels...)
 	}
 	if d.Extra != nil {
 		out.Extra = make(map[string]any, len(d.Extra))
-		for k, v := range d.Extra {
-			out.Extra[k] = v
-		}
+		maps.Copy(out.Extra, d.Extra)
 	}
 	if d.Options != nil {
 		opts := *d.Options
 		opts.Codes = append([]string(nil), d.Options.Codes...)
 		if d.Options.Labels != nil {
 			opts.Labels = make(map[string]Localized, len(d.Options.Labels))
-			for k, v := range d.Options.Labels {
-				opts.Labels[k] = v
-			}
+			maps.Copy(opts.Labels, d.Options.Labels)
 		}
 		out.Options = &opts
 	}
@@ -423,4 +413,4 @@ const NoValueTemplate = "-"
 
 // Ptr returns a pointer to v. It exists because Description's tri-state fields
 // are pointers and a struct literal cannot take the address of a constant.
-func Ptr[T any](v T) *T { return &v }
+func Ptr[T any](v T) *T { return new(v) }

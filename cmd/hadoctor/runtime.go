@@ -283,8 +283,8 @@ func diagnoseOrphanAvailability(c *capture) []diagnosis {
 // firstSegment is the topic's tree root, which is the coarsest ownership
 // signal a capture offers.
 func firstSegment(topic string) string {
-	if i := strings.IndexByte(topic, '/'); i >= 0 {
-		return topic[:i]
+	if before, _, ok := strings.Cut(topic, "/"); ok {
+		return before
 	}
 	return topic
 }

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -258,9 +259,9 @@ func lastPublishQoS(t *testing.T, f *fakeTransport) byte {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for i := len(f.ops) - 1; i >= 0; i-- {
-		if f.ops[i].kind == "publish" {
-			return f.ops[i].qos
+	for _, v := range slices.Backward(f.ops) {
+		if v.kind == "publish" {
+			return v.qos
 		}
 	}
 	t.Fatal("no publish was recorded")

@@ -18,6 +18,7 @@
 package model
 
 import (
+	"slices"
 	"sort"
 	"strings"
 )
@@ -119,10 +120,8 @@ func (id Identity) Valid() bool {
 // after a DHCP reservation moved.
 func (id Identity) Equal(other Identity) bool {
 	for _, a := range id.IDs {
-		for _, b := range other.IDs {
-			if a == b {
-				return true
-			}
+		if slices.Contains(other.IDs, a) {
+			return true
 		}
 	}
 	return false

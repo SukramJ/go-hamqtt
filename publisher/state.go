@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -861,7 +862,7 @@ func (p *StatePublisher) Latency() StateLatency {
 	}
 	sorted := make([]time.Duration, len(p.samples))
 	copy(sorted, p.samples)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	ms := func(d time.Duration) float64 {
 		return float64(d.Nanoseconds()) / float64(time.Millisecond)
 	}

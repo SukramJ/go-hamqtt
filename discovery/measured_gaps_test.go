@@ -195,7 +195,7 @@ func TestOptimisticIsProjectedFromTheDescription(t *testing.T) {
 
 	body := gapBody(t, "relay", gapEntity("relay", hacatalog.PlatformSwitch, model.Description{
 		Name:       model.L("Relay"),
-		Optimistic: model.Ptr(false),
+		Optimistic: new(false),
 	}))
 	if body["optimistic"] != false {
 		t.Errorf("optimistic = %v, want an explicit false", body["optimistic"])
@@ -211,7 +211,7 @@ func TestOptimisticIsNotProjectedWhereTheSchemaDoesNotDeclareIt(t *testing.T) {
 
 	body := gapBody(t, "level", gapEntity("level", hacatalog.PlatformSensor, model.Description{
 		Name:       model.L("Level"),
-		Optimistic: model.Ptr(true),
+		Optimistic: new(true),
 	}))
 	if _, has := body["optimistic"]; has {
 		t.Error("optimistic was projected onto sensor, whose schema drops it in silence")
@@ -275,7 +275,7 @@ func TestRenderedDescriptionKeysValidate(t *testing.T) {
 
 	relay := gapEntity("relay", hacatalog.PlatformSwitch, model.Description{
 		Name:                   model.L("Relay"),
-		Optimistic:             model.Ptr(false),
+		Optimistic:             new(false),
 		JSONAttributesTopic:    "loom/ccu/hub/relay/attrs",
 		JSONAttributesTemplate: "{{ value_json | tojson }}",
 	})

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -346,9 +347,7 @@ func validateKeys(issues *issueList, key, platform string, body map[string]any, 
 			// that teaches a consumer to ignore the validator.
 			allowed = map[string]hacatalog.SchemaKey{}
 			for _, v := range schema.Variants {
-				for k, entry := range v.Keys {
-					allowed[k] = entry
-				}
+				maps.Copy(allowed, v.Keys)
 			}
 			checkRequired = false
 		}

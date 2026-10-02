@@ -1337,10 +1337,7 @@ func levelRank(parts []string, i int) int {
 // run a tournament: the routes matching one topic are pairwise comparable
 // (registration refused the rest), so they form a chain with one maximum.
 func compareSpecificity(a, b []string) (int, bool) {
-	n := len(a)
-	if len(b) > n {
-		n = len(b)
-	}
+	n := max(len(b), len(a))
 	aStricter, bStricter := false, false
 	for i := range n {
 		ra, rb := levelRank(a, i), levelRank(b, i)

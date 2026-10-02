@@ -60,7 +60,7 @@ func TestFieldsStructsCoverThePlatform(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadMQTT: %v", err)
 	}
-	componentKeys := jsonTags(reflect.TypeOf(discovery.Component{}))
+	componentKeys := jsonTags(reflect.TypeFor[discovery.Component]())
 	owned := map[string]bool{"platform": true, "device": true, "origin": true}
 	for _, k := range componentKeys {
 		owned[k] = true
@@ -163,8 +163,8 @@ func catalogKeys(mqtt hacatalog.MQTT, name string) (map[string]hacatalog.SchemaK
 
 func jsonTags(t reflect.Type) []string {
 	out := make([]string, 0, t.NumField())
-	for i := range t.NumField() {
-		name, _, _ := strings.Cut(t.Field(i).Tag.Get("json"), ",")
+	for field := range t.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
 		if name != "" && name != "-" {
 			out = append(out, name)
 		}
@@ -179,8 +179,8 @@ func TestPtrKeepsAZeroOnTheWire(t *testing.T) {
 	t.Parallel()
 
 	raw, err := json.Marshal(discovery.CoverFields{
-		PositionClosed: discovery.Ptr(0),
-		TiltOptimistic: discovery.Ptr(false),
+		PositionClosed: new(0),
+		TiltOptimistic: new(false),
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

@@ -23,16 +23,14 @@ func (c *categorised) Category() string { return c.category }
 
 func hubEntity(key, leaf, category string) *categorised {
 	return &categorised{
-		Basic: model.Basic{
-			EntityKey:      key,
-			EntityPlatform: hacatalog.PlatformSensor,
-			Description:    model.Description{Name: model.L(key)},
-			Binds: []model.Binding{{
-				Role: model.RoleState,
-				Slot: model.S("serial:A", "", model.BucketValues, leaf),
-				Mode: model.Read,
-			}},
-		},
+		EntityKey:      key,
+		EntityPlatform: hacatalog.PlatformSensor,
+		Description:    model.Description{Name: model.L(key)},
+		Binds: []model.Binding{{
+			Role: model.RoleState,
+			Slot: model.S("serial:A", "", model.BucketValues, leaf),
+			Mode: model.Read,
+		}},
 		category: category,
 	}
 }
@@ -47,7 +45,7 @@ func TestCategoryMatchesTheConsumersOwnClassification(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Categories: []string{"hub_sensor"}},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:hub")},
+		Set:   catalog.Overlay{Icon: new("mdi:hub")},
 	}}
 
 	hub := hubEntity("service_messages", "SERVICE_MESSAGES", "hub_sensor")
@@ -87,8 +85,8 @@ func TestPostfixDistinguishesNumberedParameters(t *testing.T) {
 	t.Parallel()
 
 	rules := catalog.Rules{{
-		Match: catalog.Match{Postfix: model.Ptr("_2")},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:two")},
+		Match: catalog.Match{Postfix: new("_2")},
+		Set:   catalog.Overlay{Icon: new("mdi:two")},
 	}}
 
 	for _, tc := range []struct {
@@ -112,8 +110,8 @@ func TestPostfixDistinguishesNumberedParameters(t *testing.T) {
 	// The leading underscore is optional in the rule; a table author writes
 	// it both ways and neither reading is surprising.
 	bare := catalog.Rules{{
-		Match: catalog.Match{Postfix: model.Ptr("2")},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:two")},
+		Match: catalog.Match{Postfix: new("2")},
+		Set:   catalog.Overlay{Icon: new("mdi:two")},
 	}}
 	e := entity("k", "LEVEL_2")
 	if err := bare.Enrich(device("X"), e); err != nil {
@@ -131,8 +129,8 @@ func TestNameContainsIsNotKeyContains(t *testing.T) {
 	t.Parallel()
 
 	rules := catalog.Rules{{
-		Match: catalog.Match{NameContains: model.Ptr("counter")},
-		Set:   catalog.Overlay{Icon: model.Ptr("mdi:counter")},
+		Match: catalog.Match{NameContains: new("counter")},
+		Set:   catalog.Overlay{Icon: new("mdi:counter")},
 	}}
 
 	e := entity("svhmipraincounter", "RAIN")
@@ -162,7 +160,7 @@ func TestMultiplierRidesOnTheDescription(t *testing.T) {
 
 	rules := catalog.Rules{{
 		Match: catalog.Match{Leaves: []string{"LEVEL"}},
-		Set:   catalog.Overlay{Multiplier: model.Ptr(100.0)},
+		Set:   catalog.Overlay{Multiplier: new(100.0)},
 	}}
 	e := entity("level", "LEVEL")
 	if err := rules.Enrich(device("X"), e); err != nil {
@@ -246,8 +244,8 @@ func TestEqualPriorityAppliesInSliceOrderSoTheLastWins(t *testing.T) {
 	t.Parallel()
 
 	rules := catalog.Rules{
-		{Match: catalog.Match{Leaves: []string{"X"}}, Set: catalog.Overlay{Icon: model.Ptr("mdi:first")}},
-		{Match: catalog.Match{Leaves: []string{"X"}}, Set: catalog.Overlay{Icon: model.Ptr("mdi:last")}},
+		{Match: catalog.Match{Leaves: []string{"X"}}, Set: catalog.Overlay{Icon: new("mdi:first")}},
+		{Match: catalog.Match{Leaves: []string{"X"}}, Set: catalog.Overlay{Icon: new("mdi:last")}},
 	}
 	e := entity("x", "X")
 	if err := rules.Enrich(device("D"), e); err != nil {

@@ -33,7 +33,7 @@ func TestPartitionsByKind(t *testing.T) {
 	t.Parallel()
 
 	d := device{
-		embedded:     embedded{Serial: "AC-1"},
+		Serial:       "AC-1",
 		Manufacturer: "Daikin",
 		SWVersion:    "1.2.3",
 		Modes:        []string{"heat", "cool"},
@@ -208,13 +208,11 @@ func TestCacheIsConcurrencySafe(t *testing.T) {
 	d := device{Manufacturer: "Daikin", Temperature: 1}
 	var wg sync.WaitGroup
 	for range 50 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if got := payload.For(d, payload.Info); got["manufacturer"] != "Daikin" {
 				t.Errorf("concurrent For = %#v", got)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }

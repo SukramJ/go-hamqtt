@@ -184,7 +184,7 @@ func goType(entry hacatalog.SchemaKey) string {
 
 func goName(snake string) string {
 	var b strings.Builder
-	for _, part := range strings.Split(snake, "_") {
+	for part := range strings.SplitSeq(snake, "_") {
 		if part == "" {
 			continue
 		}

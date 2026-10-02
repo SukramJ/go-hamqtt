@@ -17,6 +17,7 @@ package discovery
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 
 	hacatalog "github.com/SukramJ/go-ha-catalog"
@@ -264,13 +265,9 @@ func (c Component) MarshalJSON() ([]byte, error) {
 		if err := json.Unmarshal(raw, &fields); err != nil {
 			return nil, fmt.Errorf("discovery: platform fields must encode to an object: %w", err)
 		}
-		for k, v := range fields {
-			merged[k] = v
-		}
+		maps.Copy(merged, fields)
 	}
-	for k, v := range c.Extra {
-		merged[k] = v
-	}
+	maps.Copy(merged, c.Extra)
 	if c.NameNull {
 		// After Fields and Extra, so an explicit request for the device's own
 		// name is not undone by a stray name key from either.
@@ -446,4 +443,6 @@ func (b *Bundle) rememberTombstone(key string, was Component) {
 // rather than omit. Go has no way to take the address of a literal, so without
 // this every call site needs a named variable — which is how a builder ends up
 // reusing one by accident.
-func Ptr[T any](v T) *T { return &v }
+//
+//go:fix inline
+func Ptr[T any](v T) *T { return new(v) }

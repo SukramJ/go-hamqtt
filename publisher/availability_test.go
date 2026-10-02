@@ -736,9 +736,7 @@ func TestConcurrentFlipsUnderTheRaceDetector(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for i := range writers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			name := names[i]
 			for j := range flips {
 				// Alternating payloads, so every call is a transition and
@@ -761,7 +759,7 @@ func TestConcurrentFlipsUnderTheRaceDetector(t *testing.T) {
 			// Walks the same map the writers are mutating; its result is not
 			// deterministic under concurrency, only its safety.
 			_, _ = a.Republish(ctx)
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -127,8 +127,8 @@ func (f *fakeTransport) Unsubscribe(_ context.Context, filter string) error {
 // matches is the sliver of MQTT filter matching the fixture needs: an exact
 // topic or a trailing multi-level wildcard.
 func matches(filter, topic string) bool {
-	if strings.HasSuffix(filter, "#") {
-		return strings.HasPrefix(topic, strings.TrimSuffix(filter, "#"))
+	if before, ok := strings.CutSuffix(filter, "#"); ok {
+		return strings.HasPrefix(topic, before)
 	}
 	return filter == topic
 }
