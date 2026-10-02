@@ -28,6 +28,14 @@ PR #54 measured …", not "go-mtec2mqtt still …"). File-and-line references
 into another repository are out; references into *this* module's code are
 fine, because a change here moves them.
 
+## [Unreleased]
+
+### Changed
+
+- **Requires Go 1.27 or newer.** The `go` directive moved from 1.26 to
+  1.27, so a consumer building this module needs a Go 1.27 toolchain.
+  No exported API changed.
+
 ## [0.34.1] - 2026-09-13
 
 ### Removed

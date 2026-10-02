@@ -31,7 +31,7 @@ env:
   # release rewraps untouched code and reds main overnight. Keep these in
   # step with the versions `make setup` installs.
   GOFUMPT_VERSION: "v0.11.0"
-  GOLANGCI_LINT_VERSION: "v2.12.2"
+  GOLANGCI_LINT_VERSION: "v2.13.0"
 
 jobs:
   lint:
