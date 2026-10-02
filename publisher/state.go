@@ -60,7 +60,7 @@ type Envelope struct {
 // cache and two call sites marshalling the same value differently would each
 // think the other's payload was a change.
 func (e Envelope) JSON() ([]byte, error) {
-	b, err := json.Marshal(e)
+	b, err := json.Marshal(&e)
 	if err != nil {
 		return nil, fmt.Errorf("publisher: marshal state envelope: %w", err)
 	}

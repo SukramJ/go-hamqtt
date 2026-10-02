@@ -372,7 +372,7 @@ func SelfAvailabilityPayload(enc discovery.Encoding, available bool) []byte {
 	}
 	// Marshalling two bools cannot fail, and an error return on a function
 	// whose only input is a bool would be noise at every call site.
-	body, _ := json.Marshal(selfEnvelope{Value: available, Available: true})
+	body, _ := json.Marshal(&selfEnvelope{Value: available, Available: true})
 	return body
 }
 
