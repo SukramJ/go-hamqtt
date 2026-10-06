@@ -12,11 +12,17 @@ import (
 	"time"
 )
 
-// processStats is the `<name>/maintenance/stats` document (spec §7). Every
-// field a platform cannot answer is omitted rather than reported as zero,
-// which a dashboard would plot as a real reading.
+// processStats is the `<name>/maintenance/stats` document (spec §7). `cpu`
+// is omitted where the platform cannot answer it rather than reported as
+// zero, which a dashboard would plot as a real reading.
+//
+// `rss` is never omitted: she discards the whole document when it is not a
+// number (parseStats in its services inventory), so a missing `rss` would
+// cost every other field too. Where the kernel's resident set size cannot be
+// read without cgo — anywhere but Linux — it is approximated, see
+// [residentApprox].
 type processStats struct {
-	RSS       *uint64  `json:"rss,omitempty"`
+	RSS       uint64   `json:"rss"`
 	HeapUsed  uint64   `json:"heapUsed"`
 	HeapTotal uint64   `json:"heapTotal"`
 	CPU       *float64 `json:"cpu,omitempty"`
@@ -30,6 +36,8 @@ var heapMetrics = []string{
 	"/memory/classes/heap/objects:bytes",
 	"/memory/classes/heap/unused:bytes",
 	"/memory/classes/heap/free:bytes",
+	"/memory/classes/total:bytes",
+	"/memory/classes/heap/released:bytes",
 }
 
 // statsSampler remembers the previous CPU reading, so `cpu` is the share of
@@ -71,7 +79,9 @@ func (s *statsSampler) sample(now time.Time) processStats {
 		TS:        now.UnixMilli(),
 	}
 	if rss, ok := residentBytes(s.statm); ok {
-		out.RSS = &rss
+		out.RSS = rss
+	} else {
+		out.RSS = residentApprox(value(3), value(4))
 	}
 	if used, ok := processCPUTime(); ok && s.haveCPU {
 		if wall := now.Sub(s.lastWall); wall > 0 {
@@ -83,9 +93,22 @@ func (s *statsSampler) sample(now time.Time) processStats {
 	return out
 }
 
+// residentApprox stands in for the resident set size where no statm file
+// exists: all memory the Go runtime has mapped, less the heap memory it has
+// released back to the operating system. It is the runtime's own
+// mapped-and-not-released figure, not the kernel's RSS — it counts mapped
+// pages that were never touched and misses memory outside the Go runtime —
+// but it tracks the same growth, which is what a dashboard plots.
+func residentApprox(total, released uint64) uint64 {
+	if released > total {
+		return 0
+	}
+	return total - released
+}
+
 // residentBytes reads the resident set size from a Linux statm file: the
 // second field, in pages. Anywhere the file does not exist it reports false,
-// and the field is omitted.
+// and [residentApprox] answers instead.
 func residentBytes(path string) (uint64, bool) {
 	raw, err := os.ReadFile(path) //nolint:gosec // the path is this package's own constant, overridden only by tests
 	if err != nil {

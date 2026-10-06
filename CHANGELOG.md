@@ -88,10 +88,14 @@ before.
   fields that cannot override those), and spec §7's maintenance —
   `maintenance/set/loglevel` onto a consumer setter (`LevelVarSetter` for a
   `slog.LevelVar`), `maintenance/set/restart` only when the consumer's
-  `Supervised` answers true and refused at warn otherwise, and the retained
-  `maintenance/stats` every `DefaultStatsInterval` (`rss` from `/proc` on
-  Linux and omitted elsewhere, `heapUsed`, `heapTotal`, `cpu` where the
-  platform reports process CPU time, `uptime`, `ts`). `StatsInterval` maps
+  `Supervised` answers true and refused at warn otherwise — on any
+  non-retained payload, the empty one included, because spec §7 says "any"
+  and she publishes it empty — and the retained `maintenance/stats` every
+  `DefaultStatsInterval` (`heapUsed`, `heapTotal`, `cpu` where the platform
+  reports process CPU time, `uptime`, `ts`, and always `rss`: from `/proc`
+  on Linux, elsewhere the Go runtime's mapped-and-not-released memory,
+  because she discards a stats document without a numeric `rss`).
+  `StatsInterval` maps
   an operator's `0` to `StatsOff` rather than to the default.
 - **`ErrStatusItemAvailability`**: `AvailabilityPublisher.Device` under a
   `SmartHomeLayout`, and `Self` under the status-object encoding, refuse

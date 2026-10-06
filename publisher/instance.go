@@ -217,35 +217,51 @@ func (i *Instance) AnnounceInfo(ctx context.Context) error {
 }
 
 // Register routes `<name>/maintenance/set/#` on r, the consumer's command
-// router, so maintenance commands share its subscription QoS, its workers
-// and its retained drop. It registers nothing when maintenance is disabled.
+// router, so maintenance commands share its subscription QoS and its
+// workers. It registers nothing when maintenance is disabled.
 //
 //   - `loglevel` takes error, warn, info or debug, in any case, onto
-//     [InstanceConfig.SetLogLevel]. Not persisted.
+//     [InstanceConfig.SetLogLevel]. Not persisted. Its payload is normalised
+//     like any `set` (spec §5.3), so `{"val":"debug"}` works and an empty
+//     one is ignored.
 //   - `restart` calls [InstanceConfig.Shutdown] when
 //     [InstanceConfig.Supervised] answers true, and is refused at warn
-//     otherwise. Any non-empty payload fires it.
+//     otherwise. Any payload fires it, the empty one included.
 //   - Anything else under `maintenance/set/` is logged at warn and ignored
 //     (spec §7).
 //
-// Payloads are normalised like any `set` (spec §5.3), so `{"val":"debug"}`
-// works, and empty or retained ones are ignored whatever the router's own
-// [CommandConfig.DeliverRetained] says.
+// Restart is the one `set`-shaped topic that accepts an empty payload, and
+// on purpose: spec §7 gives its payload as "any", and she — the management
+// tool this convention exists for — publishes it with an empty payload.
+// Normalising it like a `set` would make she's Restart button do nothing.
+// The cost is that a live subscriber also receives the empty message
+// somebody publishes to clear a retained restart topic; that is accepted,
+// because the restart only happens behind the consumer's Supervised answer,
+// and a consumer's shutdown path is latched so a second trigger is a no-op.
+//
+// Retained messages are ignored on every maintenance topic, whatever the
+// router's own [CommandConfig.DeliverRetained] says: a retained restart
+// would otherwise restart the instance on every reconnect.
 func (i *Instance) Register(r *CommandRouter) error {
 	if !i.Maintenance() {
 		return nil
 	}
-	return r.HandleSet(i.cfg.Layout.Maintenance(topic.FunctionSet)+"/#", i.handleMaintenance)
+	// handle rather than Handle: [CommandConfig.NormalizeSet] would drop the
+	// empty restart before it got here.
+	return r.handle(i.cfg.Layout.Maintenance(topic.FunctionSet)+"/#",
+		func(_ context.Context, cmd Command) { i.handleMaintenance(r, cmd) })
 }
 
-func (i *Instance) handleMaintenance(_ context.Context, cmd Command, v SetValue) {
+func (i *Instance) handleMaintenance(r *CommandRouter, cmd Command) {
 	if cmd.Retained {
 		i.log.Debug("publisher.maintenance.retained_drop", slog.String("topic", cmd.Topic))
 		return
 	}
 	switch cmd.Remainder {
 	case "loglevel":
-		i.setLogLevel(cmd, v)
+		if v, ok := r.parseSet(cmd); ok {
+			i.setLogLevel(cmd, v)
+		}
 	case "restart":
 		i.restart(cmd)
 	default:
@@ -303,8 +319,9 @@ var ErrStatsOff = errors.New("publisher: maintenance stats are off")
 // fails — the broker is away — is logged at debug and retried at the next
 // tick; the topic is retained, so a reconnect needs no extra publish.
 //
-// The document carries `rss` (resident set size, from /proc on Linux and
-// omitted elsewhere), `heapUsed` and `heapTotal` (runtime/metrics), `cpu`
+// The document carries `rss` (resident set size from /proc on Linux; elsewhere
+// the Go runtime's mapped-and-not-released memory, because she discards a
+// document without it), `heapUsed` and `heapTotal` (runtime/metrics), `cpu`
 // (percent of one core since the previous sample, where the platform reports
 // process CPU time), `uptime` (seconds) and `ts` (milliseconds). There is no
 // `eventLoopLag`: Go has no event loop.

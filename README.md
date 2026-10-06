@@ -404,7 +404,7 @@ changes nothing publishes the same bytes as before.
 | `StatePublisher.PublishStatus` / `PulseStatus` | `{"val","ts","lc"}` in integer ms with one `StateConfig.ExtensionKey`; dedup on `val` and the extension, never `ts`; `lc` moves only with `val`; `Republish` re-sends the cached object unchanged; QoS 0 by default under this encoding; `StateConfig.Clock` for tests |
 | `Runtime.SetConnected` | `<name>/connected`: the will and `AnnounceOffline` write `0`, `AnnounceOnline` republishes the current level, which starts at `1` until the consumer says its upstream is usable |
 | `CommandRouter.HandleSet`, `CommandConfig.NormalizeSet` | `set` per spec §5.3: `{"val": x}` as `x`, other JSON as parameters, empty payloads dropped, malformed JSON logged at warn; `SetValue.Bool`/`Number`/`Enum` for the conversions |
-| `Instance` | retained `<name>/info` (`name`, `version`, `spec`, `go`, `host`, `pid`, `started`, `maintenance`, project fields), `maintenance/set/loglevel`, `maintenance/set/restart` (only when `Supervised` answers true), retained `maintenance/stats` every 60 s |
+| `Instance` | retained `<name>/info` (`name`, `version`, `spec`, `go`, `host`, `pid`, `started`, `maintenance`, project fields), `maintenance/set/loglevel`, `maintenance/set/restart` (any non-retained payload, empty included as she sends it; only when `Supervised` answers true), retained `maintenance/stats` every 60 s with `rss` always present (`/proc` on Linux, the Go runtime's mapped memory elsewhere) |
 
 The device's `online` item is a status item like any other, so it is written
 with `PublishStatus`, not `AvailabilityPublisher`, which refuses it with

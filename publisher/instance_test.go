@@ -199,7 +199,6 @@ func TestMaintenanceRestartRefusedWhenUnsupervised(t *testing.T) {
 		Shutdown:   func() { calls.Add(1); close(done) },
 		Supervised: func() bool { return true },
 	}, CommandConfig{})
-	supervised.send("zendure/maintenance/set/restart", "", false) // empty: ignored
 	supervised.send("zendure/maintenance/set/restart", "now", false)
 	select {
 	case <-done:
@@ -266,8 +265,9 @@ func TestStatsInterval(t *testing.T) {
 	}
 }
 
-// TestStatsWithoutProc: off Linux there is no statm, and rss is omitted
-// rather than reported as zero.
+// TestStatsWithoutProc: off Linux there is no statm, and rss is the Go
+// runtime's approximation rather than missing — she drops a document
+// without it.
 func TestStatsWithoutProc(t *testing.T) {
 	t.Parallel()
 
@@ -278,8 +278,8 @@ func TestStatsWithoutProc(t *testing.T) {
 	}
 	var got map[string]any
 	_ = json.Unmarshal(body, &got)
-	if _, ok := got["rss"]; ok {
-		t.Errorf("rss present without /proc: %s", body)
+	if rss, ok := got["rss"].(float64); !ok || rss <= 0 {
+		t.Errorf("rss missing or zero without /proc: %s", body)
 	}
 	for _, k := range []string{"heapUsed", "heapTotal", "uptime", "ts"} {
 		if _, ok := got[k].(float64); !ok {
@@ -315,8 +315,8 @@ func TestStatsReadsStatm(t *testing.T) {
 }
 
 // TestRunStatsPublishes: the first document goes out at start, retained on
-// `<name>/maintenance/stats`, and on Linux it carries the rss she requires
-// before it shows the row's memory at all.
+// `<name>/maintenance/stats`, and on every platform it carries the numeric
+// rss she requires before it keeps the document at all.
 func TestRunStatsPublishes(t *testing.T) {
 	t.Parallel()
 
@@ -341,12 +341,75 @@ func TestRunStatsPublishes(t *testing.T) {
 	if err := json.Unmarshal(got.payload, &stats); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat("/proc/self/statm"); err == nil {
-		if _, ok := stats["rss"].(float64); !ok {
-			t.Errorf("no rss on a host with /proc: %s", got.payload)
-		}
+	if !sheParseStats(got.payload) {
+		t.Errorf("she would discard this stats document: %s", got.payload)
 	}
 	if _, ok := stats["eventLoopLag"]; ok {
 		t.Error("eventLoopLag published")
+	}
+}
+
+// sheParseStats is she's parseStats (she-services-inventory.js): the
+// document is kept only when `rss` is a finite number.
+func sheParseStats(payload []byte) bool {
+	var doc map[string]any
+	if json.Unmarshal(payload, &doc) != nil {
+		return false
+	}
+	_, ok := doc["rss"].(float64)
+	return ok
+}
+
+// TestStatsSheKeepsTheDocumentWithoutProc: the she-compat property where it
+// broke — a host with no statm still publishes a document she keeps.
+func TestStatsSheKeepsTheDocumentWithoutProc(t *testing.T) {
+	t.Parallel()
+
+	s := newStatsSampler(time.Now(), filepath.Join(t.TempDir(), "absent"))
+	body, err := json.Marshal(s.sample(time.Now()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sheParseStats(body) {
+		t.Errorf("she would discard %s", body)
+	}
+	if residentApprox(10, 20) != 0 || residentApprox(30, 10) != 20 {
+		t.Error("residentApprox arithmetic")
+	}
+}
+
+// TestSheRestartWithEmptyPayloadFires: she's Restart button publishes
+// `<name>/maintenance/set/restart` with an EMPTY payload, not retained
+// (she-services-api.js). It must restart a supervised instance — on a router
+// that normalises `set` payloads too, which drops empty ones everywhere else
+// — while a retained empty message still does nothing.
+func TestSheRestartWithEmptyPayloadFires(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	done := make(chan struct{}, 1)
+	rig := newMaintenanceRig(t, InstanceConfig{
+		Shutdown:   func() { calls.Add(1); done <- struct{}{} },
+		Supervised: func() bool { return true },
+	}, CommandConfig{NormalizeSet: true, DeliverRetained: true})
+
+	rig.send("zendure/maintenance/set/restart", "", true)
+	time.Sleep(50 * time.Millisecond)
+	if calls.Load() != 0 {
+		t.Fatal("a retained empty restart fired")
+	}
+	rig.send("zendure/maintenance/set/restart", "", false)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("she's empty restart did not run the shutdown")
+	}
+
+	var level slog.LevelVar
+	ll := newMaintenanceRig(t, InstanceConfig{SetLogLevel: LevelVarSetter(&level)}, CommandConfig{NormalizeSet: true})
+	ll.send("zendure/maintenance/set/loglevel", "", false)
+	ll.send("zendure/maintenance/set/loglevel", "debug", false) // what she sends
+	if level.Level() != slog.LevelDebug {
+		t.Errorf("level = %v", level.Level())
 	}
 }
