@@ -4,6 +4,7 @@
 package discovery
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/SukramJ/go-hamqtt/model"
@@ -206,23 +207,35 @@ func entitySlot(dev *model.Device, e model.Entity) model.Slot {
 // topic: [model.LevelParent] on a device with no parent, or [model.LevelSelf]
 // on an entity with no availability binding, are both normal for an entity
 // whose description was written once and reused across device shapes.
+//
+// Under a [topic.SmartHomeLayout] the bridge and device levels change
+// vocabulary, not shape: the bridge entry reads `<name>/connected` through
+// [ConnectedAvailability] (available at 2), and a device entry reads the
+// device's `online` status item through [OnlineAvailability].
 func (c StdContext) Availability(dev *model.Device, e model.Entity) []AvailabilityEntry {
 	levels, _ := e.Desc().Availability.Resolved()
 	out := make([]AvailabilityEntry, 0, len(levels))
 
+	_, smartHome := c.Layout.(topic.SmartHomeLayout)
+	bridge, device := plainAvailability, plainAvailability
+	if smartHome {
+		bridge = func(t string) AvailabilityEntry { return ConnectedAvailability(t, ConnectedOperational) }
+		device = func(t string) AvailabilityEntry { return OnlineAvailability(t, c.Enc) }
+	}
+
 	for _, level := range levels {
 		switch level {
 		case model.LevelBridge:
-			out = append(out, plainAvailability(c.Layout.Bridge()))
+			out = append(out, bridge(c.Layout.Bridge()))
 
 		case model.LevelDevice:
-			out = append(out, plainAvailability(c.Layout.Availability(deviceSlot(dev, e))))
+			out = append(out, device(c.Layout.Availability(deviceSlot(dev, e))))
 
 		case model.LevelParent:
 			if dev.Via != nil {
 				parent := deviceSlot(dev, e)
 				parent.Address = dev.Via.UID()
-				out = append(out, plainAvailability(c.Layout.Availability(parent)))
+				out = append(out, device(c.Layout.Availability(parent)))
 			}
 
 		case model.LevelSelf:
@@ -265,12 +278,18 @@ func (c StdContext) selfAvailability(e model.Entity) (AvailabilityEntry, bool) {
 		// which matches neither payload — and Home Assistant ignores an
 		// availability payload it does not recognise, leaving the entity
 		// permanently unavailable with nothing on the wire to show why.
-		if c.Enc == EnvelopeEncoding {
+		switch c.Enc {
+		case EnvelopeEncoding:
 			entry.ValueTemplate = SelfAvailabilityTemplate
+		case StatusObjectEncoding:
+			entry.ValueTemplate = StatusBoolValueTemplate
+		case RawEncoding:
 		}
 		return entry, true
 	}
 
+	// The fallback reads the envelope's own `available` flag. Neither the
+	// bare value nor the status object carries one.
 	if c.Enc != EnvelopeEncoding {
 		return AvailabilityEntry{}, false
 	}
@@ -284,6 +303,58 @@ func (c StdContext) selfAvailability(e model.Entity) (AvailabilityEntry, bool) {
 		PayloadAvailable:    "true",
 		PayloadNotAvailable: "false",
 	}, true
+}
+
+// The levels of mqtt-smarthome's `<name>/connected` (spec §3.1).
+const (
+	// ConnectedBroker is 1: connected to the broker, the hardware or
+	// upstream service not reachable.
+	ConnectedBroker = 1
+	// ConnectedOperational is 2: fully operational, and the level an
+	// entity is available at by default (spec §8).
+	ConnectedOperational = 2
+)
+
+// ConnectedTemplate renders the availability `value_template` that turns the
+// plain integer on `<name>/connected` into [PayloadOnline] or
+// [PayloadOffline], available from atLeast upwards. A payload that is not a
+// number — an empty retained clear — reads as 0.
+func ConnectedTemplate(atLeast int) string {
+	return "{{ 'online' if value | int(0) >= " + strconv.Itoa(atLeast) + " else 'offline' }}"
+}
+
+// ConnectedAvailability is the availability entry for `<name>/connected`,
+// available from atLeast upwards. [StdContext] renders it at
+// [ConnectedOperational]; spec §8 allows [ConnectedBroker] for an entity that
+// works without the device — a wake-on-LAN switch — which a [Builder] sets
+// by replacing that entry.
+//
+// The entry carries the four keys of a list entry and nothing else. Spec §8
+// is explicit that `availability_template` belongs to the single-topic form,
+// and Home Assistant rejects a whole device document over one unknown key in
+// a list entry.
+func ConnectedAvailability(t string, atLeast int) AvailabilityEntry {
+	return AvailabilityEntry{
+		Topic:               t,
+		ValueTemplate:       ConnectedTemplate(atLeast),
+		PayloadAvailable:    PayloadOnline,
+		PayloadNotAvailable: PayloadOffline,
+	}
+}
+
+// OnlineAvailability is the availability entry for a device's `online`
+// status item: true or false, read through [StatusBoolValueTemplate] when
+// the item is published as a status object and compared bare otherwise.
+func OnlineAvailability(t string, enc Encoding) AvailabilityEntry {
+	entry := AvailabilityEntry{
+		Topic:               t,
+		PayloadAvailable:    PayloadTrue,
+		PayloadNotAvailable: PayloadFalse,
+	}
+	if enc == StatusObjectEncoding {
+		entry.ValueTemplate = StatusBoolValueTemplate
+	}
+	return entry
 }
 
 func plainAvailability(t string) AvailabilityEntry {

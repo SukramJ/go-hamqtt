@@ -24,6 +24,17 @@
 // runtime has to be exercisable without a broker, which is what the fake in
 // this package's own tests does. A go-mqtt client is adapted in one call, see
 // [github.com/SukramJ/go-hamqtt/publisher/gomqtt].
+//
+// # mqtt-smarthome 2.0
+//
+// Under a [hatopic.SmartHomeLayout] the same types speak the convention
+// (openccu-loom ADR 0083): [Runtime]'s will and announcements write
+// `<name>/connected` as 0/1/2 and [Runtime.SetConnected] moves it;
+// [StatePublisher] under [discovery.StatusObjectEncoding] writes
+// `{"val","ts","lc"}` status objects deduplicated on the value;
+// [CommandRouter.HandleSet] and [CommandConfig.NormalizeSet] normalise `set`
+// payloads; and [Instance] publishes `<name>/info` and serves the maintenance
+// topics. Nothing changes for a consumer that uses none of them.
 package publisher
 
 import (
@@ -303,6 +314,13 @@ type Runtime struct {
 	gen     uint64
 	genSeen bool
 
+	// smartHome is set when [Config.Layout] is a
+	// [hatopic.SmartHomeLayout]: the status topic is `<name>/connected` and
+	// carries 0/1/2. connected is the level [Runtime.AnnounceOnline]
+	// publishes, guarded by mu. See [Runtime.SetConnected].
+	smartHome bool
+	connected int
+
 	birth *dispatcher
 }
 
@@ -334,6 +352,17 @@ func New(tr Transport, cfg Config) *Runtime {
 				"; every entity's availability list references the latter")
 		}
 	}
+	smartHome := false
+	if sh, ok := cfg.Layout.(hatopic.SmartHomeLayout); ok {
+		// A wrapper that forwards Connected and Bridge to two different
+		// places would put the will on one topic and the discovery
+		// template on the other.
+		if sh.Connected() != sh.Bridge() {
+			panic("publisher: SmartHomeLayout.Connected() " + sh.Connected() +
+				" disagrees with Bridge() " + sh.Bridge())
+		}
+		smartHome = true
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -358,6 +387,8 @@ func New(tr Transport, cfg Config) *Runtime {
 		announced:  map[string]bool{},
 		superseded: map[string]bool{},
 		claimed:    map[string]bool{},
+		smartHome:  smartHome,
+		connected:  discovery.ConnectedBroker,
 	}
 }
 

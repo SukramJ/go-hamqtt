@@ -107,7 +107,50 @@ const (
 	// RawEncoding publishes the bare value. Simpler for anything else reading
 	// the same broker, at the cost of per-datapoint availability.
 	RawEncoding
+	// StatusObjectEncoding publishes mqtt-smarthome 2.0's status object
+	// (spec §5.2): {"val": …, "ts": …, "lc": …}, timestamps in integer
+	// milliseconds, plus at most one project-extension key. Home Assistant
+	// reads `val` through [StatusValueTemplate], or [StatusBoolValueTemplate]
+	// on the platforms whose state is a boolean.
+	//
+	// Under it the default projection also maps an enum's tokens to its
+	// labels: a select or enum sensor whose [model.Description.Options]
+	// carry labels gets the [EnumTemplates] pair reading [StatusValueField],
+	// because the convention publishes the token and `options` lists the
+	// labels — without the mapping every state would be outside the
+	// entity's own option list.
+	StatusObjectEncoding
 )
+
+// StatusValueField is the status object's value key, and the field to hand
+// [EnumTemplates] for an entity published under [StatusObjectEncoding].
+const StatusValueField = "val"
+
+// StatusValueTemplate reads the value out of a status object. It is the
+// spelling spec §8 gives.
+const StatusValueTemplate = `{{ value_json.val }}`
+
+// StatusBoolValueTemplate reads a boolean value out of a status object, for
+// the platforms that compare the rendered state against `payload_on` /
+// `payload_off`. Jinja renders a JSON true as `True`, which matches neither
+// payload; lowered, it matches [PayloadTrue] and [PayloadFalse], which are
+// the payloads such an entity declares.
+const StatusBoolValueTemplate = `{{ value_json.val | lower }}`
+
+// PayloadTrue and PayloadFalse are the plain boolean spellings of spec §5.1,
+// as an entity's `payload_on`/`payload_off` and a device `online` item's
+// availability payloads carry them.
+const (
+	PayloadTrue  = "true"
+	PayloadFalse = "false"
+)
+
+// boolPlatforms are the platforms the default projection gives a state
+// topic and whose state Home Assistant compares against an on/off payload.
+var boolPlatforms = map[hacatalog.Platform]bool{
+	hacatalog.Platform("binary_sensor"): true,
+	hacatalog.Platform("switch"):        true,
+}
 
 // ValueTemplate is the Jinja template that reads a value out of the envelope.
 //
@@ -238,18 +281,44 @@ func entityName(ctx Context, desc *model.Description, lang string) string {
 // explicit [model.NoValueTemplate] publishes none — which an event entity
 // needs, and which an empty string cannot express, since that is also what
 // "no opinion" looks like.
-func valueTemplateFor(ctx Context, desc *model.Description) string {
+func valueTemplateFor(ctx Context, desc *model.Description, platform hacatalog.Platform) string {
 	switch desc.ValueTemplate {
 	case model.NoValueTemplate:
 		return ""
 	case "":
-		if ctx.Encoding() == EnvelopeEncoding {
+		switch ctx.Encoding() {
+		case EnvelopeEncoding:
 			return ValueTemplate
+		case StatusObjectEncoding:
+			if boolPlatforms[platform] {
+				return StatusBoolValueTemplate
+			}
+			if labelled(desc.Options, ctx.Language()) {
+				value, _ := EnumTemplates(desc.Options, ctx.Language(), StatusValueField)
+				return value
+			}
+			return StatusValueTemplate
+		case RawEncoding:
 		}
 		return ""
 	default:
 		return desc.ValueTemplate
 	}
+}
+
+// labelled reports whether any code of e displays as something other than
+// itself in lang — the case where the wire token and the option Home
+// Assistant lists differ and a mapping template is needed.
+func labelled(e *model.Enum, lang string) bool {
+	if e == nil {
+		return false
+	}
+	for _, c := range e.Codes {
+		if e.Label(c, lang) != c {
+			return true
+		}
+	}
+	return false
 }
 
 func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component, error) {
@@ -373,7 +442,7 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 	if b, ok := model.Bind(e, model.RoleState); ok && b.Mode.CanRead() && accepts["state_topic"] {
 		comp.StateTopic = ctx.StateTopic(b.Slot)
 		if accepts["value_template"] {
-			comp.ValueTemplate = valueTemplateFor(ctx, desc)
+			comp.ValueTemplate = valueTemplateFor(ctx, desc, e.Platform())
 		}
 	}
 	if b, ok := model.Bind(e, model.RoleCommand); ok && b.Mode.CanWrite() && accepts["command_topic"] {
@@ -391,6 +460,14 @@ func renderComponent(ctx Context, dev *model.Device, e model.Entity) (Component,
 				comp.CommandTopic = ctx.MethodTopic(dev, e, methods[0])
 			}
 		}
+	}
+
+	// The command half of the token/label mapping the value template does
+	// under the status-object encoding: Home Assistant sends back the label
+	// it shows, and the convention's `set` takes the token.
+	if ctx.Encoding() == StatusObjectEncoding && comp.CommandTopic != "" &&
+		comp.CommandTemplate == "" && accepts["command_template"] && labelled(desc.Options, lang) {
+		_, comp.CommandTemplate = EnumTemplates(desc.Options, lang, StatusValueField)
 	}
 
 	if builder, ok := e.(Builder); ok {

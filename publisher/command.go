@@ -405,6 +405,21 @@ type CommandConfig struct {
 
 	// Logger receives the router's diagnostics. Nil means [slog.Default].
 	Logger *slog.Logger
+
+	// NormalizeSet applies mqtt-smarthome 2.0 §5.3 to every route
+	// registered with [CommandRouter.Handle]: a handler receives
+	// `{"val": x}` as the plain value x — a string without its quotes —
+	// and any other JSON object or array unchanged, as structured
+	// parameters. An empty payload, or `{"val": null}`, is dropped at
+	// debug; malformed JSON is dropped and logged at warn with topic and
+	// payload, as the spec requires of a rejected request.
+	//
+	// Off by default, so a handler that parses its own payloads sees
+	// exactly the bytes it always did. It is the router-wide switch for a
+	// consumer whose handlers already parse plain values;
+	// [CommandRouter.HandleSet] is the per-route form, and hands the
+	// handler a [SetValue] with the conversions spec §5.3 asks for.
+	NormalizeSet bool
 }
 
 // route is one registered filter, pre-split so matching never re-splits.
@@ -632,10 +647,21 @@ func NewCommandRouter(tr Transport, cfg CommandConfig) *CommandRouter {
 // seen so far, because the measured collision (a seven-level all-wildcard
 // filter against a seven-level filter with one literal) is invisible to any
 // check that waits for traffic to demonstrate it.
+//
+// With [CommandConfig.NormalizeSet] the handler receives normalised payloads;
+// see there.
 func (r *CommandRouter) Handle(filter string, handler CommandHandler) error {
 	if handler == nil {
 		return fmt.Errorf("%w: nil handler for %q", ErrInvalidFilter, filter)
 	}
+	if r.cfg.NormalizeSet {
+		handler = r.normalizing(handler)
+	}
+	return r.handle(filter, handler)
+}
+
+// handle registers a route; the registration rules are [CommandRouter.Handle]'s.
+func (r *CommandRouter) handle(filter string, handler CommandHandler) error {
 	if err := ValidateFilter(filter); err != nil {
 		return err
 	}

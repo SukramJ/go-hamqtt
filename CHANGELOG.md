@@ -30,6 +30,78 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-06
+
+### Added
+
+The `go-hamqtt` half of openccu-loom ADR 0083: the
+[mqtt-smarthome 2.0](https://github.com/mqtt-smarthome/mqtt-smarthome/blob/master/SPEC.md)
+topic convention, built once for the six consumers that adopt it. All of it
+is opt-in. A consumer that upgrades and changes nothing publishes the same
+topics and the same bytes; no existing default, signature or test changed.
+How to tell whether a piece applies to you: it does once you construct a
+`topic.SmartHome` layout or select `discovery.StatusObjectEncoding`, and not
+before.
+
+- **`topic.SmartHome`**, the layout for `<name>/<function>/<item...>`: state
+  under `status`, commands under `set` on the same item path, `meta` for the
+  descriptor companion, `<name>/status/<scope…>/<uid>/online` as device
+  availability, `<name>/connected` as the bridge topic, `info` and
+  `maintenance` helpers, and pulses as non-retained status items (the
+  per-type datapoint event renders nothing; its type travels in `val`).
+  `NewSmartHome` refuses a name spec §3 forbids; `NewSmartHomeMultiLevel`
+  accepts a deliberate multi-level base and reports it non-conformant.
+  `topic.IsFunction` backs a consumer's reserved-name guard.
+- **`topic.SmartHomeLayout`**, the capability the discovery context and the
+  publisher read to switch vocabulary. A consumer wrapping the layout keeps
+  the switch by forwarding `Connected`, `Info` and `Maintenance`; the
+  runtime refuses a layout whose `Connected` and `Bridge` disagree.
+- **`discovery.StatusObjectEncoding`**, the third encoding:
+  `{{ value_json.val }}`, `{{ value_json.val | lower }}` on `binary_sensor`
+  and `switch`, and for options that carry labels the `EnumTemplates` pair
+  on the `val` field (`StatusValueField`) — tokens on the wire, labels in
+  `options`. Under a `SmartHomeLayout`, availability renders
+  `<name>/connected` through `ConnectedTemplate` (available at
+  `ConnectedOperational`; `ConnectedAvailability` takes 1 for an entity that
+  works without its device) and the device's `online` item through
+  `OnlineAvailability`, each entry with the four list keys and never
+  `availability_template`.
+- **`StatePublisher.PublishStatus` and `PulseStatus`**, with `Observation`,
+  `StatusObject`, `StateConfig.ExtensionKey` and `StateConfig.Clock`. The
+  gate compares `val` and the extension, never `ts`; `lc` is kept per topic
+  and moves only with `val`; `Republish` re-sends the cached object with its
+  original `ts`. QoS 0 is the default under this encoding only, and
+  `StateFor` does not hand the runtime's QoS to such a plane.
+  `PublishValue` routes through `PublishStatus` under it.
+- **`Runtime.SetConnected`** and `Runtime.Connected`: under a
+  `SmartHomeLayout` the will and `AnnounceOffline` write `0`,
+  `AnnounceOnline` republishes the current level, and the level starts at 1
+  until the consumer reports its upstream usable. `ErrNotSmartHome` and
+  `ErrConnectedLevel` refuse the rest.
+- **`set` normalisation** (spec §5.3): `CommandRouter.HandleSet` per route
+  and `CommandConfig.NormalizeSet` per router unwrap `{"val": …}`, pass
+  other JSON as parameters, drop empty payloads, and log malformed JSON at
+  warn with topic and payload. `ParseSet` and `SetValue.Bool`, `Number` and
+  `Enum` are the conversions. Retained commands stay dropped as before.
+- **`Instance`**: the retained `<name>/info` (`name`, `version`,
+  `spec: "2.0"`, `go`, `host`, `pid`, `started`, `maintenance`, plus project
+  fields that cannot override those), and spec §7's maintenance —
+  `maintenance/set/loglevel` onto a consumer setter (`LevelVarSetter` for a
+  `slog.LevelVar`), `maintenance/set/restart` only when the consumer's
+  `Supervised` answers true and refused at warn otherwise — on any
+  non-retained payload, the empty one included, because spec §7 says "any"
+  and she publishes it empty — and the retained `maintenance/stats` every
+  `DefaultStatsInterval` (`heapUsed`, `heapTotal`, `cpu` where the platform
+  reports process CPU time, `uptime`, `ts`, and always `rss`: from `/proc`
+  on Linux, elsewhere the Go runtime's mapped-and-not-released memory,
+  because she discards a stats document without a numeric `rss`).
+  `StatsInterval` maps
+  an operator's `0` to `StatsOff` rather than to the default.
+- **`ErrStatusItemAvailability`**: `AvailabilityPublisher.Device` under a
+  `SmartHomeLayout`, and `Self` under the status-object encoding, refuse
+  rather than write an online/offline marker the config cannot read; under
+  the convention those are status items for `PublishStatus`.
+
 ## [0.35.0] - 2026-10-02
 
 ### Changed

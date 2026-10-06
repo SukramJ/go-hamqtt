@@ -187,6 +187,18 @@ type StateConfig struct {
 	// Logger receives the publisher's own diagnostics. Nil means
 	// [slog.Default].
 	Logger *slog.Logger
+
+	// ExtensionKey names the one project-extension key a status object
+	// carries under [discovery.StatusObjectEncoding] — `"hm"` for
+	// openccu-loom. Spec §5.2 asks for one key per adapter so a consumer can
+	// tell project fields from future spec fields. Empty means status
+	// objects carry no extension; `val`, `ts` and `lc` are refused at
+	// construction, because the spec forbids redefining them.
+	ExtensionKey string
+
+	// Clock supplies the observation time of a status object whose caller
+	// gave none. Nil means [time.Now]; tests inject a fixed one.
+	Clock func() time.Time
 }
 
 // cachedWrite is one payload a broker accepted, and whether the dedup gate is
@@ -272,6 +284,10 @@ type StatePublisher struct {
 	// index [StatePublisher.EvictPrefix] walks to clear a removed device
 	// whose datapoints no longer exist anywhere to be enumerated from.
 	published map[string]cachedWrite
+	// status is the value memory of the topics written as status objects:
+	// what the dedup gate compares and where `lc` comes from. Guarded by mu
+	// and kept in step with published. See [StatePublisher.PublishStatus].
+	status map[string]statusMemo
 
 	latMu   sync.Mutex
 	samples []time.Duration
@@ -291,6 +307,20 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
+	}
+	switch cfg.ExtensionKey {
+	case "val", "ts", "lc":
+		panic("publisher: StateConfig.ExtensionKey " + cfg.ExtensionKey +
+			" redefines a status object field; spec §5.2 forbids it")
+	}
+	if cfg.Clock == nil {
+		cfg.Clock = time.Now
+	}
+	// Status items are QoS 0 by the convention (spec §4); every other
+	// encoding keeps the package default of QoS 1.
+	stateDefault := QoSAtLeastOnce
+	if cfg.Encoding == discovery.StatusObjectEncoding {
+		stateDefault = QoSAtMostOnce
 	}
 	if cfg.QoS != QoSUnset && cfg.PulseQoS == QoSUnset {
 		// Said out loud rather than refused, because a consumer that
@@ -315,10 +345,11 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 	return &StatePublisher{
 		tr:        tr,
 		cfg:       cfg,
-		qos:       resolveQoS("publisher.StateConfig.QoS", cfg.QoS, QoSAtLeastOnce),
+		qos:       resolveQoS("publisher.StateConfig.QoS", cfg.QoS, stateDefault),
 		pulseQoS:  resolveQoS("publisher.StateConfig.PulseQoS", cfg.PulseQoS, QoSAtMostOnce),
 		log:       logger,
 		published: map[string]cachedWrite{},
+		status:    map[string]statusMemo{},
 	}
 }
 
@@ -329,11 +360,18 @@ func NewStatePublisher(tr Transport, cfg StateConfig) *StatePublisher {
 // a second set of answers is how the discovery plane and the state plane end
 // up on different brokers. Whatever cfg sets explicitly still wins; the zero
 // fields inherit.
+//
+// QoS is the one exception, and only under
+// [discovery.StatusObjectEncoding]: the convention publishes status at QoS 0
+// while a retained discovery config wants QoS 1, so a status-object plane
+// does not inherit the runtime's level and states its own if it wants one.
 func StateFor(r *Runtime, cfg StateConfig) *StatePublisher {
 	if r == nil {
 		panic("publisher: nil runtime")
 	}
-	cfg.QoS = cfg.QoS.Or(r.cfg.QoS)
+	if cfg.Encoding != discovery.StatusObjectEncoding {
+		cfg.QoS = cfg.QoS.Or(r.cfg.QoS)
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = r.log
 	}
@@ -414,6 +452,9 @@ func (p *StatePublisher) Publish(ctx context.Context, topic string, payload []by
 	// its plane's topic list, republish worklist and ownership set.
 	p.mu.Lock()
 	p.published[topic] = cachedWrite{payload: bytes.Clone(payload), gated: true}
+	// Bytes written past the status-object path describe nothing the value
+	// memory could compare against.
+	delete(p.status, topic)
 	p.mu.Unlock()
 	return true, nil
 }
@@ -520,7 +561,14 @@ func (p *StatePublisher) PublishComponentValue(
 // available fills [Envelope.Available] and is ignored under
 // [discovery.RawEncoding], which has no room for it — that is the cost of the
 // bare shape, and the reason the envelope is the default.
+//
+// Under [discovery.StatusObjectEncoding] it is [StatePublisher.PublishStatus]
+// with the value observed now, and available is ignored there too: a
+// project that carries per-item availability puts it in its extension.
 func (p *StatePublisher) PublishValue(ctx context.Context, topic string, value any, available bool) (bool, error) {
+	if p.cfg.Encoding == discovery.StatusObjectEncoding {
+		return p.PublishStatus(ctx, topic, Observation{Value: value})
+	}
 	payload, err := p.render(value, available)
 	if err != nil {
 		return false, err
@@ -603,6 +651,7 @@ func (p *StatePublisher) Evict(ctx context.Context, topics ...string) error {
 		}
 		p.mu.Lock()
 		delete(p.published, t)
+		delete(p.status, t)
 		p.mu.Unlock()
 	}
 	return errors.Join(errs...)
@@ -676,6 +725,7 @@ func (p *StatePublisher) EvictPrefix(ctx context.Context, prefix string) (int, e
 		}
 		p.mu.Lock()
 		delete(p.published, t)
+		delete(p.status, t)
 		p.mu.Unlock()
 		cleared++
 	}
@@ -766,6 +816,7 @@ func (p *StatePublisher) Forget(topics ...string) {
 	defer p.mu.Unlock()
 	for _, t := range topics {
 		delete(p.published, t)
+		delete(p.status, t)
 	}
 }
 
