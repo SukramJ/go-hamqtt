@@ -21,7 +21,7 @@ Recorded as [ADR 0070](https://github.com/SukramJ/openccu-loom/blob/main/docs/ad
 | Package | |
 | --- | --- |
 | `model` | `Device`, `Identity`, `Entity`, `Slot`, `Binding`, `State`, `Description` — and the capability interfaces |
-| `discovery` | the device-based bundle, the render pipeline, and the validator |
+| `discovery` | the device-based bundle, the render pipeline, the validator, inspection and containment |
 | `topic` | the only place that turns a coordinate into a string |
 | `payload` | `payload:"info\|config\|state"` struct-tag partitioning |
 | `catalog` | priority rules as an `Enricher`, a static table as an `EntitySource` |
@@ -65,9 +65,11 @@ bundle, err := discovery.Render(ctx, dev, []model.Entity{power},
 if err != nil {
     return err
 }
-if err := discovery.Validate(bundle); err != nil {
-    return err // nothing is published for this device
+contained := discovery.Contain(bundle, discovery.ContainOptions{})
+if err := contained.Err(); err != nil {
+    return err // a document-level error: Home Assistant would refuse it whole
 }
+bundle = contained.Bundle // withheld components are in contained.Withheld
 // Say which availability topics this bridge actually publishes. The zero
 // model.Availability resolves to {LevelBridge, LevelDevice}, and a source
 // nobody publishes is not neutral under availability_mode: all — it is every
@@ -346,10 +348,69 @@ when six consumers pin the module. `Commander`, `Suppressor`, `Deriver`,
 `OriginPolicy`, `EntitySource`, `Enricher`, `discovery.Builder`,
 `discovery.Dynamic`.
 
-**Validation is not optional.** An invalid bundle returns an error and *nothing*
-is published for that device. Home Assistant discards a malformed discovery
-config in silence — no error on the wire, nothing in its log naming the cause —
-so an invalid payload is indistinguishable from a bridge that never spoke.
+**Validation is not optional.** Home Assistant reports a refused document or
+entity only in its own log — nothing on the wire — so an invalid payload is
+indistinguishable, from the bridge, from a bridge that never spoke. What to do
+with a finding is the next section.
+
+## Validation and containment
+
+Home Assistant does not refuse a device document because one of its
+components is wrong. Read off core 2026.10.0b2 and exercised against its real
+schemas:
+
+| Home Assistant refuses… | for | where |
+| --- | --- | --- |
+| the **whole document** | a `device` block without identifier or connection; a component without `platform`, or with one that is not MQTT-capable; a component on an entity platform without `unique_id` | `components/mqtt/schemas.py:123-156, 199-227`, applied in `discovery.py:304-313` |
+| **one entity** | everything its platform schema rejects (a missing required key, an undeclared device class, a sensor unit its device class does not allow, `options` without `device_class: enum`, a number step below 0.001 or min > max, …), and what the entity itself rejects when added (`entity_category: config` on a sensor or binary sensor) | `components/mqtt/entity.py:324-347`; `sensor/__init__.py:305-313`; `binary_sensor/__init__.py:76-83` |
+| **nothing** — it strips the key | an unknown key, an unknown key inside an `availability` entry | the platform schemas are `extra=REMOVE_EXTRA` |
+| **nothing** — it logs | a state class impossible for the sensor's device class | `sensor/__init__.py:620-645` |
+
+Three entry points follow from that:
+
+- **`discovery.Validate`** — unchanged, and guaranteed unchanged: it returns
+  exactly what it returned in v0.36.0 for every input, which a test checks
+  against the frozen implementation. Its verdict is all or nothing and
+  stricter than Home Assistant: it treats every finding as a reason to refuse
+  the document, and it counts stripped keys and the state-class warning as
+  issues. A consumer that withholds the document on any `Validate` error
+  withholds every entity of the device for a finding that costs Home
+  Assistant one entity, or none — which is how one consumer lost every entity
+  of every appliance over one timestamp sensor's `state_class`.
+- **`discovery.Inspect(b, opts) Findings`** — every finding with its `Scope`
+  (`document` or `component`), the component key it is attributed to, a
+  stable `FindingKind`, a `Severity` (`error`: Home Assistant refuses the thing
+  in scope; `warning`: it accepts it and strips, rewrites or logs), the
+  offending keys, and whether the warning is strippable. It also checks rules
+  `Validate` never did: entity category per platform, number bounds, a sensor
+  unit against its device class and state class, a non-numeric sensor with a
+  unit, `last_reset_value_template`, and availability entry keys. Each
+  `FindingKind` constant documents its classification and core reference.
+- **`discovery.Contain(b, opts) *Containment`** — the document Home Assistant
+  would accept: components with an error are withheld and reported, the rest
+  published; `StripWarnings` removes strippable keys; the document is
+  unpublishable (`Err()` matches `ErrUnpublishable`) only for an error on its
+  own keys, or when nothing is left. `publisher.Config.Contain` applies it
+  inside `Runtime.PublishBundle`, opt-in.
+
+**A withheld component is not a removed one.** Omitting a key from a device
+document leaves Home Assistant's entity as it was; a tombstone — the
+platform-only entry `RemoveComponents` writes — deletes it with its registry
+entry. The contained bundle records what it withheld in `Bundle.Withheld`,
+`Remove`/`RemoveComponents` skip those keys, and `Bundle.KeepSet()` counts them
+as declared. The order:
+
+```go
+contained := discovery.Contain(rendered, opts)       // 1. contain
+b := contained.Bundle
+b.RemoveComponents(prev, gone(prev, b)...)           // 2. tombstone what left; withheld keys are skipped
+_, err := run.PublishBundle(ctx, b)                  // 3. publish; the sweep spares withheld per-entity configs
+prev = b.KeepSet()                                   // 4. NOT b.Components
+```
+
+Steps 1 and 2 may be swapped. What withholding costs: an entity Home Assistant
+already had keeps its last good config until Home Assistant restarts, and is
+then not rediscovered until a document carrying it again is published.
 
 ## Composite entities
 
@@ -404,7 +465,10 @@ changes nothing publishes the same bytes as before.
 | `StatePublisher.PublishStatus` / `PulseStatus` | `{"val","ts","lc"}` in integer ms with one `StateConfig.ExtensionKey`; dedup on `val` and the extension, never `ts`; `lc` moves only with `val`; `Republish` re-sends the cached object unchanged; QoS 0 by default under this encoding; `StateConfig.Clock` for tests |
 | `Runtime.SetConnected` | `<name>/connected`: the will and `AnnounceOffline` write `0`, `AnnounceOnline` republishes the current level, which starts at `1` until the consumer says its upstream is usable |
 | `CommandRouter.HandleSet`, `CommandConfig.NormalizeSet` | `set` per spec §5.3: `{"val": x}` as `x`, other JSON as parameters, empty payloads dropped, malformed JSON logged at warn; `SetValue.Bool`/`Number`/`Enum` for the conversions |
-| `Instance` | retained `<name>/info` (`name`, `version`, `spec`, `go`, `host`, `pid`, `started`, `maintenance`, project fields), `maintenance/set/loglevel`, `maintenance/set/restart` (any non-retained payload, empty included as she sends it; only when `Supervised` answers true), retained `maintenance/stats` every 60 s with `rss` always present (`/proc` on Linux, the Go runtime's mapped memory elsewhere) |
+| `topic.FunctionHA`, `SmartHome.HA`, `topic.IsReservedFunction` | the adapter function `<name>/ha/<item…>` for Home-Assistant-native documents that cannot be templated onto `status`/`set`. `IsFunction` deliberately does not report it — a consumer refusing an operator identifier that `IsFunction` accepts would otherwise stop starting for a site literally named `ha`; new guards call `IsReservedFunction` |
+| `discovery.StatusAttributesTemplate` | `{{ value_json.val \| tojson }}`: a status object's value as an entity's attributes |
+| `StdContext.AvailabilityFrom`, `discovery.BindingSlot` | `Availability` with the device level resolved from the entity's binding (or any slot) instead of the device UID, for a tree that keys `online` on the bare serial or MAC |
+| `Instance` | retained `<name>/info` (`name`, `version`, `spec`, `go`, `host`, `pid`, `started`, `maintenance`, project fields — static `Extra` and per-render `ExtraFunc`), `maintenance/set/loglevel`, `maintenance/set/restart` (any non-retained payload, empty included as she sends it; only when `Supervised` answers true), retained `maintenance/stats` every 60 s with `rss` always present (`/proc` on Linux, the Go runtime's mapped memory elsewhere) |
 
 The device's `online` item is a status item like any other, so it is written
 with `PublishStatus`, not `AvailabilityPublisher`, which refuses it with

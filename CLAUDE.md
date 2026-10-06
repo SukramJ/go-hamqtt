@@ -34,7 +34,8 @@ model/      the semantic layer: Device, Identity, Entity, Slot, Binding, State,
             Description, and the capability interfaces
 payload/    struct-tag partitioning; no domain knowledge at all
 topic/      the ONLY place that turns a Slot into a string
-discovery/  the device bundle, the render pipeline, the validator
+discovery/  the device bundle, the render pipeline, the validator,
+            Inspect (scoped findings) and Contain (what HA would accept)
 catalog/    rules as an Enricher, a static table as an EntitySource
 publisher/  the publish loop: hash-dedup, retract-then-publish, the orphan
             sweep over both topic forms, birth/LWT availability
@@ -90,6 +91,15 @@ lets six projects with six topic schemas share one model. A change that makes
   the values are symbols like `°C` and `µg/m³`. Home Assistant silently
   rewrites some spellings (most importantly the micro sign U+00B5 to U+03BC)
   and discards a config that disagrees. The validator catches it.
+- **Home Assistant does not refuse a device document for a bad component.**
+  It refuses the whole document only over `device`/`origin` and a
+  component's `platform`/`unique_id`; everything else costs one entity, and
+  unknown keys are stripped. `Validate` is all-or-nothing and FROZEN — a
+  stricter answer would newly withhold documents in six consumers;
+  `TestValidateIsUnchanged` compares it with the v0.36.0 copy. New rules go
+  into `Inspect` (each with a core file:line), and `Contain` is the
+  publish-path answer. A withheld component must never become a tombstone:
+  a platform-only entry deletes the entity and its registry entry.
 - **Suppression hides the entity, not the datapoint.** The suppressed slots
   must keep publishing, because the suppressing entity's discovery references
   those topics.
