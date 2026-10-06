@@ -411,6 +411,12 @@ with `PublishStatus`, not `AvailabilityPublisher`, which refuses it with
 `ErrStatusItemAvailability` rather than writing a marker the config cannot
 read. `publisher/example_smarthome_test.go` is this snippet compiled.
 
+`publisher.DetectSupervised("MTEC_SUPERVISED")` is a ready-made `Supervised`
+answer: the named variable decides when set (`1`/`true` or `0`/`false`),
+otherwise systemd, Kubernetes or a container counts as supervised. A container
+without a restart policy is a false positive; setting the variable to `0` is
+the operator's way out.
+
 ```go
 layout, err := topic.NewSmartHome("daikin") // refuses / + # and empty names
 dctx := discovery.StdContext{Layout: layout, Namespace: "daikin", Enc: discovery.StatusObjectEncoding}
@@ -421,7 +427,7 @@ router := publisher.NewCommandRouter(tr, publisher.CommandConfig{Lifecycle: ctx}
 inst := publisher.NewInstance(tr, publisher.InstanceConfig{
     Layout: layout, Name: "go-daikin2mqtt", Version: version,
     SetLogLevel: publisher.LevelVarSetter(&logLevel),
-    Supervised:  supervised, // nil or false: restart is refused at warn
+    Supervised:  publisher.DetectSupervised("DAIKIN_SUPERVISED"), // false: restart is refused at warn
     Shutdown:    stop,       // publishes connected 0, exits 0
 })
 _ = router.HandleSet(layout.Name()+"/set/+/+/power", func(ctx context.Context, cmd publisher.Command, v publisher.SetValue) {
