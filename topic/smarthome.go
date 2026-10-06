@@ -40,7 +40,33 @@ var functions = []string{
 // at the item level beside literal sub-trees must not spell a function, or a
 // migration sweep that tells new topics from old ones by their second level
 // could mistake one for the other.
+//
+// It does NOT report [FunctionHA], and deliberately so: the consumers'
+// guards built on this predicate decide whether an operator's identifier is
+// acceptable, and adding a name to the set would newly refuse an instance
+// that runs today. Ask [IsReservedFunction] where the adapter function
+// belongs in the answer.
 func IsFunction(s string) bool { return slices.Contains(functions, s) }
+
+// FunctionHA is an adapter-specific function: `<name>/ha/<item...>` carries
+// Home-Assistant-native documents that cannot be expressed as status items —
+// openccu-loom's JSON-schema light, whose command and state documents are
+// Home Assistant's own shape and cannot be templated onto `status`/`set`.
+//
+// It is not one of the spec §3 functions, which is why [IsFunction] leaves it
+// out; [IsReservedFunction] includes it.
+const FunctionHA = "ha"
+
+// IsReservedFunction reports whether s is a function name of the grammar this
+// family publishes: one of the spec functions [IsFunction] knows, or the
+// adapter function [FunctionHA].
+//
+// A new guard should call this one. It is separate from [IsFunction] because
+// changing that predicate's answer for "ha" would change existing guards
+// built on it: at least one consumer refuses to start when an operator's site
+// identifier spells a function, so an installation whose site segment is
+// literally "ha" would stop starting on a dependency bump.
+func IsReservedFunction(s string) bool { return s == FunctionHA || IsFunction(s) }
 
 // ErrInvalidName is returned for an instance name the convention does not
 // allow.
@@ -181,6 +207,10 @@ func (l SmartHome) Set(item ...string) string { return l.fn(FunctionSet, item) }
 
 // Meta is `<name>/meta/<item...>`, or "" for an empty item path.
 func (l SmartHome) Meta(item ...string) string { return l.fn(FunctionMeta, item) }
+
+// HA is `<name>/ha/<item...>`, the adapter function [FunctionHA], or "" for
+// an empty item path.
+func (l SmartHome) HA(item ...string) string { return l.fn(FunctionHA, item) }
 
 // Maintenance implements [SmartHomeLayout]: `<name>/maintenance/<item...>`,
 // for example `Maintenance("stats")` or `Maintenance("set", "loglevel")`.

@@ -65,6 +65,14 @@ type InstanceConfig struct {
 	// Extra are project fields added to `info`. A key the instance answers
 	// itself is dropped with a warning at construction.
 	Extra map[string]any
+	// ExtraFunc supplies project fields resolved every time `info` is
+	// rendered — [Instance.Info] and so [Instance.AnnounceInfo] — for a
+	// value that changes at runtime, such as the set of upstream
+	// controllers an instance is connected to. Its fields are applied after
+	// Extra and win over it; a key the instance answers itself is dropped
+	// with a warning, as for Extra. Nil is fine. It is called on whatever
+	// goroutine renders `info` and must not block.
+	ExtraFunc func() map[string]any
 
 	// MaintenanceDisabled switches spec §7 off: no maintenance commands are
 	// routed, no stats are published, and `info.maintenance` says false.
@@ -180,11 +188,23 @@ func (i *Instance) Maintenance() bool { return !i.cfg.MaintenanceDisabled }
 // Info renders the `<name>/info` document: `name`, `version`, `spec`, `go`
 // (the runtime version — spec §6's "own key" for a runtime that is not
 // Node), `host`, `pid`, `started` (ISO 8601, milliseconds, UTC),
-// `maintenance`, and the project's extra fields.
+// `maintenance`, and the project's extra fields — [InstanceConfig.Extra],
+// then [InstanceConfig.ExtraFunc] resolved now.
 func (i *Instance) Info() ([]byte, error) {
 	doc := make(map[string]any, len(i.extra)+len(reservedInfoKeys))
 	for k, v := range i.extra {
 		doc[k] = v
+	}
+	if i.cfg.ExtraFunc != nil {
+		for k, v := range i.cfg.ExtraFunc() {
+			if reservedInfoKeys[k] {
+				i.log.Warn("publisher.instance.reserved_info_key",
+					slog.String("key", k),
+					slog.String("effect", "spec §6 forbids redefining it; the instance's own value is published"))
+				continue
+			}
+			doc[k] = v
+		}
 	}
 	doc["name"] = i.cfg.Name
 	doc["version"] = i.cfg.Version

@@ -137,6 +137,14 @@ const StatusValueTemplate = `{{ value_json.val }}`
 // the payloads such an entity declares.
 const StatusBoolValueTemplate = `{{ value_json.val | lower }}`
 
+// StatusAttributesTemplate is the `json_attributes_template` that attaches a
+// status object's value to an entity as its attributes: the value of a
+// descriptor or structured status item is itself a JSON object, and
+// Home Assistant's json_attributes handling expects a JSON object string,
+// which `tojson` produces from the decoded `val`. Pair it with a
+// `json_attributes_topic` that carries a status object.
+const StatusAttributesTemplate = `{{ value_json.val | tojson }}`
+
 // PayloadTrue and PayloadFalse are the plain boolean spellings of spec §5.1,
 // as an entity's `payload_on`/`payload_off` and a device `online` item's
 // availability payloads carry them.
@@ -223,12 +231,14 @@ type Dynamic interface {
 // real registry collision, so Validate reports it.
 //
 // Folding Validate into Render would make that failure automatic, and the
-// failure is fail-closed: an invalid bundle publishes nothing at all, so one
-// bad component costs a device all of its entities. [ValidateIgnoring]
-// documents what that cost measured on a real fleet. A consumer that wants the
-// check on its publish path is one call away from it and keeps the choice of
-// what to do with the answer — publish anyway, drop the component, or withhold
-// the device — which is a choice this package should not be making for it.
+// failure is fail-closed: an invalid bundle would publish nothing at all, so
+// one bad component would cost a device all of its entities — which is
+// stricter than Home Assistant, which refuses most things one component at a
+// time (see [Inspect]). [ValidateIgnoring] documents what that cost measured
+// on a real fleet. A consumer that wants the check on its publish path is one
+// call away from it and keeps the choice of what to do with the answer —
+// publish anyway, withhold the component ([Contain]), or withhold the device
+// — which is a choice this package should not be making for it.
 func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Origin) (*Bundle, error) {
 	if dev == nil {
 		return nil, fmt.Errorf("discovery: no device")

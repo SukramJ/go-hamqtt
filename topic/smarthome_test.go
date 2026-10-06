@@ -223,3 +223,38 @@ func TestFunctionNamesForTheReservedNameGuard(t *testing.T) {
 		}
 	}
 }
+
+// TestFunctionHAIsReservedButNotASpecFunction: `ha` joins the reserved set a
+// new guard asks about, and IsFunction's answer is unchanged — a consumer
+// refuses to start on an operator identifier IsFunction accepts, so widening
+// it would stop an installation whose site is literally "ha".
+func TestFunctionHAIsReservedButNotASpecFunction(t *testing.T) {
+	t.Parallel()
+
+	if topic.IsFunction(topic.FunctionHA) {
+		t.Error(`IsFunction("ha") = true; existing guards would change`)
+	}
+	if !topic.IsReservedFunction(topic.FunctionHA) {
+		t.Error(`IsReservedFunction("ha") = false`)
+	}
+	for _, f := range []string{"connected", "status", "set", "get", "info", "meta", "maintenance"} {
+		if !topic.IsReservedFunction(f) {
+			t.Errorf("IsReservedFunction(%q) = false", f)
+		}
+	}
+	for _, s := range []string{"alarm", "HA", "", "hass"} {
+		if topic.IsReservedFunction(s) {
+			t.Errorf("IsReservedFunction(%q) = true", s)
+		}
+	}
+	l, err := topic.NewSmartHome("ccu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := l.HA("light", "dev1"); got != "ccu/ha/light/dev1" {
+		t.Errorf("HA = %q", got)
+	}
+	if got := l.HA(); got != "" {
+		t.Errorf("HA() = %q, want empty", got)
+	}
+}

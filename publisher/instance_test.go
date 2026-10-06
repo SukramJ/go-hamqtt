@@ -118,6 +118,44 @@ func TestInfoReservedKeysCannotBeOverridden(t *testing.T) {
 	}
 }
 
+// TestInfoExtraFuncIsResolvedPerRender: a field that changes at runtime —
+// loom's list of connected centrals — is read when `info` is rendered, wins
+// over the static Extra, and still cannot redefine a spec §6 key.
+func TestInfoExtraFuncIsResolvedPerRender(t *testing.T) {
+	t.Parallel()
+
+	centrals := make([]string, 0, 2)
+	centrals = append(centrals, "ccu1")
+	i := testInstance(t, newFake(), InstanceConfig{
+		Extra: map[string]any{"centrals": "static", "commit": "abc"},
+		ExtraFunc: func() map[string]any {
+			return map[string]any{"centrals": centrals, "pid": 1}
+		},
+	})
+	read := func() map[string]any {
+		body, err := i.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var info map[string]any
+		if err := json.Unmarshal(body, &info); err != nil {
+			t.Fatal(err)
+		}
+		return info
+	}
+	info := read()
+	if got, _ := json.Marshal(info["centrals"]); string(got) != `["ccu1"]` || info["commit"] != "abc" {
+		t.Errorf("info = %v", info)
+	}
+	if info["pid"] != float64(4242) {
+		t.Errorf("ExtraFunc redefined pid: %v", info["pid"])
+	}
+	centrals = append(centrals, "ccu2")
+	if got, _ := json.Marshal(read()["centrals"]); string(got) != `["ccu1","ccu2"]` {
+		t.Errorf("centrals not re-resolved: %s", got)
+	}
+}
+
 // maintenanceRig is an instance wired to a command router over a broker that
 // echoes, so a test publishes a maintenance command the way she does.
 type maintenanceRig struct {
