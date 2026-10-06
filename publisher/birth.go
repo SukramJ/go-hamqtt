@@ -5,7 +5,10 @@ package publisher
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -66,16 +69,83 @@ type Will struct {
 // Will returns the Last Will this runtime's availability policy assumes.
 // An empty [Config.StatusTopic] yields the zero Will and
 // [ErrNoStatusTopic], so a consumer cannot silently connect without one.
+//
+// Under a [topic.SmartHomeLayout] the payload is [ConnectedPayloadDown],
+// `0` on `<name>/connected` (spec §3.1).
 func (r *Runtime) Will() (Will, error) {
 	if r.cfg.StatusTopic == "" {
 		return Will{}, ErrNoStatusTopic
 	}
 	return Will{
 		Topic:   r.cfg.StatusTopic,
-		Payload: []byte(DeathPayload),
+		Payload: []byte(r.deathPayload()),
 		QoS:     r.qos,
 		Retain:  true,
 	}, nil
+}
+
+// ConnectedPayloadDown is the `<name>/connected` payload of an instance that
+// is not running: the Last Will, and the explicit marker on graceful stop.
+const ConnectedPayloadDown = "0"
+
+// ErrNotSmartHome is returned by [Runtime.SetConnected] on a runtime whose
+// [Config.Layout] is not a [topic.SmartHomeLayout]: its status topic carries
+// online/offline, which has no level between the two.
+var ErrNotSmartHome = errors.New("publisher: Config.Layout is not a topic.SmartHomeLayout")
+
+// ErrConnectedLevel is returned by [Runtime.SetConnected] for a level other
+// than [discovery.ConnectedBroker] or [discovery.ConnectedOperational].
+// Level 0 is the will's and [Runtime.AnnounceOffline]'s.
+var ErrConnectedLevel = errors.New("publisher: connected level must be 1 or 2")
+
+func (r *Runtime) deathPayload() string {
+	if r.smartHome {
+		return ConnectedPayloadDown
+	}
+	return DeathPayload
+}
+
+// SetConnected moves `<name>/connected` between [discovery.ConnectedBroker]
+// — the broker is reachable, the hardware or upstream service is not — and
+// [discovery.ConnectedOperational], and reports whether that was a
+// transition. A transition is published retained and logged (spec §3.1 and
+// §11); a repeat of the current level publishes nothing.
+//
+// The level is remembered, so [Runtime.AnnounceOnline] republishes it on
+// every (re)connect as the spec requires. It starts at
+// [discovery.ConnectedBroker]: until the consumer says its upstream is
+// usable, nothing claims it is, and entities stay unavailable rather than
+// showing values nobody is refreshing.
+//
+// A failed publish keeps the new level, so the next announce sends it.
+func (r *Runtime) SetConnected(ctx context.Context, level int) (bool, error) {
+	if !r.smartHome {
+		return false, ErrNotSmartHome
+	}
+	if level != discovery.ConnectedBroker && level != discovery.ConnectedOperational {
+		return false, fmt.Errorf("%w, got %d", ErrConnectedLevel, level)
+	}
+	r.mu.Lock()
+	previous := r.connected
+	r.connected = level
+	r.mu.Unlock()
+	if previous == level {
+		return false, nil
+	}
+	r.log.Info("publisher.connected",
+		slog.Int("from", previous), slog.Int("to", level))
+	if err := r.announce(ctx, strconv.Itoa(level)); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+// Connected is the level [Runtime.AnnounceOnline] publishes under a
+// [topic.SmartHomeLayout]. It is meaningless on any other runtime.
+func (r *Runtime) Connected() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.connected
 }
 
 // AnnounceOnline publishes the retained "online" marker on
@@ -84,15 +154,24 @@ func (r *Runtime) Will() (Will, error) {
 // Call it after every (re)connect, not only at boot: the broker publishes the
 // will on the drop, so a reconnected consumer that does not re-announce stays
 // offline in Home Assistant while happily publishing state nobody displays.
+//
+// Under a [topic.SmartHomeLayout] it publishes the current
+// [Runtime.Connected] level instead.
 func (r *Runtime) AnnounceOnline(ctx context.Context) error {
+	if r.smartHome {
+		return r.announce(ctx, strconv.Itoa(r.Connected()))
+	}
 	return r.announce(ctx, BirthPayload)
 }
 
 // AnnounceOffline publishes the retained "offline" marker — the same payload
 // the broker would have published as the will, sent deliberately on a clean
 // shutdown where no will fires.
+//
+// Under a [topic.SmartHomeLayout] that is [ConnectedPayloadDown]. The level
+// [Runtime.SetConnected] last set is kept for the next announce.
 func (r *Runtime) AnnounceOffline(ctx context.Context) error {
-	return r.announce(ctx, DeathPayload)
+	return r.announce(ctx, r.deathPayload())
 }
 
 func (r *Runtime) announce(ctx context.Context, payload string) error {

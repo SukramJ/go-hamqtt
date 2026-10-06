@@ -28,6 +28,20 @@ import (
 // nothing on the wire naming the mismatch.
 var ErrNoAvailabilityLayout = errors.New("publisher: no topic layout configured")
 
+// ErrStatusItemAvailability is returned when availability is asked of this
+// publisher under the mqtt-smarthome convention, where it is a status item.
+//
+// A device's `online` item under a [topic.SmartHomeLayout], and a
+// [model.LevelSelf] datapoint under [discovery.StatusObjectEncoding], are
+// status objects with `ts` and `lc` (spec §5.2: one form for every status
+// item), and their discovery entries read `val`. The online/offline marker
+// this type writes would match neither payload, and Home Assistant would
+// keep the entity unavailable without a word. Publish them with
+// [StatePublisher.PublishStatus], whose gate on `val` gives the same
+// transition semantics.
+var ErrStatusItemAvailability = errors.New(
+	"publisher: under the mqtt-smarthome convention availability is a status item; publish it with StatePublisher")
+
 // AvailabilityConfig parameterises an [AvailabilityPublisher].
 type AvailabilityConfig struct {
 	// Layout renders the topics. It must be the same [topic.Layout] the
@@ -308,7 +322,12 @@ func (a *AvailabilityPublisher) DeviceTopic(s model.Slot) (string, error) {
 // silently ignores an availability payload it does not recognise and leaves
 // the entity unavailable, so an envelope here would look exactly like a
 // device that never came back.
+//
+// Under a [topic.SmartHomeLayout] it reports [ErrStatusItemAvailability].
 func (a *AvailabilityPublisher) Device(ctx context.Context, s model.Slot, online bool) (bool, error) {
+	if _, ok := a.layout.(topic.SmartHomeLayout); ok {
+		return false, ErrStatusItemAvailability
+	}
 	t, err := a.DeviceTopic(s)
 	if err != nil {
 		return false, err
@@ -363,7 +382,14 @@ type selfEnvelope struct {
 // Exported as a pure function because a consumer whose state plane already
 // owns that datapoint's topic must be able to render the same bytes without
 // a second writer — see [AvailabilityPublisher.Self].
+//
+// Under [discovery.StatusObjectEncoding] there is no pure rendering — the
+// status object carries timestamps — and it returns nil; see
+// [ErrStatusItemAvailability].
 func SelfAvailabilityPayload(enc discovery.Encoding, available bool) []byte {
+	if enc == discovery.StatusObjectEncoding {
+		return nil
+	}
 	if enc == discovery.RawEncoding {
 		if available {
 			return []byte("true")
@@ -404,6 +430,9 @@ func (a *AvailabilityPublisher) Self(
 	b, ok := model.Bind(e, model.RoleAvailability)
 	if !ok {
 		return false, nil
+	}
+	if enc == discovery.StatusObjectEncoding {
+		return false, ErrStatusItemAvailability
 	}
 	return a.write(ctx, a.layout.State(b.Slot), SelfAvailabilityPayload(enc, available))
 }
