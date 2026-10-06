@@ -95,8 +95,14 @@ before.
   reports process CPU time, `uptime`, `ts`, and always `rss`: from `/proc`
   on Linux, elsewhere the Go runtime's mapped-and-not-released memory,
   because she discards a stats document without a numeric `rss`).
-  `StatsInterval` maps
-  an operator's `0` to `StatsOff` rather than to the default.
+  `StatsInterval` maps an operator's `0` to `StatsOff` rather than to the
+  default.
+- **`DetectSupervised(envVar) func() bool`**, a shared answer for
+  `InstanceConfig.Supervised` with openccu-loom's detection semantics: the
+  consumer's own variable (`1`/`true`, `0`/`false`; an explicit false wins),
+  else systemd (parent PID 1 with `JOURNAL_STREAM` or `/run/systemd/system`),
+  Kubernetes, or `/.dockerenv`. A container without a restart policy is a
+  known false positive; the variable set to `0` is the way out.
 - **`ErrStatusItemAvailability`**: `AvailabilityPublisher.Device` under a
   `SmartHomeLayout`, and `Self` under the status-object encoding, refuse
   rather than write an online/offline marker the config cannot read; under
