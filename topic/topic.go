@@ -15,6 +15,13 @@
 // [a-z0-9_-] Home Assistant accepts for an object id — including transliterating
 // German umlauts the way Home Assistant's own slugify does, so "Größe" becomes
 // "groesse" rather than "gr_e".
+//
+// [SmartHome] is the one layout this package ships with a topic schema of its
+// own: mqtt-smarthome 2.0's `<name>/<function>/<item...>`, which openccu-loom
+// ADR 0083 adopts for all six consumers. It implements [SmartHomeLayout], the
+// capability the discovery context and the publisher read to switch their
+// vocabulary — `<name>/connected` as 0/1/2, a device's `online` status item —
+// so a consumer that wraps it keeps that switch by forwarding three methods.
 package topic
 
 import (
