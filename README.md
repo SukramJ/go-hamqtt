@@ -387,6 +387,65 @@ needs a second topic per datapoint.
 `RawEncoding` publishes the bare value instead, for a broker other tools read
 directly.
 
+`StatusObjectEncoding` publishes the mqtt-smarthome status object, see below.
+
+## The mqtt-smarthome 2.0 convention
+
+openccu-loom ADR 0083 moves all six consumers onto the
+[mqtt-smarthome 2.0](https://github.com/mqtt-smarthome/mqtt-smarthome/blob/master/SPEC.md)
+topic convention. Everything for it is additive and opt-in: a consumer that
+changes nothing publishes the same bytes as before.
+
+| Piece | What it does |
+| --- | --- |
+| `topic.SmartHome` | `<name>/status/<item…>`, `<name>/set/<item…>` (same item path), `<name>/meta/<item…>`, `<name>/status/<scope…>/<uid>/online`, `<name>/connected`, `<name>/info`, `<name>/maintenance/…`; pulses as non-retained status items. `NewSmartHome` validates the name (spec §3); `NewSmartHomeMultiLevel` keeps a deliberate `home/loom` and reports it non-conformant |
+| `topic.SmartHomeLayout` | the capability the rest of the module reads to switch vocabulary. A wrapping layout forwards `Connected`, `Info` and `Maintenance`, or embeds `SmartHome` |
+| `discovery.StatusObjectEncoding` | `value_template` reads `value_json.val`; `binary_sensor`/`switch` read `{{ value_json.val \| lower }}` (declare `payload_on: "true"`); labelled enums get the `EnumTemplates` pair on the `val` field. Availability becomes `<name>/connected` (available at ≥ 2, `ConnectedAvailability` for ≥ 1) plus the device's `online` item, four keys per entry, never `availability_template` |
+| `StatePublisher.PublishStatus` / `PulseStatus` | `{"val","ts","lc"}` in integer ms with one `StateConfig.ExtensionKey`; dedup on `val` and the extension, never `ts`; `lc` moves only with `val`; `Republish` re-sends the cached object unchanged; QoS 0 by default under this encoding; `StateConfig.Clock` for tests |
+| `Runtime.SetConnected` | `<name>/connected`: the will and `AnnounceOffline` write `0`, `AnnounceOnline` republishes the current level, which starts at `1` until the consumer says its upstream is usable |
+| `CommandRouter.HandleSet`, `CommandConfig.NormalizeSet` | `set` per spec §5.3: `{"val": x}` as `x`, other JSON as parameters, empty payloads dropped, malformed JSON logged at warn; `SetValue.Bool`/`Number`/`Enum` for the conversions |
+| `Instance` | retained `<name>/info` (`name`, `version`, `spec`, `go`, `host`, `pid`, `started`, `maintenance`, project fields), `maintenance/set/loglevel`, `maintenance/set/restart` (only when `Supervised` answers true), retained `maintenance/stats` every 60 s |
+
+The device's `online` item is a status item like any other, so it is written
+with `PublishStatus`, not `AvailabilityPublisher`, which refuses it with
+`ErrStatusItemAvailability` rather than writing a marker the config cannot
+read. `publisher/example_smarthome_test.go` is this snippet compiled.
+
+```go
+layout, err := topic.NewSmartHome("daikin") // refuses / + # and empty names
+dctx := discovery.StdContext{Layout: layout, Namespace: "daikin", Enc: discovery.StatusObjectEncoding}
+
+run := publisher.New(tr, publisher.Config{Layout: layout}) // will: daikin/connected = 0
+state := publisher.StateFor(run, publisher.StateConfig{Encoding: dctx.Encoding()})
+router := publisher.NewCommandRouter(tr, publisher.CommandConfig{Lifecycle: ctx})
+inst := publisher.NewInstance(tr, publisher.InstanceConfig{
+    Layout: layout, Name: "go-daikin2mqtt", Version: version,
+    SetLogLevel: publisher.LevelVarSetter(&logLevel),
+    Supervised:  supervised, // nil or false: restart is refused at warn
+    Shutdown:    stop,       // publishes connected 0, exits 0
+})
+_ = router.HandleSet(layout.Name()+"/set/+/+/power", func(ctx context.Context, cmd publisher.Command, v publisher.SetValue) {
+    on, err := v.Bool() // true/false, 1/0, on/off, yes/no
+})
+_ = inst.Register(router) // <name>/maintenance/set/#
+go inst.RunStats(ctx)
+
+// on every (re)connect
+_ = run.AnnounceOnline(ctx)
+_ = inst.AnnounceInfo(ctx)
+_, _ = state.Republish(ctx)
+
+_, _ = run.SetConnected(ctx, discovery.ConnectedOperational) // upstream usable
+_, _ = state.PublishStatus(ctx, layout.State(slot), publisher.Observation{Value: 21.5})
+_, _ = state.PublishStatus(ctx, layout.Availability(slot), publisher.Observation{Value: true})
+```
+
+A consumer whose item tree is not the slot's scope/address/channel/bucket/path
+order embeds `topic.SmartHome` and overrides `State` and `Command` with its own
+item path through `Status(item…)` and `Set(item…)`. Those helpers make every
+segment topic-safe, wildcards included, so a subscription filter is spelled
+from `Name()`.
+
 ## Testing
 
 ```sh
