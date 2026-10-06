@@ -21,9 +21,13 @@ import (
 // bad key means fixing a catalog one entry per test run.
 type ValidationError struct {
 	NodeID string
-	// Issues are the problems Home Assistant does not tolerate: a key it
-	// drops, a required key that is missing, a device class the platform does
-	// not declare. A payload with any of these is broken on arrival.
+	// Issues are the problems this validator blocks on: a key Home
+	// Assistant drops, a required key that is missing, a device class the
+	// platform does not declare. Not every one of them is something Home
+	// Assistant refuses — it strips an unknown key and only logs a state
+	// class impossible for its device class — and those it does refuse, it
+	// mostly refuses one component at a time, not the document. [Inspect]
+	// says which is which.
 	Issues []string
 	// Warnings are the things Home Assistant accepts and then rewrites. They
 	// belong in a report but must not stop a publish — treating them as
@@ -77,13 +81,28 @@ func (e *ValidationError) Is(target error) bool {
 // Validate checks a bundle against the Home Assistant schemas the catalog
 // carries, and returns every problem it finds.
 //
-// This runs before publishing, and a failure means nothing is published for
-// that device. That is the point: Home Assistant discards a malformed
-// discovery config in silence — no error on the wire, no entry in its log that
-// names the cause — so an invalid payload is indistinguishable from a bridge
-// that never spoke. The reference implementation published unvalidated, which
-// is how a wrong micro sign could cost a whole device's entities without
-// anyone learning why.
+// Its verdict is all or nothing, and it is unchanged since v0.36.0 — the
+// module guarantees that, and TestValidateIsUnchanged checks it against the
+// frozen implementation. What that verdict is NOT is a statement that Home
+// Assistant would discard the device. Home Assistant (core 2026.10.0b2)
+// validates a device document as a whole only for its `device` and `origin`
+// blocks, its shared availability options, and each component's `platform`
+// and `unique_id` (components/mqtt/schemas.py:194-227, applied in
+// components/mqtt/discovery.py:304-313). Everything else is validated per
+// component by the platform's schema, and a failure there costs that one
+// entity (components/mqtt/entity.py:324-347); an unknown key is stripped, not
+// refused, because those schemas are `extra=REMOVE_EXTRA`. So a consumer that
+// withholds the whole document on any error from Validate withholds every
+// entity of the device for a finding that would have cost Home Assistant one
+// of them, or none. [Inspect] reports each finding with the scope and
+// severity Home Assistant applies, and [Contain] publishes what Home
+// Assistant would accept; prefer those on a publish path.
+//
+// Validation before publishing is still the point. Home Assistant reports a
+// refused document or entity only in its own log, never on the wire, so an
+// invalid payload looks from the bridge exactly like one that worked. The
+// reference implementation published unvalidated, which is how a wrong micro
+// sign could cost entities without anyone learning why.
 func Validate(b *Bundle) error { return ValidateIgnoring(b, nil) }
 
 // ValidateIgnoring is [Validate] with a set of keys the consumer publishes on
@@ -96,7 +115,9 @@ func Validate(b *Bundle) error { return ValidateIgnoring(b, nil) }
 // accounted for every blocking finding on 164 of 9,996 entities, turning 64
 // of 398 device bundles Blocking(). A consumer wiring the validator into its
 // publish path would therefore withhold a sixth of its devices entirely,
-// because an invalid bundle publishes nothing at all.
+// because a consumer that withholds an invalid bundle publishes nothing for
+// it at all. (That withholding is the consumer's gate, not Home Assistant's:
+// Home Assistant itself strips the key and keeps the entity — see [Inspect].)
 //
 // The set is a parameter rather than a field on Bundle: it is a property of
 // the consumer's judgement, not of the document, and the same document
@@ -118,8 +139,12 @@ func ValidateIgnoring(b *Bundle, ignore map[string]bool) error {
 		issues.add("node id %q is not a legal topic segment (want %q)", b.NodeID, slug)
 	}
 	if b.Origin.Name == "" {
-		// Required by Home Assistant on a device bundle, unlike the
-		// per-entity form where it is optional.
+		// The key is Required by Home Assistant on a device bundle, unlike
+		// the per-entity form where the block is optional — but [Origin]
+		// always encodes it, and an empty string passes cv.string
+		// (components/mqtt/schemas.py:162), so Home Assistant accepts the
+		// document. Kept as an issue because Validate does not change;
+		// [Inspect] reports it as the warning it is.
 		issues.add("origin.name is required on a device bundle")
 	}
 	if len(b.Device.Identifiers) == 0 && len(b.Device.Connections) == 0 {
@@ -291,7 +316,10 @@ func validateBody(
 
 	uniqueID := str(body, "unique_id")
 	// A component with more than a platform must carry a unique id; Home
-	// Assistant rejects the bundle otherwise.
+	// Assistant rejects the whole document otherwise (check_unique_id,
+	// components/mqtt/schemas.py:199-204) — on entity platforms only:
+	// `device_automation` and `tag` are exempt there, which [Inspect]
+	// honours and this unchanged check does not.
 	if uniqueID == "" {
 		if !isRemoval(body) {
 			issues.add("%s: unique_id is required", key)
@@ -310,7 +338,8 @@ func validateBody(
 	// Unknown keys: Home Assistant drops them silently (its discovery schema
 	// is extra=REMOVE_EXTRA), so a typo costs a feature with no diagnostic
 	// anywhere. Checking against the extracted schema is the only place this
-	// becomes visible.
+	// becomes visible. Home Assistant keeps the entity, so this is an issue
+	// only by this validator's standard; [Inspect] calls it a warning.
 	if schema, ok := mqtt.Platforms[platform]; ok {
 		validateKeys(issues, key, platform, body, schema, ignore)
 	}
@@ -393,6 +422,10 @@ func validateSensorRelations(issues *issueList, key, platform string, body map[s
 	unit := str(body, "unit_of_measurement")
 	options, hasOptions := body["options"]
 
+	// An issue here, but Home Assistant creates the entity and logs one
+	// warning (sensor/__init__.py:620-645 in core 2026.10.0b2). This is the
+	// finding that made a consumer withhold every appliance's document;
+	// [Inspect] reports it as a warning.
 	if stateClass != "" && deviceClass != "" {
 		if allowed, known := relations.SensorDeviceClassStateClasses[deviceClass]; known {
 			if !slices.Contains(allowed, stateClass) {
@@ -407,8 +440,8 @@ func validateSensorRelations(issues *issueList, key, platform string, body map[s
 	//
 	// Sensor only. `select` *requires* options and declares no device_class at
 	// all, so applying this rule everywhere rejected every select ever built —
-	// and since an invalid bundle publishes nothing for the whole device, one
-	// enum parameter would have silenced every entity of that device.
+	// and for a consumer that withholds an invalid bundle, one enum parameter
+	// would have silenced every entity of that device.
 	if hasOptions && !isEmptyList(options) && platform == string(hacatalog.PlatformSensor) {
 		if deviceClass != "enum" {
 			issues.add("%s: options require device_class \"enum\", got %q", key, deviceClass)

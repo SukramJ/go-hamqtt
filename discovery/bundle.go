@@ -12,6 +12,19 @@
 //
 // This package owns every Home Assistant JSON key name in the module. Nothing
 // below it knows what "state_topic" is called.
+//
+// # Validation
+//
+// Three entry points, from oldest to newest. [Validate] returns one
+// all-or-nothing error and is frozen: it answers exactly as it did in
+// v0.36.0. [Inspect] reports every finding with the scope Home Assistant
+// acts on — the whole document, or one component — and the severity it acts
+// with. [Contain] turns that into the document Home Assistant would accept:
+// components it refuses are withheld (never tombstoned), the rest published.
+// Home Assistant refuses a whole device document for very little — its
+// device and origin blocks, and a component's `platform` or `unique_id` —
+// and everything else one entity at a time; the comment at the top of
+// inspect.go has the rule and the core references.
 package discovery
 
 import (
@@ -327,6 +340,24 @@ type Bundle struct {
 	// that fills it directly is doing the same thing by hand.
 	Tombstones map[string]Component `json:"-"`
 
+	// Withheld holds the components [Contain] took out of this document
+	// because Home Assistant would refuse them, keyed the same way
+	// [Bundle.Components] is. Not part of the payload.
+	//
+	// A withheld component is NOT removed, and the difference is the whole
+	// reason this field exists. Omitting a key from a device document
+	// leaves Home Assistant's entity as it was (discovery.py only removes
+	// what an entry with nothing but a platform names), while a tombstone
+	// deletes the entity together with its registry entry — its entity id,
+	// its name, the automations and dashboards that reference it. So
+	// [Bundle.Remove] and [Bundle.RemoveComponents] skip a key listed here,
+	// whichever order a consumer calls them in, and [Bundle.KeepSet] counts
+	// it as still declared, so next cycle's "what disappeared?" diff does
+	// not see it disappear.
+	//
+	// Nil on every bundle [Contain] did not produce.
+	Withheld map[string]Component `json:"-"`
+
 	// QoS, if set, applies to every component that does not set its own.
 	QoS *int `json:"qos,omitempty"`
 }
@@ -381,6 +412,10 @@ func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string
 		if !known || platform == "" {
 			continue
 		}
+		// Withheld by [Contain], not removed: see [Bundle.Withheld].
+		if _, withheld := b.Withheld[k]; withheld {
+			continue
+		}
 		was := b.Components[k]
 		was.Platform = platform
 		b.rememberTombstone(k, was)
@@ -416,9 +451,34 @@ func (b *Bundle) RemoveComponents(was map[string]Component, keys ...string) {
 		if !known || prev.Platform == "" {
 			continue
 		}
+		// Withheld by [Contain], not removed: see [Bundle.Withheld].
+		if _, withheld := b.Withheld[k]; withheld {
+			continue
+		}
 		b.rememberTombstone(k, prev)
 		b.Components[k] = Component{Platform: prev.Platform}
 	}
+}
+
+// KeepSet is what a consumer remembers as "declared" for its next removal
+// diff: every entry of [Bundle.Components] plus every component
+// [Contain] withheld.
+//
+// Use it wherever the previous document's Components were used as the
+// "was" of [Bundle.RemoveComponents]. Remembering only what was published
+// loses a withheld component from the diff twice over: while it is still
+// rendered it is not "removed" (harmless), but once it really leaves the
+// catalogue nothing tombstones it, and its old entity lingers in Home
+// Assistant. The result is a fresh map; the components are shared values.
+func (b *Bundle) KeepSet() map[string]Component {
+	out := make(map[string]Component, len(b.Components)+len(b.Withheld))
+	maps.Copy(out, b.Components)
+	for k := range b.Withheld {
+		if _, published := out[k]; !published {
+			out[k] = b.Withheld[k]
+		}
+	}
+	return out
 }
 
 // rememberTombstone records a removed component's identity outside the

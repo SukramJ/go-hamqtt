@@ -30,6 +30,113 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-10-06
+
+### Added
+
+Validation that says what Home Assistant does, and the containment that
+follows from it. All of it is new API; nothing existing changed its answer.
+How to tell whether this applies to you: it does if your publish path
+withholds a device document when `discovery.Validate` returns an error.
+
+The premise this module's doc comments stated — that Home Assistant drops a
+device document whole over a malformed component — is wrong for current
+Home Assistant, and the comments are corrected. Read off core 2026.10.0b2
+and exercised against its real schemas: a document is refused as a whole
+only over its `device` and `origin` blocks, its shared availability
+options, and each component's `platform` and `unique_id`
+(`components/mqtt/schemas.py:194-227`, `discovery.py:304-313`); everything
+else is validated per component and costs that entity
+(`components/mqtt/entity.py:324-347`); unknown keys are stripped, not
+refused (`extra=REMOVE_EXTRA`). Measured on 2026-10-06: go-homeconnect2mqtt
+0.15.0, following the old comment, withheld every appliance's document over
+one timestamp sensor's `state_class: measurement` — which Home Assistant
+only logs a warning about (`sensor/__init__.py:620-645`).
+
+- **`discovery.Inspect(b, InspectOptions) Findings`**: every finding with
+  its `Scope` (`ScopeDocument` / `ScopeComponent`), the component key it is
+  attributed to (empty for the document's own keys), a stable
+  `FindingKind`, a `Severity` (`SeverityError`: Home Assistant refuses the
+  thing in scope; `SeverityWarning`: it accepts it and strips, rewrites or
+  logs), the offending `Keys`, whether the warning is `Strippable`, and the
+  message. `Findings.Errors`, `Warnings`, `ForComponent`,
+  `DocumentErrors` and `FailingComponents` decide with it. Classified
+  differently from `Validate`, each against core: an unknown key and a
+  state class impossible for its device class are warnings; an empty
+  `origin.name` is a warning (`Origin` always encodes the key and cv.string
+  accepts `""`); no components is a warning; a missing `platform`, an
+  unsupported platform and a missing `unique_id` are document errors
+  attributed to their component — curable by withholding it; `unique_id` is
+  not required on `device_automation` and `tag`.
+- **New checks, in `Inspect` only**: `entity_category` outside
+  config/diagnostic, and `config` on `sensor`/`binary_sensor`; a `number`
+  step below 0.001, min > max after the 0/100 defaults, a bound that is not
+  a number, and NaN/±Inf (which encoding/json cannot encode, so the whole
+  document fails to marshal); a sensor unit outside its device class's or
+  state class's unit set; a non-numeric sensor (`date`, `enum`,
+  `timestamp`, `uptime`) with a unit; an empty `options` list;
+  `last_reset_value_template` without `state_class: total`; and keys other
+  than the four in a component's `availability` entry (stripped by Home
+  Assistant, so a strippable warning).
+- **`discovery.Contain(b, ContainOptions) *Containment`**: the document
+  Home Assistant would accept. Components with an error are withheld and
+  reported in `Withheld`; with `StripWarnings`, strippable keys are removed
+  and listed in `Stripped`; `Publishable`/`Err` (matching
+  `ErrUnpublishable`) refuse only for an error on the document's own keys or
+  when nothing is left. The input is never modified.
+- **A withheld component is never a tombstone.** `Bundle.Withheld` records
+  what containment took out; `Bundle.Remove` and `Bundle.RemoveComponents`
+  skip those keys, so the natural removal diff cannot delete the entity and
+  its registry entry; `Bundle.KeepSet()` is the prior set to remember for the
+  next diff. `publisher.WithheldTopics` names a withheld component's old
+  per-entity config topics, `Runtime.PublishBundle` keeps them away from
+  `Runtime.Sweep` (`Runtime.Kept` lists them), and supersedes them once the
+  component is published again.
+- **`publisher.Config.Contain` and `Config.OnContained`**: opt-in
+  containment inside `Runtime.PublishBundle`, the publish path all six
+  consumers share. Nil publishes exactly the bytes it is given, as before.
+- **`topic.FunctionHA`, `topic.IsReservedFunction`, `SmartHome.HA`**: the
+  adapter function `<name>/ha/<item…>` openccu-loom uses for
+  Home-Assistant-native documents. `IsFunction("ha")` stays false: a
+  consumer refuses to start when an operator's site identifier is one
+  `IsFunction` reports, so widening it would stop an installation whose
+  site segment is literally `ha` on a dependency bump. A guard that should
+  include the adapter function calls `IsReservedFunction`.
+- **`publisher.InstanceConfig.ExtraFunc`**: `info` fields resolved at every
+  render, applied after the static `Extra`; reserved keys are dropped with a
+  warning as for `Extra`.
+- **`discovery.StatusAttributesTemplate`** (`{{ value_json.val | tojson }}`).
+- **`StdContext.AvailabilityFrom` and `discovery.BindingSlot`**: the
+  availability list with the device level resolved from a slot of the
+  caller's choosing — the entity's first binding, for a tree that keys the
+  `online` item on a bare serial or MAC rather than the device UID.
+  `StdContext.Availability` renders exactly as before.
+
+### Unchanged, and checked
+
+- **`Validate`, `ValidateIgnoring`, `ValidateBody` and
+  `ValidateBodyIgnoring` return exactly what they returned in v0.36.0** for
+  every input — same error identity, message and issue/warning lists.
+  `TestValidateIsUnchanged` runs a corpus of over a thousand bundles (every
+  fixture of this package plus a combinatorial sweep), and every component
+  of them as a per-entity body, through the current functions and through a
+  frozen copy of the v0.36.0 implementation. Their doc comments now say what
+  the verdict is and is not; a consumer gains, by moving to `Contain`, every
+  entity `Validate`'s all-or-nothing verdict would have withheld for another
+  entity's fault, or for a key Home Assistant only strips.
+
+### Notes
+
+- Tables this release keeps by hand because go-ha-catalog v0.3.0 has none,
+  each cited to core and each belonging in go-ha-catalog: the
+  non-entity platforms (`device_automation`, `tag`), the platforms that
+  refuse `entity_category: config`, the four availability-entry keys, and
+  the number step minimum. The non-numeric sensor classes are derived from
+  the catalog and pinned against core's constant by a test.
+- go-ha-catalog's `device_automation` schema carries only `automation_type`,
+  so `Validate` and `Inspect` both report `topic`, `type` and `subtype` as
+  unknown keys there; a catalog fix, not one this release makes.
+
 ## [0.36.0] - 2026-10-06
 
 ### Added
@@ -2272,6 +2379,16 @@ first day.
   invalid bundle publishes nothing for the whole device, a single enum
   parameter would have silenced every entity of that device. The rule
   is now sensor-only, where Home Assistant's own validator puts it.
+
+  > **Correction (2026-10-06).** "An invalid bundle publishes nothing for
+  > the whole device" describes a consumer that withholds a document on
+  > any `Validate` error, not Home Assistant. Home Assistant (core
+  > 2026.10.0b2) refuses a device document as a whole only over its
+  > `device`/`origin` blocks and a component's `platform` or `unique_id`
+  > (`components/mqtt/schemas.py:194-227`); a sensor with `options` but
+  > no `device_class: enum` costs that one entity
+  > (`components/mqtt/entity.py:324-347`). See 0.37.0's `Inspect` and
+  > `Contain`.
 - **A `Builder`'s `Extra` was discarded.** `renderComponent` assigned
   `comp.Extra = desc.Extra` *after* running the builder, closing the
   only route to the ~90 platform keys that have no typed field yet —

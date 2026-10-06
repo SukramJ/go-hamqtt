@@ -149,12 +149,16 @@ func Example_runtime() {
 	if err != nil {
 		return
 	}
-	// Not optional. Home Assistant discards a malformed discovery config in
-	// silence, so an invalid payload is indistinguishable from a bridge that
-	// never spoke.
-	if err := discovery.Validate(bundle); err != nil {
+	// Not optional. Home Assistant refuses a malformed discovery config in
+	// its own log only, so an invalid payload is indistinguishable from a
+	// bridge that never spoke. Contain rather than Validate: Home Assistant
+	// refuses most findings one component at a time, so withholding the
+	// whole device on one would cost every entity for one entity's fault.
+	contained := discovery.Contain(bundle, discovery.ContainOptions{})
+	if !contained.Publishable() {
 		return
 	}
+	bundle = contained.Bundle
 
 	// ── boot, in this order ────────────────────────────────────────────────
 	//

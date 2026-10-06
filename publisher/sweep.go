@@ -387,11 +387,15 @@ func (r *Runtime) hasClaimed(topic string) bool {
 // sweep's own subscription — while `declared` records it only afterwards.
 // Without the in-flight claim, a sweep running concurrently with a publish
 // retracts the config that publish just wrote.
+//
+// `keptCount` is consulted too: a per-entity config of a component that
+// containment withheld from its device document is still what describes that
+// entity, and clearing it would delete the entity — see [WithheldTopics].
 func (r *Runtime) claims(topic string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	_, declared := r.declared[topic]
-	return declared || r.announced[topic]
+	return declared || r.announced[topic] || r.keptCount[topic] > 0
 }
 
 // snapshot installs filter for the length of window, feeds every delivery to

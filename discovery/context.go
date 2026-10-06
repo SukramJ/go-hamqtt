@@ -213,6 +213,67 @@ func entitySlot(dev *model.Device, e model.Entity) model.Slot {
 // [ConnectedAvailability] (available at 2), and a device entry reads the
 // device's `online` status item through [OnlineAvailability].
 func (c StdContext) Availability(dev *model.Device, e model.Entity) []AvailabilityEntry {
+	return c.availability(dev, e, func(dev *model.Device, e model.Entity) (model.Slot, bool) {
+		return deviceSlot(dev, e), true
+	}, false)
+}
+
+// AvailabilityFrom is [StdContext.Availability] with the device level
+// resolved from a slot the caller chooses instead of [DeviceSlot].
+//
+// It exists for a consumer whose device-level availability item is not keyed
+// on the device's identity: [DeviceSlot] addresses the device by
+// [model.Device.UID] — typically the discovery identifier, such as
+// `bridge_<serial>` — while the consumer's own tree keys the item on the
+// bare serial, MAC or client key that only the entity's binding carries. Such
+// a consumer used to override [Context.Availability] wholesale to change that
+// one coordinate, and with it re-implement the level loop, the smart-home
+// vocabulary switch and the parent level; it can now delegate:
+//
+//	func (c ctx) Availability(dev *model.Device, e model.Entity) []discovery.AvailabilityEntry {
+//		return c.StdContext.AvailabilityFrom(dev, e, discovery.BindingSlot)
+//	}
+//
+// Every level renders exactly as [StdContext.Availability] renders it, with
+// two differences, both about the device and parent levels: the slot comes
+// from device (which may answer false to skip the level), and a level whose
+// slot the layout renders as no topic at all is skipped rather than emitted
+// with an empty topic — a resolver that names a slot for every entity cannot
+// know which of them have an item. [model.LevelParent] takes the resolved
+// slot with its Address replaced by the parent's UID, as
+// [StdContext.Availability] does.
+func (c StdContext) AvailabilityFrom(
+	dev *model.Device,
+	e model.Entity,
+	device func(*model.Device, model.Entity) (model.Slot, bool),
+) []AvailabilityEntry {
+	if device == nil {
+		return c.Availability(dev, e)
+	}
+	return c.availability(dev, e, device, true)
+}
+
+// BindingSlot resolves an entity's device level to the slot of its first
+// binding, for [StdContext.AvailabilityFrom]: the coordinate the consumer's
+// own tree addresses the entity's object by. An entity with no binding has
+// no device level.
+func BindingSlot(_ *model.Device, e model.Entity) (model.Slot, bool) {
+	if e == nil {
+		return model.Slot{}, false
+	}
+	binds := e.Bindings()
+	if len(binds) == 0 {
+		return model.Slot{}, false
+	}
+	return binds[0].Slot, true
+}
+
+func (c StdContext) availability(
+	dev *model.Device,
+	e model.Entity,
+	resolve func(*model.Device, model.Entity) (model.Slot, bool),
+	skipEmpty bool,
+) []AvailabilityEntry {
 	levels, _ := e.Desc().Availability.Resolved()
 	out := make([]AvailabilityEntry, 0, len(levels))
 
@@ -229,13 +290,24 @@ func (c StdContext) Availability(dev *model.Device, e model.Entity) []Availabili
 			out = append(out, bridge(c.Layout.Bridge()))
 
 		case model.LevelDevice:
-			out = append(out, device(c.Layout.Availability(deviceSlot(dev, e))))
+			slot, ok := resolve(dev, e)
+			if !ok {
+				continue
+			}
+			if t := c.Layout.Availability(slot); t != "" || !skipEmpty {
+				out = append(out, device(t))
+			}
 
 		case model.LevelParent:
 			if dev.Via != nil {
-				parent := deviceSlot(dev, e)
+				parent, ok := resolve(dev, e)
+				if !ok {
+					continue
+				}
 				parent.Address = dev.Via.UID()
-				out = append(out, device(c.Layout.Availability(parent)))
+				if t := c.Layout.Availability(parent); t != "" || !skipEmpty {
+					out = append(out, device(t))
+				}
 			}
 
 		case model.LevelSelf:
@@ -330,9 +402,12 @@ func ConnectedTemplate(atLeast int) string {
 // by replacing that entry.
 //
 // The entry carries the four keys of a list entry and nothing else. Spec §8
-// is explicit that `availability_template` belongs to the single-topic form,
-// and Home Assistant rejects a whole device document over one unknown key in
-// a list entry.
+// is explicit that `availability_template` belongs to the single-topic form.
+// Inside a component, Home Assistant strips any other key from a list entry
+// (the platform schemas are `extra=REMOVE_EXTRA`, and that reaches the
+// nested entries of components/mqtt/schemas.py:100-114), so the key would
+// silently do nothing; only in a document-level `availability` list, which
+// [Bundle] does not produce, would it refuse the whole document.
 func ConnectedAvailability(t string, atLeast int) AvailabilityEntry {
 	return AvailabilityEntry{
 		Topic:               t,

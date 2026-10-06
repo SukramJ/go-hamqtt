@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -203,6 +204,25 @@ type Config struct {
 	// measured consumer does the first two. Nil is fine.
 	OnResync func(replayed int, err error)
 
+	// Contain, when set, makes [Runtime.PublishBundle] publish
+	// [discovery.Contain]'s result instead of the bundle it was handed: a
+	// component Home Assistant would refuse is withheld and reported, the
+	// rest of the device is published, and only a document Home Assistant
+	// refuses whatever it contains is not published at all — PublishBundle
+	// then returns an error matching [discovery.ErrUnpublishable] and
+	// writes nothing, not even the supersede retractions.
+	//
+	// Nil — the zero value — publishes exactly the bytes it is given, as
+	// every release before v0.37.0 did. It is opt-in because it changes
+	// what reaches the broker for a bundle that has findings.
+	Contain *discovery.ContainOptions
+
+	// OnContained receives every containment that found anything, before
+	// the publish, with the device's node id. It is where a consumer logs
+	// or counts what was withheld; the runtime itself logs one warning per
+	// withheld component. Nil is fine. Called only when Contain is set.
+	OnContained func(nodeID string, c *discovery.Containment)
+
 	// Logger receives the runtime's own diagnostics. Nil means
 	// [slog.Default].
 	Logger *slog.Logger
@@ -308,6 +328,14 @@ type Runtime struct {
 	// in it. It is not a dedup structure; it is the ownership evidence
 	// [SweepRequest.SelfClaimed] reads. See [Runtime.Claimed].
 	claimed map[string]bool
+	// kept maps a device document's topic to the per-entity config topics
+	// of the components containment withheld from it, and keptCount
+	// counts how many documents keep each. A kept topic is one the sweep
+	// must not clear: its retained per-entity config is what still
+	// describes a component the current document deliberately leaves out.
+	// See [WithheldTopics].
+	kept      map[string][]string
+	keptCount map[string]int
 	// gen is the connection generation the memos above describe, and
 	// genSeen whether one has ever been read. Both are meaningless unless
 	// the transport implements [Generational].
@@ -387,6 +415,8 @@ func New(tr Transport, cfg Config) *Runtime {
 		announced:  map[string]bool{},
 		superseded: map[string]bool{},
 		claimed:    map[string]bool{},
+		kept:       map[string][]string{},
+		keptCount:  map[string]int{},
 		smartHome:  smartHome,
 		connected:  discovery.ConnectedBroker,
 	}
@@ -535,11 +565,29 @@ func (r *Runtime) Publish(ctx context.Context, topic string, payload []byte) (bo
 // change of the document. After the first retraction the broker holds nothing
 // there, so a second is a message for nothing — and a boot that rewrites a
 // device forty times would otherwise send forty rounds of them.
+//
+// # Containment
+//
+// With [Config.Contain] set, the document published is
+// [discovery.Contain]'s result rather than b, and b is not modified. A bundle
+// that is already contained — one whose [discovery.Bundle.Withheld] is set,
+// whoever called [discovery.Contain] — has the per-entity config topics of
+// its withheld components kept away from [Runtime.Sweep] for as long as this
+// document is the one the runtime last published for that node: the old
+// per-entity config is what still describes such an entity during a
+// migration, and clearing it would delete it. See [WithheldTopics].
 func (r *Runtime) PublishBundle(ctx context.Context, b *discovery.Bundle) (bool, error) {
 	if b == nil {
 		return false, errors.New("publisher: nil bundle")
 	}
 	r.checkGeneration()
+	if r.cfg.Contain != nil {
+		contained, err := r.contain(b)
+		if err != nil {
+			return false, err
+		}
+		b = contained
+	}
 	payload, err := json.Marshal(b)
 	if err != nil {
 		return false, fmt.Errorf("publisher: marshal bundle %s: %w", b.NodeID, err)
@@ -547,6 +595,7 @@ func (r *Runtime) PublishBundle(ctx context.Context, b *discovery.Bundle) (bool,
 	// BundleConfigTopic rather than [discovery.Bundle.Topic] so a prefix
 	// written with a trailing slash addresses the same tree the parser reads.
 	topic := BundleConfigTopic(r.cfg.Prefix, b.NodeID)
+	r.keep(topic, WithheldTopics(r.cfg.Prefix, b, r.cfg.LegacyEntityTopics...))
 
 	// Checked before the retraction, not after: a repeat publish must not
 	// tear down the per-entity topics a second time, and on a steady-state
@@ -562,6 +611,90 @@ func (r *Runtime) PublishBundle(ctx context.Context, b *discovery.Bundle) (bool,
 		return false, err
 	}
 	return r.Publish(ctx, topic, payload)
+}
+
+// contain applies [Config.Contain] to b and reports what it did.
+func (r *Runtime) contain(b *discovery.Bundle) (*discovery.Bundle, error) {
+	c := discovery.Contain(b, *r.cfg.Contain)
+	if len(c.Findings) > 0 && r.cfg.OnContained != nil {
+		r.cfg.OnContained(b.NodeID, c)
+	}
+	for _, key := range sortedComponentKeys(c.Withheld) {
+		errs := c.Findings.ForComponent(key).Errors()
+		reasons := make([]string, 0, len(errs))
+		for _, f := range errs {
+			reasons = append(reasons, f.Message)
+		}
+		r.log.Warn("publisher.bundle.component_withheld",
+			slog.String("node_id", b.NodeID),
+			slog.String("component", key),
+			slog.String("reason", strings.Join(reasons, "; ")))
+	}
+	if err := c.Err(); err != nil {
+		return nil, fmt.Errorf("publisher: bundle %s: %w", b.NodeID, err)
+	}
+	return c.Bundle, nil
+}
+
+// keep records the per-entity topics a document's withheld components still
+// own, replacing what the previous publish of that document kept.
+func (r *Runtime) keep(bundleTopic string, topics []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, t := range r.kept[bundleTopic] {
+		r.keptCount[t]--
+		if r.keptCount[t] <= 0 {
+			delete(r.keptCount, t)
+		}
+	}
+	if len(topics) == 0 {
+		delete(r.kept, bundleTopic)
+		return
+	}
+	r.kept[bundleTopic] = topics
+	for _, t := range topics {
+		r.keptCount[t]++
+	}
+}
+
+// Kept lists the per-entity config topics the runtime currently keeps away
+// from the sweep because containment withheld their component, sorted.
+func (r *Runtime) Kept() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.keptCount))
+	for t := range r.keptCount {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WithheldTopics returns the per-entity config topics of the components
+// [discovery.Contain] withheld from b, in the forms given — exactly what
+// [SupersededTopics] would have returned for them had they been published.
+//
+// They are the topics a consumer must treat as still owned. During a
+// migration from the per-entity form, a withheld component's old config is
+// still retained and is what keeps its entity alive: the document leaves the
+// component out, so [Runtime.PublishBundle] does not retract it, and an
+// orphan sweep that did would delete the entity with its registry entry.
+// [Runtime.PublishBundle] keeps these away from [Runtime.Sweep] itself; a
+// consumer running its own sweep excludes them.
+func WithheldTopics(prefix string, b *discovery.Bundle, forms ...LegacyTopicFunc) []string {
+	if b == nil || len(b.Withheld) == 0 {
+		return nil
+	}
+	return SupersededTopics(prefix, &discovery.Bundle{NodeID: b.NodeID, Components: b.Withheld}, forms...)
+}
+
+func sortedComponentKeys(m map[string]discovery.Component) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // PublishComponent writes one entity's standalone discovery config, in the
