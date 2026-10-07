@@ -30,6 +30,14 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+### Added
+
+- **`docs/open-items.md`**: what is known to be unfinished across this module
+  and its six consumers as of v0.37.0, mostly left over from the
+  mqtt-smarthome 2.0 wave (openccu-loom ADR 0083). Each entry points at the
+  ADR section, changelog entry, file or PR that holds the detail. Documentation
+  only.
+
 ## [0.37.0] - 2026-10-06
 
 ### Added
