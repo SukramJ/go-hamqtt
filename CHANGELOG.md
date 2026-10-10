@@ -30,6 +30,12 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+### Security
+
+- Built with Go 1.27.2, which fixes Go standard-library vulnerabilities
+  (net/http and HTTP/2, crypto/tls, net/textproto, html/template).
+- golangci-lint v2.14.0 (reads Go 1.27.2's export data).
+
 ### Added
 
 - **`docs/open-items.md`**: what is known to be unfinished across this module
