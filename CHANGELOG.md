@@ -30,6 +30,8 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-10-12
+
 ### Security
 
 - Built with Go 1.27.2, which fixes Go standard-library vulnerabilities
@@ -38,6 +40,24 @@ fine, because a change here moves them.
 
 ### Added
 
+- **`publisher.Config.SupersedeObserved`**: `Runtime.PublishBundle` retracts
+  a superseded per-entity config only where the broker still retains one.
+  The first supersede step on a connection opens one snapshot window over
+  the discovery prefix (`Config.SweepWindow`); topics it did not see are
+  memoised as done without a message. Topics outside the prefix, and every
+  topic when the snapshot cannot be taken, are retracted as before. Opt-in,
+  so a consumer that sets nothing behaves exactly as before. The trap it
+  closes: Home Assistant checks the discovery topic before the payload
+  (core `components/mqtt/entity.py:1153-1187`), so each blind retraction
+  that reaches an entity already owned by a device document is logged as
+  `Received a conflicting MQTT discovery message`, on every connection,
+  long after the migration finished. A reader tells whether it applies to
+  them by that WARNING in Home Assistant's log naming a
+  `homeassistant/<platform>/…/config` topic for an entity on
+  `homeassistant/device/…/config`. Measured on 2026-10-12: 79 such lines
+  per restart from a three-appliance go-homeconnect2mqtt 0.16.0. The cost is
+  the window on the first bundle of a connection, and a retained config the
+  window misses stays until the next connection.
 - **`docs/open-items.md`**: what is known to be unfinished across this module
   and its six consumers as of v0.37.0, mostly left over from the
   mqtt-smarthome 2.0 wave (openccu-loom ADR 0083). Each entry points at the
