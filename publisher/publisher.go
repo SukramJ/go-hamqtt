@@ -196,6 +196,33 @@ type Config struct {
 	// and no entities. See [LegacyTopicFunc].
 	LegacyEntityTopics []LegacyTopicFunc
 
+	// SupersedeObserved makes [Runtime.PublishBundle] retract a superseded
+	// per-entity config only where the broker still retains one, instead
+	// of on every topic the legacy forms name.
+	//
+	// The blind round is not free: Home Assistant checks the discovery
+	// topic before it looks at the payload (core
+	// components/mqtt/entity.py:1153-1187), so every empty retraction that
+	// reaches an entity already owned by a device document is logged as
+	// `Received a conflicting MQTT discovery message` — and the round
+	// repeats on every connection. Measured on 2026-10-12: 79 such
+	// WARNING lines per restart from a three-appliance go-homeconnect2mqtt
+	// 0.16.0, long after its migration had completed.
+	//
+	// With it set, the first supersede step on a connection opens one
+	// snapshot window over the discovery prefix ([Config.SweepWindow]) and
+	// remembers which config topics hold a retained payload; a topic this
+	// process published on the connection counts as held too. Topics
+	// outside the prefix, and every topic when the snapshot cannot be
+	// taken, are retracted as before.
+	//
+	// Off by default because the window is a trade: the first bundle on a
+	// connection waits for it, and a window that ends before the broker
+	// has delivered a retained config leaves that one in place until the
+	// next connection — the per-entity entity keeps working, but Home
+	// Assistant refuses its component in the document until then.
+	SupersedeObserved bool
+
 	// OnResync is called after a birth-triggered republish, with the number
 	// of configs replayed and whatever error the replay produced.
 	//
@@ -323,6 +350,14 @@ type Runtime struct {
 	// superseded records the topics retracted to clear the way for the
 	// other discovery form. See [Runtime.PublishBundle].
 	superseded map[string]bool
+	// observed is the set of config topics the broker retained when this
+	// connection's snapshot was taken, and observedTaken whether one has
+	// been. Only consulted with [Config.SupersedeObserved].
+	observed      map[string]bool
+	observedTaken bool
+	// epoch counts resets, so a snapshot whose window spanned one is not
+	// stored as the new connection's.
+	epoch uint64
 	// claimed is every config topic this process has published since it
 	// started, and it only ever grows — a topic retracted afterwards stays
 	// in it. It is not a dedup structure; it is the ownership evidence
@@ -749,10 +784,23 @@ func (r *Runtime) PublishComponent(
 // on the broker are precisely the previous build's — skipping them because
 // this process does not know them would leave every one in place, and every
 // document refused.
+//
+// With [Config.SupersedeObserved] a topic the connection's snapshot did not
+// see is memoised as done without a message: there is nothing there to clear.
 func (r *Runtime) supersede(ctx context.Context, topics []string) error {
+	held, err := r.retainedConfigs(ctx, topics)
+	if err != nil {
+		return err
+	}
+	prefix := topicPrefix(r.cfg.Prefix)
 	for _, t := range topics {
 		r.mu.Lock()
 		done := r.superseded[t]
+		_, mine := r.declared[t]
+		if !done && held != nil && !held[t] && !mine && strings.HasPrefix(t, prefix) {
+			r.superseded[t] = true
+			done = true
+		}
 		r.mu.Unlock()
 		if done {
 			continue
@@ -771,6 +819,86 @@ func (r *Runtime) supersede(ctx context.Context, topics []string) error {
 		r.mu.Unlock()
 	}
 	return nil
+}
+
+// retainedConfigs answers [Config.SupersedeObserved]: the config topics the
+// broker retained when this connection's snapshot was taken. Nil means
+// "unknown — retract everything", which is the answer with the option off,
+// when nothing in topics is still pending, and when the snapshot failed.
+//
+// The snapshot is taken once per connection, on the first supersede step
+// that has work to do, and shares the sweep's slot: two windows on the same
+// filter would unsubscribe each other.
+func (r *Runtime) retainedConfigs(ctx context.Context, topics []string) (map[string]bool, error) {
+	if !r.cfg.SupersedeObserved {
+		return nil, nil
+	}
+	r.mu.Lock()
+	pending := false
+	for _, t := range topics {
+		if !r.superseded[t] {
+			pending = true
+			break
+		}
+	}
+	held, taken, epoch := r.observed, r.observedTaken, r.epoch
+	r.mu.Unlock()
+	if !pending {
+		return nil, nil
+	}
+	if taken {
+		return held, nil
+	}
+
+	if !r.acquireSweepSlot(ctx) {
+		return nil, fmt.Errorf("publisher: waiting for the snapshot slot: %w", ctx.Err())
+	}
+	defer r.sweepMu.Unlock()
+	// Another bundle may have taken it while this one waited for the slot.
+	r.mu.Lock()
+	held, taken = r.observed, r.observedTaken
+	r.mu.Unlock()
+	if taken {
+		return held, nil
+	}
+
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	collect := func(topic string, payload []byte, _ bool) {
+		if len(payload) == 0 {
+			return
+		}
+		if _, ok := ParseConfigTopic(r.cfg.Prefix, topic); !ok {
+			return
+		}
+		mu.Lock()
+		seen[topic] = true
+		mu.Unlock()
+	}
+	if err := r.snapshot(ctx, topicPrefix(r.cfg.Prefix)+"#", r.cfg.SweepWindow, collect); err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		// A snapshot that cannot be taken must not cost the migration:
+		// fall back to the blind round for this call and try again on the
+		// next one.
+		r.log.Warn("publisher.supersede.snapshot_failed", slog.String("err", err.Error()))
+		return nil, nil
+	}
+
+	mu.Lock()
+	held = seen
+	mu.Unlock()
+	r.mu.Lock()
+	// A reconnect during the window reset the memos; this snapshot then
+	// describes the old connection and is used for this call only.
+	if r.epoch == epoch {
+		r.observed, r.observedTaken = held, true
+	}
+	r.mu.Unlock()
+	r.log.Info("publisher.supersede.snapshot",
+		slog.Int("retained_configs", len(held)))
+	return held, nil
 }
 
 // Retract clears retained configs and forgets them.
@@ -851,6 +979,9 @@ func (r *Runtime) resetLocked() {
 		r.declared[t] = e
 	}
 	r.superseded = map[string]bool{}
+	// A snapshot describes the broker as one connection saw it.
+	r.observed, r.observedTaken = nil, false
+	r.epoch++
 }
 
 // Claimed lists every config topic this process has published since it
