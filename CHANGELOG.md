@@ -30,6 +30,21 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-10-27
+
+### Added
+
+- **`discovery.LawnMowerFields.StopCommandTopic` / `StopCommandTemplate`**
+  (`stop_command_topic`, `stop_command_template`): the generated discovery
+  fields follow go-ha-catalog 0.3.1 (snapshot 2026.10.0), which records the
+  lawn mower's stop command. Purely additive; an unset field is omitted.
+
+### Changed
+
+- go-mqtt `v1.6.0` → `v1.7.0` (purely additive upstream: a TLS helper for
+  private-CA brokers). Nothing in this module's API or behaviour changes.
+- go-ha-catalog `0.3.0` → `0.3.1`.
+
 ## [0.38.0] - 2026-10-12
 
 ### Security
