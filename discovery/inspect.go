@@ -118,6 +118,24 @@ const (
 	// KindDeviceIdentity: document, error. The device needs an identifier
 	// or a connection (components/mqtt/schemas.py:123-130, 155, 216).
 	KindDeviceIdentity FindingKind = "device_identity"
+	// KindChildDevice: document, error. The document's child devices are
+	// not ones Home Assistant accepts, each a refusal of the whole document
+	// (references at core 2026.11.1):
+	//
+	//   - the device block carries a `child_device`: MQTT_DEVICE_INFO_SCHEMA
+	//     is strict and does not declare the key
+	//     (components/mqtt/schemas.py:150-187); only the per-entity form's
+	//     device block does;
+	//   - a child device has no identifier (schemas.py:141-148);
+	//   - two child devices share an identifier, or one shares it with the
+	//     device (validate_device_discovery_components, schemas.py:295-329);
+	//   - a component is assigned to a child device the bundle does not
+	//     declare, which [Bundle.MarshalJSON] cannot encode.
+	//
+	// A child's component on a platform that is not an entity platform is
+	// [KindPlatformUnsupported]: _CHILD_DEVICE_COMPONENT_CONFIG_SCHEMA
+	// admits ENTITY_PLATFORMS only (schemas.py:257-263).
+	KindChildDevice FindingKind = "child_device"
 	// KindNoComponents: document, warning. DEVICE_DISCOVERY_SCHEMA accepts
 	// an empty `components` object (schemas.py:217-219); the document then
 	// does nothing. [Validate] calls this an issue; Home Assistant does not.
@@ -378,6 +396,11 @@ func Inspect(b *Bundle, opts InspectOptions) Findings {
 		in.doc(KindDeviceIdentity, "", SeverityError, []string{"device.identifiers", "device.connections"},
 			"device needs at least one identifier or connection")
 	}
+	if b.Device.ChildDevice != nil {
+		in.doc(KindChildDevice, "", SeverityError, []string{"device.child_device"},
+			"device.child_device is not a key of a device document's device block; Home Assistant accepts it in the per-entity form only, a document lists its child devices in child_devices")
+	}
+	in.childDevices(b)
 	if len(b.Components) == 0 {
 		in.doc(KindNoComponents, "", SeverityWarning, []string{"components"},
 			"bundle has no components; Home Assistant accepts it and creates nothing")
@@ -508,6 +531,55 @@ func (in *inspector) sorted() Findings {
 		return a.Message < b.Message
 	})
 	return in.out
+}
+
+// childDevices checks [Bundle.ChildDevices] and [Bundle.ChildOf]; see
+// [KindChildDevice] for the rules and where Home Assistant states them.
+func (in *inspector) childDevices(b *Bundle) {
+	own := map[string]bool{}
+	for _, id := range b.Device.Identifiers {
+		own[id] = true
+	}
+	declared := map[string]bool{}
+	seen := map[string]bool{}
+	reported := map[string]bool{}
+	for i, child := range b.ChildDevices {
+		if len(child.Identifiers) == 0 {
+			in.doc(KindChildDevice, "", SeverityError, []string{"child_devices"},
+				fmt.Sprintf("child device %d has no identifier", i))
+			continue
+		}
+		declared[child.Identifiers[0]] = true
+		for _, id := range child.Identifiers {
+			switch {
+			case reported[id]:
+			case own[id]:
+				reported[id] = true
+				in.doc(KindChildDevice, "", SeverityError, []string{"child_devices"},
+					fmt.Sprintf("child device identifier %q is also an identifier of the device", id))
+			case seen[id]:
+				reported[id] = true
+				in.doc(KindChildDevice, "", SeverityError, []string{"child_devices"},
+					fmt.Sprintf("child device identifier %q is declared more than once", id))
+			}
+			seen[id] = true
+		}
+	}
+	for _, key := range b.Keys() {
+		id, assigned := b.ChildOf[key]
+		if !assigned {
+			continue
+		}
+		if !declared[id] {
+			in.doc(KindChildDevice, key, SeverityError, nil, fmt.Sprintf(
+				"%s: assigned to child device %q, which the bundle does not declare, so the document cannot be encoded", key, id))
+			continue
+		}
+		if platform := string(b.Components[key].Platform); nonEntityPlatforms[platform] {
+			in.doc(KindPlatformUnsupported, key, SeverityError, []string{"platform"}, fmt.Sprintf(
+				"%s: %q cannot sit on a child device; Home Assistant admits entity platforms there only", key, platform))
+		}
+	}
 }
 
 func (in *inspector) component(key string, comp Component) {

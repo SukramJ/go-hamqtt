@@ -161,6 +161,10 @@ func Contain(b *Bundle, opts ContainOptions) *Containment {
 	if b.Tombstones != nil {
 		out.Tombstones = maps.Clone(b.Tombstones)
 	}
+	// A withheld component keeps its assignment: it is still declared, and
+	// it goes back onto the same child device the moment it is accepted.
+	out.ChildDevices = slices.Clone(b.ChildDevices)
+	out.ChildOf = maps.Clone(b.ChildOf)
 	// A bundle contained twice keeps what the first pass withheld.
 	maps.Copy(c.Withheld, b.Withheld)
 
