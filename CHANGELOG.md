@@ -30,6 +30,8 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-11-14
+
 ### Added
 
 - **Child devices** (`child_device`, `child_devices`): an entity can sit on a
