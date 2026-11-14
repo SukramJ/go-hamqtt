@@ -106,6 +106,33 @@ var inspectCases = []struct {
 		want: []want{{"", discovery.KindChildDevice, discovery.ScopeDocument, discovery.SeverityError, false}},
 	},
 	{
+		name: "child device without identifier (mqtt/schemas.py:141-148 at 2026.11.1) refuses the document",
+		edit: func(b *discovery.Bundle) {
+			b.ChildDevices = []discovery.ChildDeviceInfo{{Name: "Rack"}}
+		},
+		want: []want{{"", discovery.KindChildDevice, discovery.ScopeDocument, discovery.SeverityError, false}},
+	},
+	{
+		name: "child device identifier declared twice (mqtt/schemas.py:295-329 at 2026.11.1) refuses the document",
+		edit: func(b *discovery.Bundle) {
+			b.AssignChild(discovery.ChildDeviceInfo{Identifiers: []string{"hc:rack-1"}}, "door")
+			b.AssignChild(discovery.ChildDeviceInfo{Identifiers: []string{"hc:rack-2", "hc:rack-1"}}, "delay")
+		},
+		want: []want{{"", discovery.KindChildDevice, discovery.ScopeDocument, discovery.SeverityError, false}},
+	},
+	{
+		name: "child device identifier shared with the device (mqtt/schemas.py:295-329 at 2026.11.1) refuses the document",
+		edit: func(b *discovery.Bundle) {
+			b.AssignChild(discovery.ChildDeviceInfo{Identifiers: []string{"hc:dishwasher-1"}}, "door")
+		},
+		want: []want{{"", discovery.KindChildDevice, discovery.ScopeDocument, discovery.SeverityError, false}},
+	},
+	{
+		name: "component assigned to an undeclared child device cannot be encoded",
+		edit: func(b *discovery.Bundle) { b.ChildOf = map[string]string{"door": "hc:rack-1"} },
+		want: []want{{"door", discovery.KindChildDevice, discovery.ScopeDocument, discovery.SeverityError, false}},
+	},
+	{
 		name: "empty components is accepted by DEVICE_DISCOVERY_SCHEMA (mqtt/schemas.py:217-219): warning",
 		edit: func(b *discovery.Bundle) { b.Components = map[string]discovery.Component{} },
 		want: []want{{"", discovery.KindNoComponents, discovery.ScopeDocument, discovery.SeverityWarning, false}},

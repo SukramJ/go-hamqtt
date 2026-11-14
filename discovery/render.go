@@ -249,8 +249,9 @@ func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Orig
 	if dev.Child != nil {
 		// See [DeviceInfo.ChildDevice]: a device document's device block has
 		// no `child_device`, and Home Assistant refuses the whole document
-		// over its device block.
-		return nil, fmt.Errorf("discovery: device %q has a child device, which only the per-entity form carries; use RenderComponent", dev.UID())
+		// over its device block. One device with one child also cannot say
+		// which entity sits where; [Bundle.AssignChild] can.
+		return nil, fmt.Errorf("discovery: device %q has a child device, which the device block of a bundle cannot carry; render without it and use Bundle.AssignChild, or RenderComponent", dev.UID())
 	}
 
 	bundle := &Bundle{

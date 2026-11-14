@@ -32,22 +32,32 @@ fine, because a change here moves them.
 
 ### Added
 
-- **Child devices in the per-entity form** (`model.Device.Child`,
-  `discovery.DeviceInfo.ChildDevice`, `child_device`): an entity can sit on a
-  child device of its device — a logical part of the same product — where
-  `Via` / `via_device` links two products. Home Assistant reads the key from
-  core 2026.11.0; the device block keeps describing the parent, and the child
-  carries identifiers and a name only. `DeviceFromInfo` and `NewDeviceInfo`
-  carry it in both directions. Purely additive: a device without a child
-  renders byte-identically.
+- **Child devices** (`child_device`, `child_devices`): an entity can sit on a
+  child device of its device — a logical part of the same product, one outlet
+  of a power strip — where `Via` / `via_device` links two products. Home
+  Assistant reads both keys from core 2026.11.0. A child carries identifiers
+  and a name only; the device block keeps describing the parent. Purely
+  additive: a device without a child renders byte-identically in both forms.
+  - **Per-entity form:** `model.Device.Child` and
+    `discovery.DeviceInfo.ChildDevice` render `device.child_device`;
+    `DeviceFromInfo` and `NewDeviceInfo` carry it in both directions.
+  - **Device bundle:** `Bundle.AssignChild` (`Bundle.ChildDevices`,
+    `Bundle.ChildOf`) puts components on a child, and the bundle encodes them
+    as `child_devices`. `Bundle.Components` stays the one flat map of
+    everything the document declares, so `Remove`, `RemoveComponents`,
+    `KeepSet`, `Contain` and the publisher's sweeps need no change.
+    `Render` refuses a `model.Device` with a `Child`, which cannot say which
+    entity sits where.
+  - **`Inspect`** reports as document errors (`KindChildDevice`) a
+    `child_device` in a bundle's device block, a child without an identifier,
+    an identifier shared between children or with the device, and a
+    component assigned to an undeclared child; a device trigger or tag on a
+    child is `KindPlatformUnsupported`.
 
-  Two things to check before setting it. A core before 2026.11.0 refuses a
-  device block with this key, and with it the entity, so it is a choice the
-  consumer makes for its fleet. And it is per-entity only: `Render` refuses a
-  device with a child, and `Inspect` reports `child_device` in a bundle's
-  device block as a document error (`KindChildDevice`), because a device
-  document expresses child devices as a top-level `child_devices` list this
-  module does not produce yet.
+  How to tell whether it applies: a core before 2026.11.0 refuses a
+  per-entity config whose device block has the key, and a whole device
+  document that has `child_devices`. Setting either is a decision about the
+  Home Assistant version of the fleet, which this module cannot see.
 
 ## [0.39.0] - 2026-10-27
 

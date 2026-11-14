@@ -74,15 +74,16 @@ type DeviceInfo struct {
 	// `child_device` in MQTT_ENTITY_DEVICE_INFO_SCHEMA and leaves it out of
 	// MQTT_DEVICE_INFO_SCHEMA, the device block of a device document
 	// (components/mqtt/schemas.py:171-187 at core 2026.11.1), where child
-	// devices are a top-level `child_devices` list this package does not
-	// produce. Both schemas are strict, so a core before 2026.11.0 — which
+	// devices are the top-level `child_devices` list [Bundle.ChildDevices]
+	// renders. Both schemas are strict, so a core before 2026.11.0 — which
 	// declares the key in neither — refuses the block, and with it the
 	// entity.
 	ChildDevice *ChildDeviceInfo `json:"child_device,omitempty"`
 }
 
-// ChildDeviceInfo is the `child_device` block inside a per-entity `device`
-// block.
+// ChildDeviceInfo is a child device as Home Assistant's MQTT discovery
+// declares one: the `child_device` block inside a per-entity `device` block,
+// and the identity of one `child_devices` entry of a device document.
 //
 // Identifiers has no `omitempty`, for the reason [AvailabilityEntry.Topic]
 // has none: Home Assistant requires the key with at least one entry, so a
@@ -382,8 +383,133 @@ type Bundle struct {
 	// Nil on every bundle [Contain] did not produce.
 	Withheld map[string]Component `json:"-"`
 
+	// ChildDevices are the device's child devices, and ChildOf says which
+	// component sits on which: it maps a [Bundle.Components] key to the
+	// first identifier of a ChildDevices entry. A component without an entry
+	// sits on the device itself. [Bundle.AssignChild] fills both.
+	//
+	// Components stays the one flat map of everything the document
+	// declares, whichever device a component is on. That is Home
+	// Assistant's own rule rather than a convenience: the component ids of
+	// a device document are one namespace across the device and its child
+	// devices (validate_device_discovery_components,
+	// components/mqtt/schemas.py:295-329 at core 2026.11.1), so a key cannot
+	// occur twice anyway — and it is what lets [Bundle.Remove], [Contain],
+	// [Bundle.KeepSet] and every publisher sweep keep working on one map.
+	// [Bundle.MarshalJSON] sorts the components into `components` and
+	// `child_devices` on the way out; neither field is part of the payload
+	// by itself.
+	//
+	// Home Assistant reads `child_devices` from core 2026.11.0. An earlier
+	// core refuses the whole document over the key, so a consumer sets
+	// these for a fleet it knows to be on that version or later.
+	ChildDevices []ChildDeviceInfo `json:"-"`
+	ChildOf      map[string]string `json:"-"`
+
 	// QoS, if set, applies to every component that does not set its own.
 	QoS *int `json:"qos,omitempty"`
+}
+
+// AssignChild puts components on a child device, declaring the child if the
+// bundle does not know it yet. A child is recognised by its first
+// identifier; a later call with the same one updates its name and remaining
+// identifiers. A child without an identifier is ignored — [Inspect] reports
+// one that was appended by hand.
+func (b *Bundle) AssignChild(child ChildDeviceInfo, keys ...string) {
+	if len(child.Identifiers) == 0 {
+		return
+	}
+	id := child.Identifiers[0]
+	known := false
+	for i := range b.ChildDevices {
+		if len(b.ChildDevices[i].Identifiers) > 0 && b.ChildDevices[i].Identifiers[0] == id {
+			b.ChildDevices[i] = child
+			known = true
+			break
+		}
+	}
+	if !known {
+		b.ChildDevices = append(b.ChildDevices, child)
+	}
+	if len(keys) > 0 && b.ChildOf == nil {
+		b.ChildOf = make(map[string]string, len(keys))
+	}
+	for _, k := range keys {
+		b.ChildOf[k] = id
+	}
+}
+
+// bundleWire is the document as it goes on the wire. Its first three and
+// its last field repeat [Bundle]'s payload fields in [Bundle]'s order, so a
+// bundle without child devices encodes to the bytes it always did;
+// TestBundleWithoutChildDevicesEncodesAsBefore holds the two together.
+type bundleWire struct {
+	Device       DeviceInfo           `json:"device"`
+	Origin       Origin               `json:"origin"`
+	Components   map[string]Component `json:"components"`
+	ChildDevices []childDeviceWire    `json:"child_devices,omitempty"`
+	QoS          *int                 `json:"qos,omitempty"`
+}
+
+// childDeviceWire is one `child_devices` entry: _CHILD_DEVICE_DISCOVERY_SCHEMA
+// (components/mqtt/schemas.py:265-271 at core 2026.11.1), the child's
+// identity plus its own required `components`.
+type childDeviceWire struct {
+	Identifiers []string             `json:"identifiers"`
+	Name        string               `json:"name,omitempty"`
+	Components  map[string]Component `json:"components"`
+}
+
+// MarshalJSON renders the document, sorting [Bundle.Components] into the
+// device's own `components` and one `child_devices` entry per child that
+// has any.
+//
+// A tombstone goes wherever its key is assigned, like any other component.
+// Home Assistant flattens both lists into one before it looks at a single
+// component (components/mqtt/discovery.py:636-651 at core 2026.11.1), and a
+// component's discovery id is its key alone, so a removal marker is found
+// from either place.
+//
+// A child with no component in the document is left out: its `components`
+// is required, and an entry that declares nothing creates nothing. A
+// component assigned to a child the bundle does not declare is an error
+// rather than a silent move onto the parent.
+func (b Bundle) MarshalJSON() ([]byte, error) {
+	wire := bundleWire{Device: b.Device, Origin: b.Origin, Components: b.Components, QoS: b.QoS}
+	if len(b.ChildDevices) == 0 && len(b.ChildOf) == 0 {
+		return json.Marshal(wire)
+	}
+
+	index := make(map[string]int, len(b.ChildDevices))
+	children := make([]childDeviceWire, len(b.ChildDevices))
+	for i, child := range b.ChildDevices {
+		children[i] = childDeviceWire{Identifiers: child.Identifiers, Name: child.Name}
+		if len(child.Identifiers) > 0 {
+			index[child.Identifiers[0]] = i
+		}
+	}
+	wire.Components = make(map[string]Component, len(b.Components))
+	for key := range b.Components {
+		id, assigned := b.ChildOf[key]
+		if !assigned {
+			wire.Components[key] = b.Components[key]
+			continue
+		}
+		i, declared := index[id]
+		if !declared {
+			return nil, fmt.Errorf("discovery: component %q is assigned to child device %q, which the bundle does not declare", key, id)
+		}
+		if children[i].Components == nil {
+			children[i].Components = map[string]Component{}
+		}
+		children[i].Components[key] = b.Components[key]
+	}
+	for _, child := range children {
+		if len(child.Components) > 0 {
+			wire.ChildDevices = append(wire.ChildDevices, child)
+		}
+	}
+	return json.Marshal(wire)
 }
 
 // Topic returns where the bundle is published. An empty prefix uses
