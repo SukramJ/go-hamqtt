@@ -246,6 +246,12 @@ func Render(ctx Context, dev *model.Device, entities []model.Entity, origin Orig
 	if !dev.Identity.Valid() {
 		return nil, fmt.Errorf("discovery: device has no identifier")
 	}
+	if dev.Child != nil {
+		// See [DeviceInfo.ChildDevice]: a device document's device block has
+		// no `child_device`, and Home Assistant refuses the whole document
+		// over its device block.
+		return nil, fmt.Errorf("discovery: device %q has a child device, which only the per-entity form carries; use RenderComponent", dev.UID())
+	}
 
 	bundle := &Bundle{
 		NodeID:     ctx.NodeID(dev),
@@ -521,6 +527,16 @@ func deviceInfo(dev *model.Device, lang string) DeviceInfo {
 	if dev.Via != nil {
 		info.ViaDevice = dev.Via.UID()
 	}
+	if dev.Child != nil {
+		child := &ChildDeviceInfo{
+			Identifiers: make([]string, 0, len(dev.Child.IDs)),
+			Name:        dev.Child.Name.In(lang),
+		}
+		for _, id := range dev.Child.IDs {
+			child.Identifiers = append(child.Identifiers, id.String())
+		}
+		info.ChildDevice = child
+	}
 	return info
 }
 
@@ -598,6 +614,9 @@ func RenderComponent(ctx Context, dev *model.Device, e model.Entity, origin Orig
 	if dev == nil || !dev.Identity.Valid() {
 		return Component{}, fmt.Errorf("discovery: device has no identity")
 	}
+	if dev.Child != nil && len(dev.Child.IDs) == 0 {
+		return Component{}, fmt.Errorf("discovery: child device of %q has no identifier", dev.UID())
+	}
 	comp, err := renderComponent(ctx, dev, e)
 	if err != nil {
 		return Component{}, fmt.Errorf("discovery: entity %q: %w", e.Key(), err)
@@ -642,6 +661,13 @@ func DeviceFromInfo(info DeviceInfo) *model.Device {
 	}
 	if info.ViaDevice != "" {
 		dev.Via = &model.Identity{IDs: []model.Identifier{{Value: info.ViaDevice}}}
+	}
+	if info.ChildDevice != nil {
+		child := &model.ChildDevice{Name: model.L(info.ChildDevice.Name)}
+		for _, id := range info.ChildDevice.Identifiers {
+			child.IDs = append(child.IDs, model.Identifier{Value: id})
+		}
+		dev.Child = child
 	}
 	return dev
 }

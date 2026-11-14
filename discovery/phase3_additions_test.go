@@ -316,3 +316,96 @@ func TestDeviceFromInfoRoundTrips(t *testing.T) {
 		t.Errorf("round trip\n got %+v\nwant %+v", got, want)
 	}
 }
+
+// TestDeviceFromInfoRoundTripsAChildDevice: the child block is part of the
+// same lossless pair. A consumer that harvests a block with a child device
+// and renders it through the model must publish the identifiers it harvested,
+// because Home Assistant converts an existing device into a child device in
+// place only when they match.
+func TestDeviceFromInfoRoundTripsAChildDevice(t *testing.T) {
+	t.Parallel()
+
+	want := discovery.DeviceInfo{
+		Identifiers:  []string{"ccu1_0001abc"},
+		Name:         "Flush-mount actuator",
+		Manufacturer: "eQ-3",
+		ViaDevice:    "ccu1",
+		ChildDevice: &discovery.ChildDeviceInfo{
+			Identifiers: []string{"ccu1_0001abc-2"},
+			Name:        "Group 2",
+		},
+	}
+
+	got := discovery.NewDeviceInfo(discovery.DeviceFromInfo(want), "en")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("round trip\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// TestRenderComponentCarriesTheChildDevice pins the wire shape of the
+// per-entity form: the device block keeps describing the parent, and
+// `child_device` carries the part's identifiers and name and nothing else
+// (MQTT_ENTITY_CHILD_DEVICE_INFO_SCHEMA, components/mqtt/schemas.py:141-148
+// at core 2026.11.1).
+func TestRenderComponentCarriesTheChildDevice(t *testing.T) {
+	t.Parallel()
+
+	dev := phase3Device()
+	parentIDs := discovery.NewDeviceInfo(dev, "en").Identifiers
+	dev.Child = &model.ChildDevice{
+		IDs:  []model.Identifier{{Value: "openccu-loom_0001abc-2"}},
+		Name: model.Localized{Default: "Group 2", Lang: map[string]string{"de": "Gruppe 2"}},
+	}
+	comp, err := discovery.RenderComponent(phase3Context(), dev, phase3Entity(), discovery.Origin{Name: "x"})
+	if err != nil {
+		t.Fatalf("RenderComponent: %v", err)
+	}
+	raw, err := comp.EntityJSON()
+	if err != nil {
+		t.Fatalf("EntityJSON: %v", err)
+	}
+	var body struct {
+		Device struct {
+			Identifiers []string       `json:"identifiers"`
+			Name        string         `json:"name"`
+			Child       map[string]any `json:"child_device"`
+		} `json:"device"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !reflect.DeepEqual(body.Device.Identifiers, parentIDs) || body.Device.Name != "Thermostat" {
+		t.Errorf("device block = %+v, want it to stay the parent", body.Device)
+	}
+	wantChild := map[string]any{"identifiers": []any{"openccu-loom_0001abc-2"}, "name": "Group 2"}
+	if !reflect.DeepEqual(body.Device.Child, wantChild) {
+		t.Errorf("child_device = %v, want %v", body.Device.Child, wantChild)
+	}
+}
+
+// TestRenderComponentRefusesAChildDeviceWithNoIdentifier: Home Assistant
+// requires at least one, and the identifier is what a child device is
+// converted and found again by.
+func TestRenderComponentRefusesAChildDeviceWithNoIdentifier(t *testing.T) {
+	t.Parallel()
+
+	dev := phase3Device()
+	dev.Child = &model.ChildDevice{Name: model.L("Group 2")}
+	if _, err := discovery.RenderComponent(phase3Context(), dev, phase3Entity(),
+		discovery.Origin{Name: "x"}); err == nil {
+		t.Error("a child device with no identifier was rendered")
+	}
+}
+
+// TestRenderRefusesAChildDevice: a device document's device block has no
+// `child_device`, so a bundle rendered with one would be refused whole.
+func TestRenderRefusesAChildDevice(t *testing.T) {
+	t.Parallel()
+
+	dev := phase3Device()
+	dev.Child = &model.ChildDevice{IDs: []model.Identifier{{Value: "openccu-loom_0001abc-2"}}}
+	if _, err := discovery.Render(phase3Context(), dev, []model.Entity{phase3Entity()},
+		discovery.Origin{Name: "x"}); err == nil {
+		t.Error("a bundle was rendered for a device with a child device")
+	}
+}

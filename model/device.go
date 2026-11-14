@@ -182,9 +182,34 @@ type Device struct {
 	// Via names the parent device in the hierarchy. Nil for a root device.
 	Via *Identity
 
+	// Child places the entities rendered against this device on a child
+	// device of it: a logical part of the same product — one outlet of a
+	// power strip, one channel group of a multi-channel actuator — rather
+	// than a product of its own, which is what Via links. Nil for a device
+	// whose entities sit on the device itself.
+	//
+	// The Device stays the parent: its identity, name and hardware fields
+	// describe the product, and Child carries only what Home Assistant keeps
+	// for a part. Only the per-entity form can express it; see
+	// [ChildDevice].
+	Child *ChildDevice
+
 	// Extra carries keys the model does not model. It is an escape hatch, not
 	// a design surface: a key that every consumer sets belongs in a field.
 	Extra map[string]any
+}
+
+// ChildDevice is a logical part of a [Device], as Home Assistant's child
+// devices model it (core 2026.11.0 for MQTT discovery).
+//
+// It has identifiers and a name and nothing else: Home Assistant's
+// MQTT_ENTITY_CHILD_DEVICE_INFO_SCHEMA (components/mqtt/schemas.py:141-148 at
+// core 2026.11.1) declares exactly those two keys, `identifiers` required
+// with at least one entry. Manufacturer, model, versions and connections
+// belong to the parent.
+type ChildDevice struct {
+	IDs  []Identifier
+	Name Localized
 }
 
 // UID is shorthand for the device's identity key.

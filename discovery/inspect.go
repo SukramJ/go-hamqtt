@@ -118,6 +118,11 @@ const (
 	// KindDeviceIdentity: document, error. The device needs an identifier
 	// or a connection (components/mqtt/schemas.py:123-130, 155, 216).
 	KindDeviceIdentity FindingKind = "device_identity"
+	// KindChildDevice: document, error. A device document's device block
+	// carries a `child_device`. MQTT_DEVICE_INFO_SCHEMA is strict and does
+	// not declare the key (components/mqtt/schemas.py:150-187 at core
+	// 2026.11.1); only the per-entity form's device block does.
+	KindChildDevice FindingKind = "child_device"
 	// KindNoComponents: document, warning. DEVICE_DISCOVERY_SCHEMA accepts
 	// an empty `components` object (schemas.py:217-219); the document then
 	// does nothing. [Validate] calls this an issue; Home Assistant does not.
@@ -377,6 +382,10 @@ func Inspect(b *Bundle, opts InspectOptions) Findings {
 	if len(b.Device.Identifiers) == 0 && len(b.Device.Connections) == 0 {
 		in.doc(KindDeviceIdentity, "", SeverityError, []string{"device.identifiers", "device.connections"},
 			"device needs at least one identifier or connection")
+	}
+	if b.Device.ChildDevice != nil {
+		in.doc(KindChildDevice, "", SeverityError, []string{"device.child_device"},
+			"device.child_device is not a key of a device document's device block; Home Assistant accepts it in the per-entity form only")
 	}
 	if len(b.Components) == 0 {
 		in.doc(KindNoComponents, "", SeverityWarning, []string{"components"},

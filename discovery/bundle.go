@@ -67,6 +67,30 @@ type DeviceInfo struct {
 	SuggestedArea    string      `json:"suggested_area,omitempty"`
 	ConfigurationURL string      `json:"configuration_url,omitempty"`
 	ViaDevice        string      `json:"via_device,omitempty"`
+	// ChildDevice moves the entity onto a child device of this one. The rest
+	// of the block keeps describing the parent.
+	//
+	// Legal in the per-entity form only. Home Assistant accepts
+	// `child_device` in MQTT_ENTITY_DEVICE_INFO_SCHEMA and leaves it out of
+	// MQTT_DEVICE_INFO_SCHEMA, the device block of a device document
+	// (components/mqtt/schemas.py:171-187 at core 2026.11.1), where child
+	// devices are a top-level `child_devices` list this package does not
+	// produce. Both schemas are strict, so a core before 2026.11.0 — which
+	// declares the key in neither — refuses the block, and with it the
+	// entity.
+	ChildDevice *ChildDeviceInfo `json:"child_device,omitempty"`
+}
+
+// ChildDeviceInfo is the `child_device` block inside a per-entity `device`
+// block.
+//
+// Identifiers has no `omitempty`, for the reason [AvailabilityEntry.Topic]
+// has none: Home Assistant requires the key with at least one entry, so a
+// block without one is refused either way and the empty list is the more
+// legible diagnostic.
+type ChildDeviceInfo struct {
+	Identifiers []string `json:"identifiers"`
+	Name        string   `json:"name,omitempty"`
 }
 
 // AvailabilityEntry is one entry of an `availability` list.

@@ -30,6 +30,25 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+### Added
+
+- **Child devices in the per-entity form** (`model.Device.Child`,
+  `discovery.DeviceInfo.ChildDevice`, `child_device`): an entity can sit on a
+  child device of its device — a logical part of the same product — where
+  `Via` / `via_device` links two products. Home Assistant reads the key from
+  core 2026.11.0; the device block keeps describing the parent, and the child
+  carries identifiers and a name only. `DeviceFromInfo` and `NewDeviceInfo`
+  carry it in both directions. Purely additive: a device without a child
+  renders byte-identically.
+
+  Two things to check before setting it. A core before 2026.11.0 refuses a
+  device block with this key, and with it the entity, so it is a choice the
+  consumer makes for its fleet. And it is per-entity only: `Render` refuses a
+  device with a child, and `Inspect` reports `child_device` in a bundle's
+  device block as a document error (`KindChildDevice`), because a device
+  document expresses child devices as a top-level `child_devices` list this
+  module does not produce yet.
+
 ## [0.39.0] - 2026-10-27
 
 ### Added

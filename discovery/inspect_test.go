@@ -99,6 +99,13 @@ var inspectCases = []struct {
 		want: []want{{"", discovery.KindDeviceIdentity, discovery.ScopeDocument, discovery.SeverityError, false}},
 	},
 	{
+		name: "child_device in a device document's device block (mqtt/schemas.py:150-187 at 2026.11.1) refuses the document",
+		edit: func(b *discovery.Bundle) {
+			b.Device.ChildDevice = &discovery.ChildDeviceInfo{Identifiers: []string{"strip-1"}}
+		},
+		want: []want{{"", discovery.KindChildDevice, discovery.ScopeDocument, discovery.SeverityError, false}},
+	},
+	{
 		name: "empty components is accepted by DEVICE_DISCOVERY_SCHEMA (mqtt/schemas.py:217-219): warning",
 		edit: func(b *discovery.Bundle) { b.Components = map[string]discovery.Component{} },
 		want: []want{{"", discovery.KindNoComponents, discovery.ScopeDocument, discovery.SeverityWarning, false}},
