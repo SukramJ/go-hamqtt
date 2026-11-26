@@ -3,7 +3,7 @@
 
 package topic
 
-import "github.com/SukramJ/go-hamqtt/model"
+import "sukramj.dev/go-hamqtt/model"
 
 // PulseKind names a topic that carries an occurrence rather than a value.
 //

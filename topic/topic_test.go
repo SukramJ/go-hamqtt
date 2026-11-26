@@ -6,8 +6,8 @@ package topic_test
 import (
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/model"
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 // TestSlugTransliteratesUmlauts is the defect one reference bridge shipped by

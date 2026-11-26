@@ -1,8 +1,8 @@
-module github.com/SukramJ/go-hamqtt
+module sukramj.dev/go-hamqtt
 
 go 1.27.4
 
 require (
-	github.com/SukramJ/go-ha-catalog v0.3.1
-	github.com/SukramJ/go-mqtt v1.7.0
+	sukramj.dev/go-ha-catalog v0.4.0
+	sukramj.dev/go-mqtt v1.8.0
 )

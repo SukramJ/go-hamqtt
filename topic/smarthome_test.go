@@ -7,8 +7,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/model"
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 func mustSmartHome(t *testing.T, name string) topic.SmartHome {

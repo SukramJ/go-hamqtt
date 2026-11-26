@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
-	"github.com/SukramJ/go-mqtt/protocol"
+	hacatalog "sukramj.dev/go-ha-catalog"
+	"sukramj.dev/go-mqtt/protocol"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 // cmdBroker is a transport that behaves the way a real broker behaves

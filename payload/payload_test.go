@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/payload"
+	"sukramj.dev/go-hamqtt/payload"
 )
 
 type embedded struct {

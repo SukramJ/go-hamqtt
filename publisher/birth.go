@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 // BirthPayload and DeathPayload are what Home Assistant publishes on its own

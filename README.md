@@ -301,7 +301,7 @@ Build them first — they are not committed, and neither is any other binary:
 
 ```sh
 make tools                   # -> bin/hacheck, bin/hadoctor
-# or: go install github.com/SukramJ/go-hamqtt/cmd/hacheck@latest
+# or: go install sukramj.dev/go-hamqtt/cmd/hacheck@latest
 ```
 
 ```sh

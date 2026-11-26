@@ -6,7 +6,7 @@ package discovery
 import (
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // PresetModeField is the field a climate entity's curated state document

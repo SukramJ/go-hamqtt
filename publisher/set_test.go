@@ -12,7 +12,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // TestParseSet is spec §5.3's acceptance table: a plain value and its

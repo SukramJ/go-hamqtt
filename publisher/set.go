@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 var (

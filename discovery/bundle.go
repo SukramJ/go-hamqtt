@@ -33,7 +33,7 @@ import (
 	"maps"
 	"sort"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // DefaultPrefix is Home Assistant's own default discovery prefix.
@@ -354,7 +354,7 @@ type Bundle struct {
 	// The measured need is the retraction of the removed entity's OLD
 	// per-entity config. [Bundle.Remove] writes `Component{Platform: …}`,
 	// which has no `unique_id` — so a consumer on the node-id-less legacy
-	// form ([github.com/SukramJ/go-hamqtt/publisher.LegacyTopicByUniqueID],
+	// form ([sukramj.dev/go-hamqtt/publisher.LegacyTopicByUniqueID],
 	// go-zendure2mqtt's fleet, measured 2026-09-12) got no legacy topic for
 	// a tombstone at all, and the deleted entity kept being rediscovered
 	// from its stale retained config on every MQTT-integration restart. The
@@ -586,7 +586,7 @@ func (b *Bundle) Remove(platformOf map[string]hacatalog.Platform, keys ...string
 // express. Its payload entry carries a platform and nothing else, by Home
 // Assistant's rule; a consumer whose installed fleet keys its per-entity
 // configs on the `unique_id`
-// ([github.com/SukramJ/go-hamqtt/publisher.LegacyTopicByUniqueID],
+// ([sukramj.dev/go-hamqtt/publisher.LegacyTopicByUniqueID],
 // go-zendure2mqtt, measured 2026-09-12) therefore had no topic to retract for
 // a removed entity, and its stale retained config went on re-creating the
 // entity as a permanently unavailable phantom on every MQTT-integration

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/internal/dump"
+	"sukramj.dev/go-hamqtt/internal/dump"
 )
 
 // TestObjectIDIsFoundOnARealPayload is the defect this tool exists for, on a

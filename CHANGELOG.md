@@ -30,6 +30,16 @@ fine, because a change here moves them.
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-11-26
+
+### Changed
+
+- **Breaking:** the module path is now `sukramj.dev/go-hamqtt` (was
+  `github.com/SukramJ/go-hamqtt`). Update imports and `go.mod`; the vanity
+  path resolves to the same repository.
+- Dependencies moved to their vanity paths: `sukramj.dev/go-mqtt` v1.8.0 and
+  `sukramj.dev/go-ha-catalog` v0.4.0.
+
 ## [0.40.0] - 2026-11-14
 
 ### Added

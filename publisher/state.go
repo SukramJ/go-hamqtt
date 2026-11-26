@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // Envelope is the state payload [discovery.EnvelopeEncoding] points Home

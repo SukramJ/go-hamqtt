@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // ValidationError collects every problem in a bundle rather than the first.

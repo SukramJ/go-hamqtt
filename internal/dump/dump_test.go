@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/internal/dump"
+	"sukramj.dev/go-hamqtt/internal/dump"
 )
 
 func TestParseTopicForms(t *testing.T) {

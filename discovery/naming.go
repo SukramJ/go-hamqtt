@@ -6,8 +6,8 @@ package discovery
 import (
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/model"
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 // NodeID is the topic segment a device's bundle is published under.

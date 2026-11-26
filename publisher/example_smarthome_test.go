@@ -8,13 +8,13 @@ import (
 	"log/slog"
 	"os"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
-	"github.com/SukramJ/go-hamqtt/publisher"
-	"github.com/SukramJ/go-hamqtt/publisher/gomqtt"
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/publisher"
+	"sukramj.dev/go-hamqtt/publisher/gomqtt"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 // Example_smartHome is the README's mqtt-smarthome section, compiled. Like
