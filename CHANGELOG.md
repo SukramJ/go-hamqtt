@@ -39,6 +39,9 @@ fine, because a change here moves them.
   path resolves to the same repository.
 - Dependencies moved to their vanity paths: `sukramj.dev/go-mqtt` v1.8.0 and
   `sukramj.dev/go-ha-catalog` v0.4.0.
+- `discovery/gen_fields.go` regenerated from the go-ha-catalog v0.4.0
+  snapshot (HA 2026.10.4); only the header line changes, the field set is
+  unchanged.
 
 ## [0.40.0] - 2026-11-14
 
