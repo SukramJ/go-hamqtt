@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 func smartHomeLayout(t *testing.T, name string) topic.SmartHome {

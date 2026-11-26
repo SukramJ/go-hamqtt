@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // The functions of the mqtt-smarthome 2.0 grammar `<name>/<function>/<item...>`

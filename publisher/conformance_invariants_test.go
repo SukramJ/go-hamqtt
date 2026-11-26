@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // TestConformanceAdvertisedStateTopicIsWhereStateIsPublished pins the first

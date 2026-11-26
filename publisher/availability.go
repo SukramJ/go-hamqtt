@@ -13,9 +13,9 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 // ErrNoAvailabilityLayout is returned by the slot-shaped calls when no

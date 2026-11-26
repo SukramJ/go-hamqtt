@@ -7,10 +7,10 @@ import (
 	"context"
 	"testing"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/catalog"
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/catalog"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 func entity(key, leaf string) *model.Basic {

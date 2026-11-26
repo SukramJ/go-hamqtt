@@ -21,9 +21,9 @@ import (
 	"sort"
 	"strings"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // Match is the condition of a rule. Every non-empty field must match — the

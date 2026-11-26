@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 // BundleSegment is the fixed first segment of a device document's topic.

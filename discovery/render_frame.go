@@ -7,7 +7,7 @@ import (
 	"maps"
 	"reflect"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // RenderFrame renders the frame *under* a component whose own keys are

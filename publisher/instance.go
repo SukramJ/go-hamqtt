@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/topic"
 )
 
 // SpecVersion is the mqtt-smarthome specification version this module

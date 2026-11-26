@@ -17,13 +17,13 @@
 // measurement written beside it.
 //
 // The transport is an interface declared here rather than
-// [github.com/SukramJ/go-mqtt] itself, and it speaks in plain bytes and a
+// [sukramj.dev/go-mqtt] itself, and it speaks in plain bytes and a
 // plain QoS byte. Two reasons, both measured: the consumers wrap their client
 // differently — one publishes through a circuit breaker and subscribes around
 // it — so a concrete client type would fit none of them; and the whole
 // runtime has to be exercisable without a broker, which is what the fake in
 // this package's own tests does. A go-mqtt client is adapted in one call, see
-// [github.com/SukramJ/go-hamqtt/publisher/gomqtt].
+// [sukramj.dev/go-hamqtt/publisher/gomqtt].
 //
 // # mqtt-smarthome 2.0
 //
@@ -49,8 +49,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	hatopic "github.com/SukramJ/go-hamqtt/topic"
+	"sukramj.dev/go-hamqtt/discovery"
+	hatopic "sukramj.dev/go-hamqtt/topic"
 )
 
 // Handler receives one delivered message.
@@ -101,7 +101,7 @@ type Transport interface {
 // (re)connect and must not change otherwise; it need not be sequential, only
 // different, and it is read on the publish path, so it must be cheap and must
 // take no lock a publish could be holding. A consumer wrapping
-// [github.com/SukramJ/go-mqtt] has the number already: its lifecycle calls
+// [sukramj.dev/go-mqtt] has the number already: its lifecycle calls
 // OnConnect once per connection, so an atomic counter incremented there is
 // the whole implementation.
 //

@@ -102,7 +102,7 @@ formatters:
         group-params: true
     goimports:
       local-prefixes:
-        - github.com/SukramJ/go-hamqtt
+        - sukramj.dev/go-hamqtt
   exclusions:
     generated: lax
     paths:

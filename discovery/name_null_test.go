@@ -6,10 +6,10 @@ package discovery_test
 import (
 	"testing"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // nameNullEntity is one entity on the given platform, with the description the

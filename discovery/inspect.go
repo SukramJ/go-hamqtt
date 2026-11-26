@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // # What Home Assistant refuses, and at which granularity

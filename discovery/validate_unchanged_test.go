@@ -9,9 +9,9 @@ import (
 	"reflect"
 	"testing"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 // equivalenceCorpus is every bundle this package's tests judge, plus a

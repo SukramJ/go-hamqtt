@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 go-hamqtt authors.
 
-// Package gomqtt adapts a [github.com/SukramJ/go-mqtt] client to
+// Package gomqtt adapts a [sukramj.dev/go-mqtt] client to
 // [publisher.Transport].
 //
 // It is its own package so the runtime stays testable without a transport
@@ -15,9 +15,9 @@ package gomqtt
 import (
 	"context"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 
-	"github.com/SukramJ/go-hamqtt/publisher"
+	"sukramj.dev/go-hamqtt/publisher"
 )
 
 // Transport wraps a whole client.

@@ -25,7 +25,7 @@ import (
 	"sort"
 	"strings"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // structural keys belong to the bundle or to the component's own discriminator,

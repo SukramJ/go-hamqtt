@@ -45,7 +45,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/internal/dump"
+	"sukramj.dev/go-hamqtt/internal/dump"
 )
 
 func main() { os.Exit(cli(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 // The cases below are not invented. Every one of them was found by running

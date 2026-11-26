@@ -7,7 +7,7 @@ import (
 	"context"
 	"errors"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // Errors a consumer's capability implementations are expected to return.

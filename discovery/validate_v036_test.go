@@ -18,9 +18,9 @@ import (
 	"sort"
 	"strings"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 func v036ValidateIgnoring(b *discovery.Bundle, ignore map[string]bool) error {

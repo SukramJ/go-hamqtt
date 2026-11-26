@@ -13,7 +13,7 @@ GO            ?= go
 GOFUMPT       ?= gofumpt
 GOLANGCI_LINT ?= golangci-lint
 COVER_MIN     ?= 80
-MODULE        := github.com/SukramJ/go-hamqtt
+MODULE        := sukramj.dev/go-hamqtt
 
 export CGO_ENABLED := 0
 

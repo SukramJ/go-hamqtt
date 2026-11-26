@@ -7,7 +7,7 @@ import (
 	"maps"
 	"slices"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // DeviceClass is Home Assistant's device class as a plain string.

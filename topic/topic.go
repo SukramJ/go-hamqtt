@@ -27,7 +27,7 @@ package topic
 import (
 	"strings"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // Layout renders the topics a consumer publishes. It is an interface because

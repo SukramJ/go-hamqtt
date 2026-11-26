@@ -6,10 +6,10 @@ package catalog_test
 import (
 	"testing"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/catalog"
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/catalog"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // categorised is an entity carrying the consumer's own classification, which

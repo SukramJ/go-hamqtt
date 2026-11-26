@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"sync"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // Context is what the model asks for the strings it must not build itself.

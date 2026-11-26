@@ -8,9 +8,9 @@ import (
 	"errors"
 	"testing"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 
-	"github.com/SukramJ/go-hamqtt/publisher"
+	"sukramj.dev/go-hamqtt/publisher"
 )
 
 // fakeClient is a go-mqtt client that records rather than connects. It

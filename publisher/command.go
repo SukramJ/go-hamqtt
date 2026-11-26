@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"unicode/utf8"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/discovery"
 )
 
 // Errors reported by the command router. They are sentinels rather than

@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 )
 
 // ErrUnpublishable matches a document Home Assistant refuses whatever it

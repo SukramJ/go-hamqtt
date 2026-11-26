@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // TestBucketSpellings pins the strings that become topic segments: changing

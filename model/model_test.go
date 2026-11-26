@@ -7,9 +7,9 @@ import (
 	"slices"
 	"testing"
 
-	hacatalog "github.com/SukramJ/go-ha-catalog"
+	hacatalog "sukramj.dev/go-ha-catalog"
 
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 func ident(ns, v string) model.Identifier { return model.Identifier{Namespace: ns, Value: v} }

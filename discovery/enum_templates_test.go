@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/SukramJ/go-hamqtt/discovery"
-	"github.com/SukramJ/go-hamqtt/model"
+	"sukramj.dev/go-hamqtt/discovery"
+	"sukramj.dev/go-hamqtt/model"
 )
 
 // The two strings the consumer's climate plane has pinned. Copied verbatim
